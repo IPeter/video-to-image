@@ -11,6 +11,15 @@ const (
 	SmallWidth    = 640
 	FullQScale    = 2
 	SmallQScale   = 4
+	// DefaultConcurrency is how many ranges Run extracts at once when
+	// Input.Concurrency is unset (the worker sets it from V2I_EXTRACT_CONCURRENCY or its
+	// CPU budget, see pipeline.ExtractConcurrency). One 4K HEVC 60 fps range holds about
+	// 450 MiB of memory at FFMPEG_THREADS=2 (about 700 MiB at 4), so memory scales with
+	// the concurrency. Parallel ranges only pay off with idle cores: six ~4 s ranges took
+	// 69 s one at a time and 28 s three at a time on an unconstrained 8-core machine, but
+	// under a 4 CPU / 4Gi limit three ranges took 34 s at once against 39 s in turn, for
+	// three times the memory (1.3 GiB).
+	DefaultConcurrency = 3
 )
 
 // Range is one accepted scene (from analyze.Scene).
@@ -30,6 +39,10 @@ type Input struct {
 	Ranges        []Range
 	SampleFPS     int // domain selection.sampleFps (default 4)
 	MaxCandidates int // domain limits.maxCandidateFrames (300)
+	// Concurrency bounds the ffmpeg processes Run starts at once (one per range);
+	// ≤ 0 means DefaultConcurrency. Each process is still bounded by FFmpeg.Threads,
+	// so CPU and memory scale with Concurrency × FFmpeg.Threads.
+	Concurrency int
 }
 
 // RangePlan is the sampling decision for one Range (pure, see Plan).

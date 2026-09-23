@@ -117,22 +117,26 @@ func newServeCmd() *cobra.Command {
 			}
 
 			srv := httpapi.New(httpapi.Deps{
-				Registry:             a.Registry,
-				Store:                a.Store,
-				Storage:              a.Storage,
-				Prober:               a.FFmpeg,
-				Enqueuer:             enqueuer,
-				Logger:               log,
-				InternalToken:        cfg.InternalToken,
-				IPHashSalt:           cfg.IPHashSalt,
-				TrustedProxies:       trusted,
-				ClientIPHeader:       cfg.ClientIPHeader,
-				StatusRatePerMinute:  cfg.StatusRatePerMinute,
-				MaxConcurrentUploads: cfg.MaxConcurrentUploads,
-				MaxUploadsPerClient:  cfg.MaxUploadsPerClient,
-				ScratchDir:           cfg.ScratchDir,
-				PresignDownloads:     cfg.Storage.PresignDownloads,
-				FFmpegVersion:        ffmpegVersion,
+				Registry:                   a.Registry,
+				Store:                      a.Store,
+				Storage:                    a.Storage,
+				Prober:                     a.FFmpeg,
+				Enqueuer:                   enqueuer,
+				Logger:                     log,
+				InternalToken:              cfg.InternalToken,
+				IPHashSalt:                 cfg.IPHashSalt,
+				TrustedProxies:             trusted,
+				ClientIPHeader:             cfg.ClientIPHeader,
+				StatusRatePerMinute:        cfg.StatusRatePerMinute,
+				MaxConcurrentUploads:       cfg.MaxConcurrentUploads,
+				MaxUploadsPerClient:        cfg.MaxUploadsPerClient,
+				MaxRequestBytes:            cfg.MaxRequestBytes,
+				ChunkSizeBytes:             cfg.UploadChunkBytes,
+				UploadSessionTTL:           cfg.UploadSessionTTL,
+				MaxUploadSessionsPerClient: cfg.MaxUploadSessionsPerClient,
+				ScratchDir:                 cfg.ScratchDir,
+				PresignDownloads:           cfg.Storage.PresignDownloads,
+				FFmpegVersion:              ffmpegVersion,
 			})
 			hs := &http.Server{
 				Addr:              cfg.HTTPAddr,
@@ -148,6 +152,7 @@ func newServeCmd() *cobra.Command {
 			go serveAdmin(admin, log)
 			return runHTTP(ctx, hs, log, cfg.ShutdownTimeout, func(sctx context.Context) {
 				_ = admin.Shutdown(sctx)
+				srv.Close()
 				if worker != nil {
 					if err := worker.Stop(sctx); err != nil {
 						log.Warn("worker stop", "err", err)

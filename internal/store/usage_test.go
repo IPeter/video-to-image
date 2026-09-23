@@ -229,3 +229,84 @@ func TestUsageReportGroupsByUTCDayAndDomain(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, rows, "empty range")
 }
+
+func TestJobUsageSumsPerStepAndModel(t *testing.T) {
+	t.Parallel()
+	s, _ := newStore(t)
+	ctx := context.Background()
+	id := processingJob(t, s)
+	other := processingJob(t, s)
+
+	t0 := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	ev := func(job, step, model string, at time.Duration, in, out, think int, cost float64) store.UsageEvent {
+		return store.UsageEvent{
+			JobID: job, DomainKey: "cars", Step: step, Model: model,
+			InputTokens: in, OutputTokens: out, ThinkingTokens: think, VideoSeconds: 59,
+			CostUSD: cost, LatencyMs: 900, CreatedAt: t0.Add(at),
+		}
+	}
+	// Inserted out of time order: the result follows each group's first call, not the
+	// insertion order and not the (step, model) sort order.
+	for _, e := range []store.UsageEvent{
+		ev(id, "review", "gemini-3.5-flash", 3*time.Second, 5000, 300, 700, 0.000417),
+		ev(id, "analyze", "gemini-3.5-flash-lite", 0, 12000, 800, 1500, 0.0012345), // stored as 0.001235
+		ev(id, "analyze", "gemini-2.5-pro", 9*time.Second, 100, 10, 0, 0.01),       // a later fallback model
+		ev(id, "review", "gemini-3.5-flash", 2*time.Second, 4000, 250, 600, 0.000333),
+		ev(id, "analyze", "gemini-3.5-flash-lite", time.Second, 11000, 700, 0, 0.002),
+		ev(other, "analyze", "gemini-3.5-flash-lite", -time.Second, 1, 1, 1, 0.5), // another job
+		ev("", "analyze", "gemini-3.5-flash-lite", -time.Second, 1, 1, 1, 0.25),   // no job
+	} {
+		require.NoError(t, s.InsertUsage(ctx, e))
+	}
+
+	got, err := s.JobUsage(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, []store.UsageByStep{
+		{Step: "analyze", Model: "gemini-3.5-flash-lite", Calls: 2, InputTokens: 23000, OutputTokens: 1500, ThinkingTokens: 1500, CostUSD: 0.003235},
+		{Step: "review", Model: "gemini-3.5-flash", Calls: 2, InputTokens: 9000, OutputTokens: 550, ThinkingTokens: 1300, CostUSD: 0.00075},
+		{Step: "analyze", Model: "gemini-2.5-pro", Calls: 1, InputTokens: 100, OutputTokens: 10, ThinkingTokens: 0, CostUSD: 0.01},
+	}, got)
+
+	// The per-step costs add up to the job's running total.
+	j, err := s.GetJob(ctx, id)
+	require.NoError(t, err)
+	var sum float64
+	for _, u := range got {
+		sum += u.CostUSD
+	}
+	assert.Equal(t, j.CostUSD, math.Round(sum*1e6)/1e6)
+	assert.Equal(t, 0.013985, j.CostUSD)
+
+	og, err := s.JobUsage(ctx, other)
+	require.NoError(t, err)
+	assert.Equal(t, []store.UsageByStep{
+		{Step: "analyze", Model: "gemini-3.5-flash-lite", Calls: 1, InputTokens: 1, OutputTokens: 1, ThinkingTokens: 1, CostUSD: 0.5},
+	}, og)
+}
+
+func TestJobUsageEmptyAndMissingJob(t *testing.T) {
+	t.Parallel()
+	s, _ := newStore(t)
+	ctx := context.Background()
+
+	got, err := s.JobUsage(ctx, createJob(t, s))
+	require.NoError(t, err)
+	assert.NotNil(t, got)
+	assert.Empty(t, got)
+
+	got, err = s.JobUsage(ctx, ids.NewJob())
+	require.NoError(t, err)
+	assert.NotNil(t, got)
+	assert.Empty(t, got)
+}
+
+func TestJobUsageCanceledContext(t *testing.T) {
+	t.Parallel()
+	s, _ := newStore(t)
+	id := createJob(t, s)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := s.JobUsage(ctx, id)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Contains(t, err.Error(), "store: job usage "+id)
+}

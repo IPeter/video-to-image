@@ -61,6 +61,31 @@
         ],
         "type": "object"
       },
+      "CreateUploadRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "contentType": {
+            "description": "The browser's MIME type; informational (the content is sniffed).",
+            "type": "string"
+          },
+          "fileName": {
+            "description": "The file's name (shown on the job; a name containing \"reject\" makes the fake analyzer fail the gate).",
+            "maxLength": 255,
+            "type": "string"
+          },
+          "sizeBytes": {
+            "description": "Exact size of the whole file.",
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fileName",
+          "sizeBytes"
+        ],
+        "type": "object"
+      },
       "ErrorDetail": {
         "additionalProperties": false,
         "properties": {
@@ -79,6 +104,8 @@
               "RESOLUTION_TOO_LOW",
               "RESOLUTION_TOO_HIGH",
               "SERVER_BUSY",
+              "UPLOAD_NOT_FOUND",
+              "UPLOAD_INCOMPLETE",
               "RATE_LIMITED",
               "JOB_NOT_FOUND",
               "IMAGE_NOT_FOUND",
@@ -144,6 +171,9 @@
             ],
             "type": "string"
           },
+          "usage": {
+            "$ref": "#/components/schemas/JobUsage"
+          },
           "video": {
             "$ref": "#/components/schemas/VideoInfo"
           }
@@ -156,6 +186,7 @@
           "expiresAt",
           "video",
           "progress",
+          "usage",
           "result",
           "rejection",
           "error"
@@ -228,6 +259,62 @@
           "object",
           "null"
         ]
+      },
+      "JobUsage": {
+        "additionalProperties": false,
+        "properties": {
+          "calls": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "costComplete": {
+            "description": "Every step is priced, so costUsd is the whole cost (true when there were no calls). False: some calls went to a model missing from the price table, so their cost is unknown (not 0); also false when the usage could not be read.",
+            "type": "boolean"
+          },
+          "costUsd": {
+            "description": "USD, computed from the price table when each call was made. Only the full cost when costComplete.",
+            "format": "double",
+            "type": "number"
+          },
+          "inputTokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "outputTokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/UsageStep"
+            },
+            "type": "array"
+          },
+          "testMode": {
+            "description": "Every call was answered by the built-in test analyzer (model \"fake:...\"), so nothing was charged. False when there were no calls.",
+            "type": "boolean"
+          },
+          "thinkingTokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "totalTokens": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "calls",
+          "inputTokens",
+          "outputTokens",
+          "thinkingTokens",
+          "totalTokens",
+          "costUsd",
+          "testMode",
+          "costComplete",
+          "steps"
+        ],
+        "type": "object"
       },
       "Progress": {
         "additionalProperties": false,
@@ -422,6 +509,10 @@
       "ResultImage": {
         "additionalProperties": false,
         "properties": {
+          "cropped": {
+            "description": "The frame was cropped around the subject.",
+            "type": "boolean"
+          },
           "downloadUrl": {
             "description": "Same as url with ?download=1 (Content-Disposition: attachment).",
             "type": "string"
@@ -446,6 +537,11 @@
           },
           "reason": {
             "type": "string"
+          },
+          "rotation": {
+            "description": "Degrees clockwise the source frame was rotated to make it upright (0, 90, 180, 270).",
+            "format": "int64",
+            "type": "integer"
           },
           "shotId": {
             "type": "string"
@@ -489,7 +585,9 @@
           "fileName",
           "url",
           "downloadUrl",
-          "thumbnailUrl"
+          "thumbnailUrl",
+          "rotation",
+          "cropped"
         ],
         "type": "object"
       },
@@ -506,6 +604,39 @@
         "required": [
           "id",
           "label"
+        ],
+        "type": "object"
+      },
+      "UploadSession": {
+        "additionalProperties": false,
+        "properties": {
+          "chunkCount": {
+            "description": "Chunks are numbered 0..chunkCount-1.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "chunkSizeBytes": {
+            "description": "Every chunk but the last has exactly this size.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "expiresAt": {
+            "description": "The session and its chunks are dropped after this unless another request arrives: 5 minutes after create until the first chunk is stored, then the session TTL after the last request. It may also be cancelled earlier to make room once it has been idle (see createUpload).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "uploadId": {
+            "examples": [
+              "upl_01J8ZK3M2Q7K2M9QXA4B5C6D7E"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "uploadId",
+          "chunkSizeBytes",
+          "chunkCount",
+          "expiresAt"
         ],
         "type": "object"
       },
@@ -592,6 +723,59 @@
           "thinkingTokens",
           "videoSeconds",
           "costUsd"
+        ],
+        "type": "object"
+      },
+      "UsageStep": {
+        "additionalProperties": false,
+        "properties": {
+          "calls": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "costUsd": {
+            "format": "double",
+            "type": "number"
+          },
+          "inputTokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "model": {
+            "description": "The model that answered; the built-in test analyzer reports \"fake:\u003cmodel\u003e\".",
+            "examples": [
+              "gemini-3.5-flash-lite"
+            ],
+            "type": "string"
+          },
+          "outputTokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "priced": {
+            "description": "The model has a price in the price table, or is the free test analyzer (\"fake:\" prefix). False: real calls to a model without a price, recorded at costUsd 0 although they were billed.",
+            "type": "boolean"
+          },
+          "step": {
+            "examples": [
+              "analyze"
+            ],
+            "type": "string"
+          },
+          "thinkingTokens": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "step",
+          "model",
+          "calls",
+          "inputTokens",
+          "outputTokens",
+          "thinkingTokens",
+          "costUsd",
+          "priced"
         ],
         "type": "object"
       },
@@ -820,7 +1004,7 @@
     },
     "/v1/domains/{domainKey}/jobs": {
       "post": {
-        "description": "multipart/form-data with one field `video`. Streams to storage, validates with ffprobe, enqueues.",
+        "description": "multipart/form-data with one field `video`. Streams to storage, validates with ffprobe, enqueues. A body above what one request may carry in this deployment is 413 UPLOAD_TOO_LARGE with details.maxRequestBytes: send such a video as a chunked upload (createUpload).",
         "operationId": "createJob",
         "parameters": [
           {
@@ -1478,6 +1662,471 @@
         "summary": "640 px thumbnail JPG",
         "tags": [
           "files"
+        ]
+      }
+    },
+    "/v1/domains/{domainKey}/uploads": {
+      "post": {
+        "description": "For files larger than one request may be (e.g. behind Cloudflare's 100 MB body limit). PUT the chunks, then complete. sizeBytes may be up to the domain's maxUploadBytes (else 413 UPLOAD_TOO_LARGE). Counts against the upload rate limit. An open upload holds an upload slot until it is completed, cancelled or idle past expiresAt (5 minutes before its first chunk, then the session TTL after its last request). A client that already has its maximum of open uploads gets its own longest-idle one (idle for 1 minute, no request in flight) cancelled to make room, else 429 RATE_LIMITED; when all upload slots are taken, the longest-idle upload of anyone idle for 5 minutes is cancelled, else 503 SERVER_BUSY. Retry-After says when one can be.",
+        "operationId": "createUpload",
+        "parameters": [
+          {
+            "description": "Domain key, e.g. cars.",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "description": "Domain key, e.g. cars.",
+              "examples": [
+                "cars"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUploadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadSession"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Start a chunked upload",
+        "tags": [
+          "uploads"
+        ]
+      }
+    },
+    "/v1/domains/{domainKey}/uploads/{uploadId}": {
+      "delete": {
+        "operationId": "abortUpload",
+        "parameters": [
+          {
+            "description": "Domain key, e.g. cars.",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "description": "Domain key, e.g. cars.",
+              "examples": [
+                "cars"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Upload session ID (upl_ + ULID).",
+            "in": "path",
+            "name": "uploadId",
+            "required": true,
+            "schema": {
+              "description": "Upload session ID (upl_ + ULID).",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Cancel a chunked upload",
+        "tags": [
+          "uploads"
+        ]
+      }
+    },
+    "/v1/domains/{domainKey}/uploads/{uploadId}/chunks/{index}": {
+      "put": {
+        "description": "Raw bytes (application/octet-stream) of chunk index (0-based). Re-sending a chunk replaces it. Every chunk but the last must be exactly chunkSizeBytes: a Content-Length must match it, and a body without one (chunked transfer) must end after exactly that many bytes (else 400 with details {index, expectedBytes, contentLength}). Chunks may be sent in any order and in parallel. A refused chunk's body is read before the answer, so the client can read it.",
+        "operationId": "putUploadChunk",
+        "parameters": [
+          {
+            "example": "cars",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "uploadId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "index",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "contentMediaType": "application/octet-stream",
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Chunk stored"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "INVALID_REQUEST (bad index or size)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "ORIGIN_NOT_ALLOWED"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "DOMAIN_NOT_FOUND | UPLOAD_NOT_FOUND"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "UPLOAD_TOO_LARGE"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "RATE_LIMITED"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "INTERNAL_ERROR"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "SERVER_BUSY"
+          }
+        },
+        "summary": "Upload one chunk",
+        "tags": [
+          "uploads"
+        ]
+      }
+    },
+    "/v1/domains/{domainKey}/uploads/{uploadId}/complete": {
+      "post": {
+        "description": "Validates the assembled file exactly like POST /jobs (format, decode, duration, resolution) and enqueues the job. 409 UPLOAD_INCOMPLETE lists the missing chunks in details (an older PUT of a chunk that a newer PUT already stored is waited for, at most a few seconds, and then cut off). Afterwards the upload is gone; calling complete again returns the same outcome, except after a 500, which keeps the chunks so complete can be retried.",
+        "operationId": "completeUpload",
+        "parameters": [
+          {
+            "description": "Domain key, e.g. cars.",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "description": "Domain key, e.g. cars.",
+              "examples": [
+                "cars"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Upload session ID (upl_ + ULID).",
+            "in": "path",
+            "name": "uploadId",
+            "required": true,
+            "schema": {
+              "description": "Upload session ID (upl_ + ULID).",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateJobResponse"
+                }
+              }
+            },
+            "description": "Accepted",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Finish a chunked upload and start the job",
+        "tags": [
+          "uploads"
         ]
       }
     }

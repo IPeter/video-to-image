@@ -164,15 +164,17 @@ func retryAfterSeconds(d time.Duration) int {
 	return max(1, int(math.Ceil(d.Seconds())))
 }
 
-// guardLimiters are the domain guard's two limiters.
+// guardLimiters are the domain guard's limiters.
 type guardLimiters struct {
-	uploads *keyedLimiter // POST jobs: limits.ratePerIpPerHour per hour
+	uploads *keyedLimiter // POST jobs / POST uploads: limits.ratePerIpPerHour per hour
 	status  *keyedLimiter // GET job / file routes: StatusRatePerMinute per minute
+	chunks  *keyedLimiter // chunked-upload session routes: chunkRatePerMinute per minute
 }
 
 func newGuardLimiters(now func() time.Time) *guardLimiters {
 	return &guardLimiters{
 		uploads: newKeyedLimiter(now, defaultMaxLimiterEntries),
 		status:  newKeyedLimiter(now, defaultMaxLimiterEntries),
+		chunks:  newKeyedLimiter(now, defaultMaxLimiterEntries),
 	}
 }

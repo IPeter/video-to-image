@@ -3,7 +3,7 @@
 import { ChevronLeft, ChevronRight, Download } from "lucide-react";
 import type { KeyboardEvent } from "react";
 
-import { imageAltText } from "@/components/result-card";
+import { imageAltText, ReframeBadge } from "@/components/result-card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
@@ -53,6 +53,7 @@ export function Lightbox({ images, index, onIndexChange, apiBaseUrl }: LightboxP
               <Badge variant="secondary">{image.shotLabel}</Badge>
               <span className="text-sm font-normal tabular-nums text-muted-foreground">at {image.timestampLabel}</span>
             </DialogTitle>
+            <ReframeBadge image={image} />
             <span className="ml-auto text-xs tabular-nums text-muted-foreground" aria-live="polite">
               {(position ?? 0) + 1} of {images.length}
             </span>

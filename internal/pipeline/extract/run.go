@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 
+	"golang.org/x/sync/errgroup"
+
 	"video-to-image/internal/ids"
 	"video-to-image/internal/media"
 )
@@ -17,20 +19,26 @@ import (
 // Run executes Plan with ffmpeg and returns the candidates. The total never exceeds
 // MaxCandidates.
 //
-// Ranges run sequentially (ffmpeg already uses every core to decode), one ffmpeg call
-// per range writing WorkDir/cand/<scene>_%04d.jpg and WorkDir/small/<scene>_%04d.jpg,
-// where <scene> is the 3-digit SceneIdx, suffixed with "-<plan index>" when several
-// ranges share a SceneIdx. Candidate i of a range gets TimestampSec = PadStartSec +
-// i/FPS clamped to [0, DurationSec] — the media.ExtractFrames sampling contract, exact
-// to within one source frame.
+// One ffmpeg call per range writes WorkDir/cand/<scene>_%04d.jpg and
+// WorkDir/small/<scene>_%04d.jpg, where <scene> is the 3-digit SceneIdx, suffixed
+// with "-<plan index>" when several ranges share a SceneIdx. Up to Input.Concurrency
+// (DefaultConcurrency) ranges run at once: FFmpeg.Threads caps each process, and every
+// range pays its own seek and decoder warm-up, so a few in parallel use the cores a
+// single capped process leaves idle. The result does not depend on the concurrency:
+// ranges are collected in plan order and candidates are ordered by SceneIdx then
+// TimestampSec. Candidate i of a range gets TimestampSec = PadStartSec + i/FPS
+// clamped to [0, DurationSec] — the media.ExtractFrames sampling contract, exact to
+// within one source frame.
 //
 // A range that yields no frames (it starts after the last decodable frame, e.g. when
 // the container duration includes a longer audio track) is skipped and logged. If no
 // range yields any frame the video is treated as undecodable and Run fails. If ffmpeg
 // ever writes more frames than MaxCandidates in total, frames are dropped evenly
 // within each range (never the tail), each range keeping at least one, and the
-// dropped files are deleted. On error, every file Run wrote is removed; the caller
-// still owns (and deletes) WorkDir.
+// dropped files are deleted. The first failing range (or ctx ending) stops the
+// others: their ffmpeg processes are killed and no new range starts. On error,
+// every file Run wrote is removed and the error is the first range's failure
+// (wrapping ctx.Err() when ctx ended); the caller still owns (and deletes) WorkDir.
 func Run(ctx context.Context, ff *media.FFmpeg, in Input) (*Output, error) {
 	switch {
 	case ff == nil:
@@ -59,32 +67,13 @@ func Run(ctx context.Context, ff *media.FFmpeg, in Input) (*Output, error) {
 		}
 	}
 
-	names := fileStems(plans)
-	var got []rangeFrames
-	fail := func(err error) (*Output, error) {
-		for _, r := range got {
-			r.remove(0, len(r.full))
-		}
+	results, err := extractRanges(ctx, ff, in, plans, candDir, smallDir)
+	if err != nil {
 		return nil, err
 	}
+	var got []rangeFrames
 	for k, p := range plans {
-		if err := ctx.Err(); err != nil {
-			return fail(fmt.Errorf("extract: %w", err))
-		}
-		res, err := ff.ExtractFrames(ctx, media.ExtractArgs{
-			Input:        in.SourcePath,
-			StartSec:     p.PadStartSec,
-			DurationSec:  p.PadEndSec - p.PadStartSec,
-			FPS:          p.FPS,
-			FullPattern:  filepath.Join(candDir, names[k]+"_%04d.jpg"),
-			SmallPattern: filepath.Join(smallDir, names[k]+"_%04d.jpg"),
-			SmallWidth:   SmallWidth,
-			FullQScale:   FullQScale,
-			SmallQScale:  SmallQScale,
-		})
-		if err != nil {
-			return fail(fmt.Errorf("extract: scene %d (%.2f–%.2f s): %w", p.SceneIdx, p.PadStartSec, p.PadEndSec, err))
-		}
+		res := results[k]
 		n := min(len(res.Full), len(res.Small))
 		if n == 0 {
 			log.Warn("extract: range produced no frames; skipping",
@@ -132,6 +121,54 @@ func Run(ctx context.Context, ff *media.FFmpeg, in Input) (*Output, error) {
 		return ca.TimestampSec < cb.TimestampSec
 	})
 	return out, nil
+}
+
+// extractRanges runs ExtractFrames for every plan, at most Input.Concurrency at a
+// time, and returns the results in plan order. The first failure cancels the ranges
+// still running (ExtractFrames removes their partial frames) and skips the ones not
+// started; the frames of ranges that already finished are removed before the error
+// is returned.
+func extractRanges(ctx context.Context, ff *media.FFmpeg, in Input, plans []RangePlan, candDir, smallDir string) ([]*media.ExtractResult, error) {
+	names := fileStems(plans)
+	results := make([]*media.ExtractResult, len(plans))
+	limit := in.Concurrency
+	if limit <= 0 {
+		limit = DefaultConcurrency
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(limit)
+	for k, p := range plans {
+		g.Go(func() error {
+			if err := gctx.Err(); err != nil {
+				return fmt.Errorf("extract: %w", err)
+			}
+			res, err := ff.ExtractFrames(gctx, media.ExtractArgs{
+				Input:        in.SourcePath,
+				StartSec:     p.PadStartSec,
+				DurationSec:  p.PadEndSec - p.PadStartSec,
+				FPS:          p.FPS,
+				FullPattern:  filepath.Join(candDir, names[k]+"_%04d.jpg"),
+				SmallPattern: filepath.Join(smallDir, names[k]+"_%04d.jpg"),
+				SmallWidth:   SmallWidth,
+				FullQScale:   FullQScale,
+				SmallQScale:  SmallQScale,
+			})
+			if err != nil {
+				return fmt.Errorf("extract: scene %d (%.2f–%.2f s): %w", p.SceneIdx, p.PadStartSec, p.PadEndSec, err)
+			}
+			results[k] = res
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		for _, res := range results {
+			if res != nil {
+				rangeFrames{full: res.Full, small: res.Small}.remove(0, len(res.Full))
+			}
+		}
+		return nil, err
+	}
+	return results, nil
 }
 
 // rangeFrames are the files one range produced. keep lists the frame indices that

@@ -118,6 +118,87 @@ The public subset also exposes `minShortSidePx`, `maxPixels` and `retentionHours
 - Extra states: deletion confirmation, expired-while-open, 429/503 with a countdown from
   `Retry-After`, screen-reader announcements on terminal states.
 
+## Round 2 (2026-09-23): real-video quality, cost display, speed
+
+Driven by the user's own iPhone walkaround (59 s, 4K HEVC 60 fps, portrait, phone
+turned mid-recording, 377 MB). The Phase 1 pipeline produced 8 photos of which 5 were
+sideways, one exterior shot cut the car in half, two views were duplicated and all were
+portrait; the job took 242 s.
+
+- **Model frame review** (`internal/pipeline/review`, replaces the plan's optional
+  re-rank; `review:` block in the domain YAML, on for cars). Two calls after scoring:
+  1. *Orientation*: one 2x2 grid per shortlisted frame showing it rotated
+     0/90/180/270°; the model names the upright cell. Asking for "degrees clockwise" or
+     "which edge is up" was wrong on 2-3 of 4 real frames; the grid got 4 of 4
+     (flash-lite, no thinking). Per frame, not per scene: on the user's video the phone
+     turns at ~6 s inside the side-profile scene. Retried once on bad output or an
+     unavailable model; if it still fails, the judgement prompt says the frames may be
+     sideways and asks for a `rotation` per frame. The rotations reach the runner
+     before the judgement call, so a failed judgement still exports frames upright.
+  2. *Judgement* on upright 512 px copies: the view it really shows, whether the whole
+     subject is inside the frame, quality 1-5, the subject box, and `sameAs` (a
+     near-duplicate of an earlier frame). Only usable frames are eligible.
+  Output budgets scale with the shortlist (judgement: max(domain cap, 512 + 160 per
+  frame), orientation: 256 + 48 per grid, both ≤ 32768); `issues` is ≤ 8 words.
+  The outcome is merged into the select step's `job_steps.meta` as soon as the review
+  returns (`Store.MergeStepMeta`), before selection and export: verdicts (`review`) and
+  rotations (`reviewRotations`) keyed by scene, shot and timestamp, counts, and on
+  failure `reviewError` + `reviewFailure` (`badOutput`, `tooFew`, `unavailable`,
+  `other`) and `reviewOrientationError`. A River retry reuses verdicts only when every
+  stored one maps onto a current candidate (Usable recomputed with the current
+  `minQuality`); a stored `badOutput`/`tooFew`/`other` failure selects on scores alone
+  without calling the model again; only `unavailable` is reviewed again.
+- **Incomplete or failed review**: an answer covering fewer than half of the frames sent
+  (empty, unknown ids, cut short) counts as a failed review and the job selects on scores
+  alone instead of ending with no photos; above half, unanswered frames stay ineligible.
+  Frames without a verdict are exported rotated only (their own orientation answer,
+  else the nearest oriented frame of the same scene within 1 s).
+- **One photo per view** (`selection.maxPerShot: 1`) plus the review's `sameAs` links
+  (resolved transitively: b sameAs a and c sameAs b never yield both a and c): the fill
+  pass no longer adds a second frame of a covered view. `maxPerShot` is opt-in (unset =
+  no cap); validation rejects an `imageCount` above `maxPerShot × (shots + 1)`. A frame
+  the review re-classified gets "<Label> view" as its reason instead of the scene's
+  reason for the old view.
+- **Rotate + crop** (`crop:` block; cars: 4:3, 6% margin, ≥ 1080 px short side):
+  frames are turned upright and cropped around the reviewed box; a crop that would cut
+  the subject or drop below the minimum size is skipped. The margin is best effort
+  (shrinks down to 0 before a crop is given up), and a crop that changes the orientation
+  (upright portrait → 4:3 landscape) may go down to the frame's widest 4:3 rectangle, not
+  below 480 px, so 1080p portrait (the iPhone default) becomes 1080x810. Edited frames are re-encoded
+  once (q92) with a new thumbnail; unedited frames are still copied byte for byte.
+- **Why views are missing**: when every take of a required view had the subject cut off,
+  the explanation says so and asks to film from further away (a view with any fully
+  visible take, rejected for blur or as a duplicate, gets no such hint).
+- **Usage and cost on the job page**: `usage` in the job payload (per step and model:
+  calls, input/output/thinking tokens, USD) shown as "AI usage: N tokens · $X".
+- **Speed**: keyframe-only preview (`-skip_frame nokey`) when no stretch of the source
+  goes longer than one preview frame interval (+0.25 s) without a keyframe, judged from
+  the packet flags of the whole stream (demux only, 0.08–0.2 s on the 377 MB clip), at
+  min(previewFps, ⌊1/largest gap⌋) fps. Phone video: preview 172.9 s → 4.4 s at 1 fps,
+  also half the video tokens. Every skip-mode preview is read back (a video stream,
+  ≥ 80 % of the expected frames, reaching the source's end, and — for keyframes-only —
+  no gap between decoded frames, printed by `metadata` filters in the same run); if it
+  fails it is rebuilt with `noref`, then from a full decode. The reason: H.264 open-GOP
+  and intra-refresh sources flag recovery points as keyframes, and under nokey give an
+  empty MP4 or a frozen picture while ffmpeg exits 0.
+  Extract ranges can run in parallel (`V2I_EXTRACT_CONCURRENCY`, 0 = auto: CPUs /
+  (FFMPEG_THREADS × V2I_PIPELINE_WORKERS)): 68.6 s → 28.1 s with 3 at once on an
+  unconstrained 8-core machine, but 34 s vs 39 s under the worker's 4 CPU / 4Gi limit
+  for 3× the memory (≈ 450 MiB per 4K HEVC process at 2 threads), so home-k3s uses 1.
+- **Prompts**: the car instructions demand the whole car in exterior shots, distinct
+  angles only, and judge content rather than orientation.
+
+Result on the same video: 48–60 s end to end; 5 upright photos (dashboard, front, front
+seats, instrument cluster close-up, trunk), no duplicates, no half cars. The exterior
+3/4 and side views are reported missing because the car never fit in the frame.
+Cost $0.011–0.017 per job (analyze ≈ $0.003, review ≈ $0.008–0.013: images are billed
+≈ 1,100 tokens each at the default media resolution; LOW resolution was ~4× cheaper
+but got 3 of 4 orientation grids right, so it is not used for the grids).
+
+Open: the review's image cost (try LOW resolution for the judgement call only), and a
+fallback crop aspect for tall subjects (a straight-on front view in a portrait frame
+stays uncropped because it does not fit 4:3).
+
 ## Deployment (Phase 3, first cut — 2026-09-23)
 
 Live at `https://cardealer.peterilles.com` on the home k3s node; details and runbook in
@@ -129,7 +210,8 @@ Live at `https://cardealer.peterilles.com` on the home k3s node; details and run
 - TLS terminates at Cloudflare; traffic arrives through the locally managed Cloudflare
   Tunnel on the node (`/etc/cloudflared/config.yml`, rule added for the new host), like
   the other `*.peterilles.com` apps; no cert-manager, no open router ports. Cloudflare caps request bodies at 100 MB on Free/Pro, so
-  `V2I_MAX_UPLOAD_BYTES` caps uploads at 95 MiB for this deployment. Client IPs come from
+  the browser uploads in 16 MiB chunks (see "Chunked uploads" below) and only the
+  single-request upload is capped at 95 MiB (`V2I_MAX_REQUEST_BYTES`). Client IPs come from
   `CF-Connecting-IP` (`V2I_CLIENT_IP_HEADER`), trusted only from the Traefik pod network.
 - Storage is a `local-path` PVC shared by api and worker (`V2I_STORAGE=local`) instead of
   MinIO: single node, fewer moving parts. `V2I_STORAGE=s3` switches without code changes.
@@ -139,6 +221,34 @@ Live at `https://cardealer.peterilles.com` on the home k3s node; details and run
   kustomize's secretGenerator (SealedSecrets/SOPS later).
 - Direct-to-storage upload (decision 9) is not done; with Cloudflare in front it would not
   lift the 100 MB cap anyway unless the upload host is DNS-only.
+
+### Chunked uploads
+
+A 1-minute 4K phone walkaround is ~380 MB, far above Cloudflare's 100 MB request limit,
+so the browser always uploads in pieces (small files are one piece):
+
+- `POST /v1/domains/{key}/uploads {fileName, sizeBytes, contentType}` → 201
+  `{uploadId, chunkSizeBytes, chunkCount, expiresAt}`; `PUT …/uploads/{id}/chunks/{i}`
+  (raw bytes, any order, 2 in flight, idempotent) → 204; `POST …/uploads/{id}/complete`
+  → 202 with the job, running the same ingest as the single-request `POST …/jobs`
+  (sniff, sha256, probe, limits, store, enqueue); `DELETE …/uploads/{id}` aborts.
+- Limits: the domain's `maxUploadBytes` (500 MB for cars) is the real limit again. The
+  hourly per-IP upload limit is charged when the upload starts, not per chunk. An open
+  upload holds one of the global upload slots (shared with single-request uploads) and
+  one of `V2I_MAX_UPLOAD_SESSIONS_PER_CLIENT`. Scratch space is reserved up front
+  (2 × size + 256 MiB, like the single-request path); the data file is sparse.
+- Sessions live in the API process with a `session.json` next to the data under
+  `<scratch>/uploads/upl_…/`, so a container restart resumes them. A new pod (deploy)
+  starts with an empty emptyDir: uploads in progress then fail with UPLOAD_NOT_FOUND
+  and must start again. Unfinished uploads expire (5 min before the first chunk,
+  `V2I_UPLOAD_SESSION_TTL`, default 15 min, after the last one); the browser also
+  deletes its session on cancel and on page close.
+- A repeated `complete` replays the first outcome (same job), so the browser can retry
+  it after a lost answer; chunks are kept after a 500 for the same reason.
+- Settings: `V2I_UPLOAD_CHUNK_BYTES` (16 MiB, clamped below `V2I_MAX_REQUEST_BYTES`),
+  `V2I_UPLOAD_SESSION_TTL`, `V2I_MAX_UPLOAD_SESSIONS_PER_CLIENT`. Server-side callers
+  (eval CLI, scripts) going through Cloudflare must use the chunked API too, or call the
+  API directly.
 
 ## Operations
 

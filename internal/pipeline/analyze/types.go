@@ -21,6 +21,9 @@ type Input struct {
 	CacheKey    string  // stable key for recording/replay (sha256 of the original upload)
 	FileHandle  string  // provider file handle from an earlier attempt ("" → upload)
 	SourceName  string  // original upload file name; only passed through as analyzer.Request.SourceName
+	// PreviewFPS is the preview's real frame rate (preview.Output.FPS); it is what the
+	// model is told to sample at. 0 → Domain.Model.PreviewFPS.
+	PreviewFPS float64
 }
 
 // Gate is the model's verdict on whether the video belongs to the domain. After

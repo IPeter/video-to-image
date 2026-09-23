@@ -49,9 +49,11 @@ const (
 // createJob is POST /v1/domains/{domainKey}/jobs (plan/03-pipeline.md step 0). The
 // upload first needs a slot (admitUpload: global and per-client concurrency, scratch
 // free space); then the file is streamed from the multipart body to a scratch file
-// (never held in memory, at a minimum pace) while it is hashed and counted, validated
-// with ffprobe, copied to storage, and the job row + River job are inserted in one
-// transaction.
+// (never held in memory, at a minimum pace) while it is hashed and counted, and
+// ingest validates it with ffprobe, copies it to storage and inserts the job row +
+// River job in one transaction. Videos larger than one request may carry
+// (Deps.MaxRequestBytes) take the chunked upload instead (uploads_chunked.go), which
+// ends in the same ingest.
 func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dc, err := s.domainFor(ctx, chi.URLParam(r, "domainKey"))
@@ -72,24 +74,28 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		}
 		writeAPIError(w, errInternal())
 	}
-	maxBytes := dc.Limits.MaxUploadBytes
+	lim := s.requestLimit(dc)
 
 	// 1. Size, before reading anything; the body is capped again below for clients
 	//    that lie about (or omit) Content-Length.
-	if r.ContentLength > maxBytes+multipartSlack {
-		reject(errTooLarge(maxBytes), "content_length", r.ContentLength)
+	if r.ContentLength > dc.Limits.MaxUploadBytes+multipartSlack {
+		reject(errTooLarge(dc.Limits.MaxUploadBytes), "content_length", r.ContentLength)
+		return
+	}
+	if r.ContentLength > lim.body {
+		reject(lim.tooLarge(), "content_length", r.ContentLength)
 		return
 	}
 
-	// 2. A slot, before reading anything: each upload holds up to maxBytes of scratch
+	// 2. A slot, before reading anything: each upload holds up to lim.file of scratch
 	//    and a goroutine until it is done.
-	release, busy := s.admitUpload(w, r, maxBytes)
+	release, busy := s.admitUpload(w, r, lim.file)
 	if busy != nil {
 		reject(busy)
 		return
 	}
 	defer release()
-	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+multipartSlack)
+	r.Body = http.MaxBytesReader(w, r.Body, lim.body)
 	defer s.paceBody(w, r)() // also bounds net/http's drain of an unread body tail
 
 	mr, err := r.MultipartReader()
@@ -100,7 +106,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	}
 	part, err := nextVideoPart(mr)
 	if err != nil {
-		reject(bodyError(err, maxBytes), "err", err)
+		reject(bodyError(err, lim.tooLarge), "err", err)
 		return
 	}
 	// The part is deliberately never Closed: Part.Close drains the rest of the part,
@@ -111,20 +117,19 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	br := bufio.NewReaderSize(part, uploadBufferSize)
 	head, err := br.Peek(media.SniffBytes)
 	if err != nil && !errors.Is(err, io.EOF) {
-		reject(bodyError(err, maxBytes), "err", err)
+		reject(bodyError(err, lim.tooLarge), "err", err)
 		return
 	}
 	format, ok := media.Sniff(head)
 	if !ok {
-		reject(NewAPIError(http.StatusBadRequest, CodeUnsupportedFormat,
-			"unsupported file type: upload an MP4, MOV, WebM or MKV video"), "declared_type", part.Header.Get("Content-Type"))
+		reject(errUnsupportedFormat(), "declared_type", part.Header.Get("Content-Type"))
 		return
 	}
 
 	// 4. Stream to scratch, hashing and counting on the way.
 	jobID := ids.NewJob()
 	noteJob(ctx, jobID)
-	up, err := s.spool(br, jobID, format.Ext, maxBytes)
+	up, err := s.spool(br, jobID, format.Ext, lim.file, lim.tooLarge)
 	if up != nil {
 		defer up.remove(s.d.Logger)
 	}
@@ -138,59 +143,141 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. ffprobe: decodable, duration, resolution and frame rate within the domain's
-	//    limits (media.FFmpeg also caps the decoder at maxPixels, so a decode bomb is
-	//    CANNOT_DECODE before it can use much memory).
+	// 5.-6. Probe, validate, store, create.
+	err = s.ingest(ctx, dc, ingestInput{
+		jobID: jobID, path: up.path, format: format, sha256: up.sha256, size: up.size,
+		fileName: sanitizeFileName(part.FileName()), ipHash: s.ipHash(r), via: "request",
+	})
+	var rej *rejection
+	var ie *ingestError
+	switch {
+	case errors.As(err, &rej):
+		reject(rej.e, rej.attrs...)
+		return
+	case errors.As(err, &ie):
+		fail(ie.op, ie.err)
+		return
+	case err != nil:
+		fail("ingest", err)
+		return
+	}
+	w.Header().Set("Location", jobPath(dc.Key, jobID))
+	writeJSON(w, http.StatusAccepted, CreateJobResponse{JobID: jobID, Status: JobQueued})
+}
+
+// requestLimits bounds one POST /jobs: the video file and the whole multipart body.
+type requestLimits struct {
+	file, body int64
+	tooLarge   func() *APIError // the 413 for a body or file over the limits
+}
+
+// requestLimit is the domain's upload limit, lowered to Deps.MaxRequestBytes: the
+// ingress refuses larger bodies anyway, and those videos take the chunked upload.
+func (s *Server) requestLimit(dc *domain.Config) requestLimits {
+	maxUpload := dc.Limits.MaxUploadBytes
+	l := requestLimits{file: maxUpload, body: maxUpload + multipartSlack,
+		tooLarge: func() *APIError { return errTooLarge(maxUpload) }}
+	if m := s.d.MaxRequestBytes; m > 0 && m < l.body {
+		l.body, l.file = m, min(maxUpload, m)
+		l.tooLarge = func() *APIError { return errRequestTooLarge(dc, m) }
+	}
+	return l
+}
+
+// errRequestTooLarge: the video may be fine, but not in one request.
+func errRequestTooLarge(dc *domain.Config, maxRequest int64) *APIError {
+	return NewAPIError(http.StatusRequestEntityTooLarge, CodeUploadTooLarge,
+		fmt.Sprintf("the upload is larger than the %s one request may carry: send it as a chunked upload (POST %s%s/uploads)",
+			formatBytes(maxRequest), domainsPrefix, dc.Key)).
+		WithDetails(map[string]any{"maxUploadBytes": dc.Limits.MaxUploadBytes, "maxRequestBytes": maxRequest})
+}
+
+func errUnsupportedFormat() *APIError {
+	return NewAPIError(http.StatusBadRequest, CodeUnsupportedFormat,
+		"unsupported file type: upload an MP4, MOV, WebM or MKV video")
+}
+
+// ingestInput is a complete upload on scratch: sniffed, hashed and counted.
+type ingestInput struct {
+	jobID    string
+	path     string
+	format   media.Format
+	sha256   string
+	size     int64
+	fileName string // sanitised
+	ipHash   string
+	via      string // "request" or "chunked", for the log
+}
+
+// rejection is a client-side problem with an upload: the envelope to answer with and
+// the attributes to log it with.
+type rejection struct {
+	e     *APIError
+	attrs []any
+}
+
+func (r *rejection) Error() string { return r.e.Error() }
+
+// ingestError is a server-side failure of step op.
+type ingestError struct {
+	op  string
+	err error
+}
+
+func (e *ingestError) Error() string { return e.op + ": " + e.err.Error() }
+func (e *ingestError) Unwrap() error { return e.err }
+
+// ingest turns a complete upload on scratch into a job — the part both upload paths
+// share. ffprobe checks it is decodable, and its duration, resolution and frame rate
+// against the domain's limits (media.FFmpeg also caps the decoder at maxPixels, so a
+// decode bomb is CANNOT_DECODE before it can use much memory); then the original is
+// stored and the job row + River job are inserted in one transaction. It returns a
+// *rejection for a video the domain does not accept and an *ingestError for a
+// server-side failure (anything already stored is deleted again).
+func (s *Server) ingest(ctx context.Context, dc *domain.Config, in ingestInput) error {
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
-	info, err := s.d.Prober.Probe(pctx, up.path)
+	info, err := s.d.Prober.Probe(pctx, in.path)
 	cancel()
 	if errors.Is(err, media.ErrCannotDecode) {
-		reject(NewAPIError(http.StatusBadRequest, CodeCannotDecode, "the video could not be decoded"), "err", err)
-		return
+		return &rejection{e: NewAPIError(http.StatusBadRequest, CodeCannotDecode, "the video could not be decoded"), attrs: []any{"err", err}}
 	}
 	if err != nil {
-		fail("probe", err)
-		return
+		return &ingestError{op: "probe", err: err}
 	}
 	if e := validateVideo(dc, info); e != nil {
-		reject(e, "duration_sec", info.DurationSec, "width", info.Width, "height", info.Height, "fps", info.FPS)
-		return
+		return &rejection{e: e, attrs: []any{"duration_sec", info.DurationSec, "width", info.Width, "height", info.Height, "fps", info.FPS}}
 	}
-	info.MIME = format.MIME
-	info.SHA256 = up.sha256
-	info.SizeBytes = up.size
-	info.OriginalName = sanitizeFileName(part.FileName())
+	info.MIME = in.format.MIME
+	info.SHA256 = in.sha256
+	info.SizeBytes = in.size
+	info.OriginalName = in.fileName
 
-	// 6. Store the original, then job row + River job in one transaction.
-	key := storage.OriginalKey(dc.Key, jobID, format.Ext)
-	if err := s.putFile(ctx, key, up.path, format.MIME); err != nil {
+	key := storage.OriginalKey(dc.Key, in.jobID, in.format.Ext)
+	if err := s.putFile(ctx, key, in.path, in.format.MIME); err != nil {
 		s.deleteBestEffort(ctx, key)
-		fail("store original", err)
-		return
+		return &ingestError{op: "store original", err: err}
 	}
 	nj := store.NewJob{
-		ID:           jobID,
+		ID:           in.jobID,
 		DomainKey:    dc.Key,
 		ExpiresAt:    s.d.Now().UTC().Add(time.Duration(dc.RetentionHours) * time.Hour),
-		ClientIPHash: s.ipHash(r),
+		ClientIPHash: in.ipHash,
 		VideoPath:    key,
 		VideoInfo:    info,
 		ModelName:    dc.Model.Name,
 	}
 	err = s.d.Store.CreateJob(ctx, nj, func(ctx context.Context, tx pgx.Tx) error {
-		return s.d.Enqueuer.EnqueuePipelineTx(ctx, tx, jobID)
+		return s.d.Enqueuer.EnqueuePipelineTx(ctx, tx, in.jobID)
 	})
 	if err != nil {
 		s.deleteBestEffort(ctx, key)
-		fail("insert job", err)
-		return
+		return &ingestError{op: "insert job", err: err}
 	}
 
 	metrics.JobsCreated.WithLabelValues(dc.Key).Inc()
-	s.d.Logger.InfoContext(ctx, "httpapi: job created", "domain", dc.Key, "job_id", jobID,
-		"bytes", up.size, "mime", format.MIME, "duration_sec", info.DurationSec, "width", info.Width, "height", info.Height)
-	w.Header().Set("Location", jobPath(dc.Key, jobID))
-	writeJSON(w, http.StatusAccepted, CreateJobResponse{JobID: jobID, Status: JobQueued})
+	s.d.Logger.InfoContext(ctx, "httpapi: job created", "domain", dc.Key, "job_id", in.jobID, "upload", in.via,
+		"bytes", in.size, "mime", in.format.MIME, "duration_sec", info.DurationSec, "width", info.Width, "height", info.Height)
+	return nil
 }
 
 // nextVideoPart returns the first part named "video", draining any other part
@@ -215,15 +302,16 @@ func nextVideoPart(mr *multipart.Reader) (*multipart.Part, error) {
 	}
 }
 
-// bodyError maps a failure reading the request body to an envelope.
-func bodyError(err error, maxBytes int64) *APIError {
+// bodyError maps a failure reading the request body to an envelope (tooLarge: the
+// 413 for a body over its cap).
+func bodyError(err error, tooLarge func() *APIError) *APIError {
 	var apiErr *APIError
 	var mbe *http.MaxBytesError
 	switch {
 	case errors.As(err, &apiErr):
 		return apiErr
 	case errors.As(err, &mbe):
-		return errTooLarge(maxBytes)
+		return tooLarge()
 	case errors.Is(err, errUploadTooSlow):
 		// The connection read side is dead by now; the client may still read this.
 		return NewAPIError(http.StatusBadRequest, CodeInvalidRequest, "the upload was too slow and was cut off")
@@ -281,9 +369,9 @@ func (u *spooled) remove(log *slog.Logger) {
 
 // spool copies at most maxBytes from src to ScratchDir/uploads/<jobID>.<ext>. It
 // returns a non-nil *spooled whenever the file was created, so the caller can always
-// remove it. Errors are *APIError for client-side problems (too large, broken body)
-// and plain errors for server-side ones.
-func (s *Server) spool(src io.Reader, jobID, ext string, maxBytes int64) (*spooled, error) {
+// remove it. Errors are *APIError for client-side problems (too large: tooLarge(),
+// broken body) and plain errors for server-side ones.
+func (s *Server) spool(src io.Reader, jobID, ext string, maxBytes int64, tooLarge func() *APIError) (*spooled, error) {
 	dir := s.uploadDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create upload dir: %w", err)
@@ -301,13 +389,13 @@ func (s *Server) spool(src io.Reader, jobID, ext string, maxBytes int64) (*spool
 	switch {
 	case rr.err != nil:
 		// Keep the cause for the log; errors.As still finds the envelope.
-		return up, fmt.Errorf("read upload: %w (%w)", bodyError(rr.err, maxBytes), rr.err)
+		return up, fmt.Errorf("read upload: %w (%w)", bodyError(rr.err, tooLarge), rr.err)
 	case copyErr != nil:
 		return up, fmt.Errorf("write upload file: %w", copyErr)
 	case closeErr != nil:
 		return up, fmt.Errorf("close upload file: %w", closeErr)
 	case n > maxBytes:
-		return up, errTooLarge(maxBytes)
+		return up, tooLarge()
 	}
 	up.sha256 = hex.EncodeToString(h.Sum(nil))
 	return up, nil

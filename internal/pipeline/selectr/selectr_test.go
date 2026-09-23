@@ -30,8 +30,9 @@ var testShots = []domain.Shot{
 
 var carWeights = domain.Weights{Relevance: 0.5, Sharpness: 0.4, Exposure: 0.1}
 
+// params is the car-like setup, one image per shot (cars.yaml: maxPerShot 1).
 func params(imageCount int) Params {
-	return Params{ImageCount: imageCount, Shots: testShots, Weights: carWeights, DedupeMaxHamming: 6}
+	return Params{ImageCount: imageCount, Shots: testShots, Weights: carWeights, DedupeMaxHamming: 6, MaxPerShot: 1}
 }
 
 // code spreads the bits of k over bytes, so any two codes are ≥ 8 bits apart (> the
@@ -61,6 +62,15 @@ func ids(out *Output) []string {
 	r := make([]string, len(out.Images))
 	for i, s := range out.Images {
 		r[i] = s.Candidate.ID
+	}
+	return r
+}
+
+// selShots returns the ShotID of every selected image.
+func selShots(out *Output) []string {
+	r := make([]string, len(out.Images))
+	for i, s := range out.Images {
+		r[i] = s.ShotID
 	}
 	return r
 }
@@ -111,7 +121,14 @@ func TestParamsForCars(t *testing.T) {
 	assert.Equal(t, cars.Selection.Weights, p.Weights)
 	assert.Equal(t, cars.Selection.DedupeMaxHamming, p.DedupeMaxHamming)
 	assert.Equal(t, MinGapSec, p.MinGapSec)
+	assert.Equal(t, cars.Selection.EffectiveMaxPerShot(), p.MaxPerShot)
+	assert.Equal(t, 1, p.MaxPerShot, "cars: one photo per angle")
 	assert.Nil(t, p.Preferred)
+	assert.Nil(t, p.Assessments)
+
+	noCap := *cars
+	noCap.Selection.MaxPerShot = 0
+	assert.Equal(t, 0, ParamsFor(&noCap).MaxPerShot, "a domain without maxPerShot: no cap")
 }
 
 func TestSelectFullCoverage(t *testing.T) {
@@ -154,8 +171,15 @@ func TestSelectFewerThanImageCount(t *testing.T) {
 		mk("oth", domain.OtherShotID, 20, 0.5, 0, 5),
 	}
 	out := Select(cands, params(8))
-	assert.Equal(t, []string{"f34", "side", "front_a", "front_b", "oth"}, ids(out))
+	// front_b is a second "front" view: the cap of 1 (params) keeps it out.
+	assert.Equal(t, []string{"f34", "side", "front_a", "oth"}, ids(out))
 	assert.Equal(t, []string{"rear_three_quarter", "interior_dashboard"}, shotIDs(out.MissingShots))
+	assert.Equal(t, "Only 4 distinct high-quality views were found. Missing: Rear 3/4, Dashboard.", out.Explanation)
+
+	p := params(8)
+	p.MaxPerShot = 2
+	out = Select(cands, p)
+	assert.Equal(t, []string{"f34", "side", "front_a", "front_b", "oth"}, ids(out))
 	assert.Equal(t, "Only 5 distinct high-quality views were found. Missing: Rear 3/4, Dashboard.", out.Explanation)
 }
 
@@ -197,11 +221,17 @@ func TestSelectDuplicatesAndGapInFill(t *testing.T) {
 	}
 	cands[1].DHash = code(1) ^ 1
 	cands[6].DHash = code(5) ^ 1
-	out := Select(cands, params(8))
+	p := params(8)
+	p.MaxPerShot = 10 // this test is about distinctness, not the per-shot cap
+	out := Select(cands, p)
 	// a1 by coverage; fill in score order: f_dup (dup), f_near (0.99 s), f_ok (ok),
 	// f_near_ok (0.5 s from f_ok), o1 (ok), o1_twin (dup of o1).
 	assert.Equal(t, []string{"f_ok", "a1", "o1"}, ids(out))
 	assert.Equal(t, "Only 3 distinct high-quality views were found. Missing: Side profile, Rear 3/4, Dashboard.", out.Explanation)
+
+	// With the cap of 1 (params) the fill pass adds no second front 3/4 or other frame.
+	out = Select(cands, params(8))
+	assert.Equal(t, []string{"a1", "o1"}, ids(out))
 }
 
 func TestSelectMinGap(t *testing.T) {
@@ -211,7 +241,8 @@ func TestSelectMinGap(t *testing.T) {
 		mk("c", "front_three_quarter", 13, 0.9, 0.2, 3),
 	}
 	p := params(8)
-	p.MinGapSec = 0 // → MinGapSec (1 s): all three are ≥ 1 s apart
+	p.MaxPerShot = 3 // this test is about the gap, not the per-shot cap
+	p.MinGapSec = 0  // → MinGapSec (1 s): all three are ≥ 1 s apart
 	assert.Equal(t, []string{"a", "b", "c"}, ids(Select(cands, p)))
 
 	p.MinGapSec = 2.5 // b is 2 s from a; c is 3 s from a
@@ -297,9 +328,17 @@ func TestSelectPreferred(t *testing.T) {
 
 	t.Run("preferred first, best-scoring still eligible for fill", func(t *testing.T) {
 		p := params(8)
+		p.MaxPerShot = 2
 		p.Preferred = map[string]string{"front_three_quarter": "f_pick"}
 		out := Select(base(), p)
 		assert.Equal(t, []string{"f_top", "f_pick", "s_top"}, ids(out), "f_top joins in the fill pass")
+	})
+
+	t.Run("preferred first, the cap keeps the best-scoring out", func(t *testing.T) {
+		p := params(8)
+		p.Preferred = map[string]string{"front_three_quarter": "f_pick"}
+		out := Select(base(), p)
+		assert.Equal(t, []string{"f_pick", "s_top"}, ids(out))
 	})
 }
 
@@ -318,8 +357,9 @@ func TestSelectOrdering(t *testing.T) {
 		mk("a20", "a", 20, 0.1, 0, 6),
 		mk("b15", "b", 15, 0.1, 0, 7),
 	}
-	out := Select(cands, Params{ImageCount: 10, Shots: shots, Weights: carWeights, DedupeMaxHamming: 6})
+	out := Select(cands, Params{ImageCount: 10, Shots: shots, Weights: carWeights, DedupeMaxHamming: 6, MaxPerShot: 2})
 	assert.Equal(t, []string{"a9", "a20", "b5", "b15", "c1", "other0", "unknown3"}, ids(out))
+	assert.Equal(t, []string{"a", "a", "b", "b", "c", domain.OtherShotID, "zzz"}, selShots(out))
 	assert.Empty(t, out.MissingShots)
 	assert.Equal(t, "Only 7 distinct high-quality views were found.", out.Explanation)
 }
@@ -348,8 +388,36 @@ func TestSelectAllRejected(t *testing.T) {
 func TestSelectDeterministic(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2))
 	shotPool := append(shotIDs(testShots), domain.OtherShotID, "not_in_list")
-	var cands []score.Scored
-	for i := range 80 {
+	cands := randomCands(r, 80, shotPool)
+	for _, maxPerShot := range []int{0, 1, 2} {
+		t.Run(fmt.Sprintf("maxPerShot=%d", maxPerShot), func(t *testing.T) {
+			p := params(8)
+			p.MaxPerShot = maxPerShot
+			p.Preferred = map[string]string{"side_profile": cands[7].ID, "front": cands[11].ID}
+			want := Select(cands, p)
+			require.NotEmpty(t, want.Images)
+
+			for range 25 {
+				got := Select(shuffle(r, cands), p)
+				assert.Equal(t, want, got)
+			}
+			limit := maxPerShot
+			if limit <= 0 {
+				limit = len(cands) // no cap
+			}
+			assertInvariants(t, want, limit)
+			for _, img := range want.Images {
+				assert.Equal(t, img.Candidate.ShotID, img.ShotID, "no review: the scene's shot")
+			}
+		})
+	}
+}
+
+// randomCands builds n candidates with many ties: frames within 1 s of each other,
+// equal scores, identical hashes; about one in eight is rejected.
+func randomCands(r *rand.Rand, n int, shotPool []string) []score.Scored {
+	cands := make([]score.Scored, 0, n)
+	for i := range n {
 		c := mk(fmt.Sprintf("cf_%03d", i), shotPool[r.IntN(len(shotPool))],
 			float64(r.IntN(240))/4, // many frames within 1 s of each other
 			float64(r.IntN(4))/4,   // coarse values → many exact score ties
@@ -360,26 +428,31 @@ func TestSelectDeterministic(t *testing.T) {
 		}
 		cands = append(cands, c)
 	}
-	p := params(8)
-	p.Preferred = map[string]string{"side_profile": cands[7].ID, "front": cands[11].ID}
-	want := Select(cands, p)
-	require.NotEmpty(t, want.Images)
+	return cands
+}
 
-	for range 25 {
-		shuffled := append([]score.Scored(nil), cands...)
-		r.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
-		got := Select(shuffled, p)
-		assert.Equal(t, want, got)
-	}
+func shuffle(r *rand.Rand, cands []score.Scored) []score.Scored {
+	out := append([]score.Scored(nil), cands...)
+	r.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	return out
+}
 
-	// The selection honours the invariants.
-	for i, a := range want.Images {
+// assertInvariants checks that no rejected frame was selected, all selected frames are
+// pairwise distinct, and no shot has more than maxPerShot images.
+func assertInvariants(t *testing.T, out *Output, maxPerShot int) {
+	t.Helper()
+	perShot := map[string]int{}
+	for i, a := range out.Images {
 		assert.Empty(t, a.Candidate.Rejected)
-		for _, b := range want.Images[i+1:] {
+		perShot[a.ShotID]++
+		for _, b := range out.Images[i+1:] {
 			assert.Greater(t, score.Hamming(a.Candidate.DHash, b.Candidate.DHash), 6)
 			d := a.Candidate.TimestampSec - b.Candidate.TimestampSec
 			assert.GreaterOrEqual(t, max(d, -d), 1.0)
 		}
+	}
+	for shot, n := range perShot {
+		assert.LessOrEqual(t, n, maxPerShot, "shot %s", shot)
 	}
 }
 
@@ -430,6 +503,8 @@ func TestSelectTieBreaks(t *testing.T) {
 	assert.Equal(t, []string{"a", "early"}, ids(Select(cands, p)))
 
 	p.ImageCount = 8
+	assert.Equal(t, []string{"a", "early"}, ids(Select(cands, p)), "the cap keeps late out")
+	p.MaxPerShot = 2
 	assert.Equal(t, []string{"a", "early", "late"}, ids(Select(cands, p)))
 }
 
@@ -443,9 +518,41 @@ func TestSelectShotListedTwice(t *testing.T) {
 		mk("a1", "a", 1, 0.9, 1, 1),
 		mk("a2", "a", 5, 0.8, 1, 2),
 	}
-	out := Select(cands, Params{ImageCount: 2, Shots: shots, Weights: carWeights, DedupeMaxHamming: 6})
-	// The duplicate entry does not take a second coverage slot; a2 arrives via fill.
-	assert.Equal(t, []string{"a1", "a2"}, ids(out))
+	p := Params{ImageCount: 2, Shots: shots, Weights: carWeights, DedupeMaxHamming: 6, MaxPerShot: 1}
+	// The duplicate entry neither takes a second coverage slot nor lifts the cap.
+	out := Select(cands, p)
+	assert.Equal(t, []string{"a1"}, ids(out))
 	assert.Equal(t, []string{"b"}, shotIDs(out.MissingShots))
+	assert.Equal(t, "Only 1 distinct high-quality view was found. Missing: B.", out.Explanation)
+
+	// With room for two, a2 arrives via fill.
+	p.MaxPerShot = 2
+	out = Select(cands, p)
+	assert.Equal(t, []string{"a1", "a2"}, ids(out))
 	assert.Equal(t, "2 images selected. Not clearly visible in the video: B.", out.Explanation)
+}
+
+// The review can link two frames of DIFFERENT shots as the same view (a dashboard frame
+// labelled "odometer"): pixel hashes and the time gap miss this, the link must not.
+func TestSelectReviewDuplicateLink(t *testing.T) {
+	dash := mk("dash", "interior_dashboard", 31.5, 0.9, 1, 1)
+	odo := mk("odo", "odometer", 33.0, 0.9, 1, 2) // a different hash: far apart in pixels
+	p := Params{
+		ImageCount: 8, MaxPerShot: 1, MinGapSec: MinGapSec, DedupeMaxHamming: 6,
+		Shots: []domain.Shot{
+			{ID: "interior_dashboard", Label: "Dashboard", Required: true},
+			{ID: "odometer", Label: "Odometer"},
+		},
+		Weights: domain.Weights{Relevance: 0.5, Sharpness: 0.4, Exposure: 0.1},
+		Assessments: map[string]Assessment{
+			"dash": {View: "interior_dashboard", Usable: true, Quality: 4},
+			"odo":  {View: "odometer", Usable: true, Quality: 4, DuplicateOf: "dash"},
+		},
+	}
+	out := Select([]score.Scored{dash, odo}, p)
+	require.Len(t, out.Images, 1)
+	assert.Equal(t, "dash", out.Images[0].Candidate.ID)
+
+	p.Assessments["odo"] = Assessment{View: "odometer", Usable: true, Quality: 4}
+	assert.Len(t, Select([]score.Scored{dash, odo}, p).Images, 2, "without the link both are kept")
 }

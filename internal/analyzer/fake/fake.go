@@ -1,7 +1,9 @@
 // Package fake is a deterministic, free analyzer.Analyzer for tests, e2e runs and local
 // UI work (V2I_ANALYZER=fake). It never touches the network: for the analyze step it
 // returns either a canned JSON file verbatim or synthetic scenes spread evenly over the
-// video, one per shot ID; for the re-rank step it returns no picks.
+// video, one per shot ID; for the review step it approves every frame it was shown
+// (upright, the proposed view, fully visible, quality 4, a centred subject box); for the
+// legacy re-rank step it returns no picks.
 //
 // A request whose SourceName contains "reject" (case-insensitive) fails the domain gate,
 // so tests and demos can exercise the rejection path deterministically.
@@ -15,6 +17,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -92,6 +95,12 @@ func (a *Analyzer) Generate(ctx context.Context, req *analyzer.Request) (*analyz
 	}
 
 	var text string
+	usage := analyzer.Usage{
+		Model:        ModelPrefix + req.Model,
+		InputTokens:  int(duration*100) + 500,
+		OutputTokens: 300,
+		Latency:      a.delay,
+	}
 	switch req.Step {
 	case analyzer.StepAnalyze:
 		if a.canned != nil {
@@ -103,6 +112,36 @@ func (a *Analyzer) Generate(ctx context.Context, req *analyzer.Request) (*analyz
 			}
 			text = string(b)
 		}
+	case analyzer.StepReview:
+		if ids, ok := orientIDs(req.ResponseSchema); ok {
+			// The review's orientation call: every frame is upright as stored.
+			type entry struct {
+				ID      string `json:"id"`
+				Upright string `json:"upright"`
+			}
+			out := struct {
+				Images []entry `json:"images"`
+			}{Images: []entry{}}
+			for _, id := range ids {
+				out.Images = append(out.Images, entry{ID: id, Upright: "top-left"})
+			}
+			b, err := json.Marshal(out)
+			if err != nil {
+				return nil, fmt.Errorf("fake: encode orientation response: %w", err)
+			}
+			text = string(b)
+			usage.InputTokens = ReviewTokensPerImage * len(ids)
+			usage.OutputTokens = 10 * len(ids)
+			break
+		}
+		resp := synthesizeReview(req)
+		b, err := json.Marshal(resp)
+		if err != nil {
+			return nil, fmt.Errorf("fake: encode review response: %w", err)
+		}
+		text = string(b)
+		usage.InputTokens = ReviewBaseTokens + ReviewTokensPerImage*len(resp.Images)
+		usage.OutputTokens = ReviewOutputTokensPerImage * len(resp.Images)
 	case analyzer.StepRerank:
 		text = `{"picks":[]}`
 	default:
@@ -123,13 +162,8 @@ func (a *Analyzer) Generate(ctx context.Context, req *analyzer.Request) (*analyz
 		"job_id", req.JobID, "domain", req.DomainKey, "step", req.Step, "bytes", len(text))
 
 	return &analyzer.Response{
-		Text: text,
-		Usage: analyzer.Usage{
-			Model:        ModelPrefix + req.Model,
-			InputTokens:  int(duration*100) + 500,
-			OutputTokens: 300,
-			Latency:      a.delay,
-		},
+		Text:        text,
+		Usage:       usage,
 		FileHandles: make([]string, len(req.Parts)),
 	}, nil
 }
@@ -217,4 +251,90 @@ func FormatTimestamp(sec float64) string {
 	m := cs / 6000
 	rem := cs % 6000
 	return fmt.Sprintf("%02d:%02d.%02d", m, rem/100, rem%100)
+}
+
+// Synthetic review usage: a plausible order of magnitude per image sent, so the result
+// page shows non-zero tokens in fake runs (the fake is still priced at $0).
+const (
+	ReviewBaseTokens           = 600
+	ReviewTokensPerImage       = 258
+	ReviewOutputTokensPerImage = 50
+)
+
+// ReviewBox is the box_2d ([ymin, xmin, ymax, xmax], 0-1000) the fake reports for every
+// reviewed frame: a centred subject with room around it.
+var ReviewBox = [4]int{150, 100, 850, 900}
+
+// The types below mirror the JSON shape internal/pipeline/review parses.
+
+type reviewImage struct {
+	ID                  string `json:"id"`
+	Rotation            int    `json:"rotation"`
+	View                string `json:"view"`
+	SubjectFullyVisible bool   `json:"subjectFullyVisible"`
+	Quality             int    `json:"quality"`
+	Box2D               [4]int `json:"box_2d"`
+	Issues              string `json:"issues"`
+}
+
+type reviewResponse struct {
+	Images []reviewImage `json:"images"`
+}
+
+// proposedViewRe finds "id <id>, proposed view: <view>" in a review text part.
+var proposedViewRe = regexp.MustCompile(`\bid (\S+), proposed view: (\S+)`)
+
+// synthesizeReview approves every frame of the request. The frame IDs come from the
+// response schema (images.items.properties.id.Enum, in the order sent); the proposed
+// view of each comes from its "Image <n> — id <id>, proposed view: <view>" text part
+// ("other" when absent).
+func synthesizeReview(req *analyzer.Request) reviewResponse {
+	views := map[string]string{}
+	for _, p := range req.Parts {
+		if m := proposedViewRe.FindStringSubmatch(p.Text); m != nil {
+			if _, ok := views[m[1]]; !ok {
+				views[m[1]] = m[2]
+			}
+		}
+	}
+	resp := reviewResponse{Images: []reviewImage{}}
+	for _, id := range reviewIDs(req.ResponseSchema) {
+		view, ok := views[id]
+		if !ok {
+			view = "other"
+		}
+		resp.Images = append(resp.Images, reviewImage{
+			ID: id, View: view, SubjectFullyVisible: true, Quality: 4, Box2D: ReviewBox,
+		})
+	}
+	return resp
+}
+
+// reviewIDs returns images.items.properties.id.Enum of the review schema, or nil.
+func reviewIDs(s *analyzer.Schema) []string {
+	if s == nil {
+		return nil
+	}
+	images := s.Properties["images"]
+	if images == nil || images.Items == nil {
+		return nil
+	}
+	id := images.Items.Properties["id"]
+	if id == nil {
+		return nil
+	}
+	return id.Enum
+}
+
+// orientIDs returns the ids of an orientation request (its answer schema has an
+// "upright" field), or ok false for any other request.
+func orientIDs(s *analyzer.Schema) ([]string, bool) {
+	if s == nil || s.Properties["images"] == nil || s.Properties["images"].Items == nil {
+		return nil, false
+	}
+	item := s.Properties["images"].Items
+	if _, ok := item.Properties["upright"]; !ok || item.Properties["id"] == nil {
+		return nil, false
+	}
+	return item.Properties["id"].Enum, true
 }

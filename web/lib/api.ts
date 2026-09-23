@@ -18,10 +18,14 @@ export type ProgressStep = Schemas["ProgressStep"];
 export type StepName = ProgressStep["name"];
 export type StepStatus = ProgressStep["status"];
 export type ResultImage = Schemas["ResultImage"];
+export type JobUsage = Schemas["JobUsage"];
+export type UsageStep = Schemas["UsageStep"];
 export type ShotRef = Schemas["ShotRef"];
 export type PublicDomain = Schemas["PublicDomain"];
 export type PublicLimits = Schemas["PublicLimits"];
 export type CreateJobResponse = Schemas["CreateJobResponse"];
+export type CreateUploadRequest = Schemas["CreateUploadRequest"];
+export type UploadSession = Schemas["UploadSession"];
 export type ErrorDetail = Schemas["ErrorDetail"];
 export type ErrorCode = ErrorDetail["code"];
 
@@ -39,6 +43,8 @@ export const ERROR_CODES = [
   "RESOLUTION_TOO_LOW",
   "RESOLUTION_TOO_HIGH",
   "SERVER_BUSY",
+  "UPLOAD_NOT_FOUND",
+  "UPLOAD_INCOMPLETE",
   "RATE_LIMITED",
   "JOB_NOT_FOUND",
   "IMAGE_NOT_FOUND",

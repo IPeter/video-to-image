@@ -100,6 +100,34 @@ func (q *Queries) ListSteps(ctx context.Context, arg ListStepsParams) ([]JobStep
 	return items, nil
 }
 
+const mergeStepMeta = `-- name: MergeStepMeta :execrows
+UPDATE job_steps
+SET meta = (meta - $1::text[]) || $2::jsonb
+WHERE job_id = $3 AND name = $4
+`
+
+type MergeStepMetaParams struct {
+	Remove []string
+	Set    []byte
+	JobID  string
+	Name   string
+}
+
+// Drops the keys in @remove from meta, then adds or replaces the keys of @set; status
+// and times are unchanged.
+func (q *Queries) MergeStepMeta(ctx context.Context, arg MergeStepMetaParams) (int64, error) {
+	result, err := q.db.Exec(ctx, mergeStepMeta,
+		arg.Remove,
+		arg.Set,
+		arg.JobID,
+		arg.Name,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const skipRemainingSteps = `-- name: SkipRemainingSteps :execrows
 UPDATE job_steps
 SET status      = 'skipped',

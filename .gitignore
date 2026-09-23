@@ -35,3 +35,6 @@ coverage.out
 /deploy/k8s/overlays/*/gemini.env
 /deploy/k8s/overlays/*/basic-auth.users
 /deploy/k8s/overlays/*/basic-auth.password
+
+# Local test videos (large, personal: phone videos carry GPS metadata)
+/test-video/

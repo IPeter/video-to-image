@@ -61,7 +61,11 @@ spec:
           livenessProbe:
             httpGet: { path: /livez, port: admin }
             periodSeconds: 20
-          resources: # FFmpeg is the hog (plan/10); FFMPEG_THREADS bounds it per process
+          # FFmpeg is the hog (plan/10); FFMPEG_THREADS bounds it per process. One 4K HEVC
+          # extract process holds ~450 MiB at 2 threads (~700 MiB at 4): size the memory
+          # limit as V2I_PIPELINE_WORKERS x V2I_EXTRACT_CONCURRENCY x that, plus the worker.
+          # Under this CPU limit parallel extracts barely help (3 at once: 34 s, in turn: 39 s).
+          resources:
             requests: { cpu: "1", memory: 1Gi }
             limits: { cpu: "4", memory: 4Gi }
           securityContext:

@@ -52,7 +52,7 @@ export interface paths {
         put?: never;
         /**
          * Upload a video and start a job
-         * @description multipart/form-data with one field `video`. Streams to storage, validates with ffprobe, enqueues.
+         * @description multipart/form-data with one field `video`. Streams to storage, validates with ffprobe, enqueues. A body above what one request may carry in this deployment is 413 UPLOAD_TOO_LARGE with details.maxRequestBytes: send such a video as a chunked upload (createUpload).
          */
         post: operations["createJob"];
         delete?: never;
@@ -136,6 +136,83 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/domains/{domainKey}/uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a chunked upload
+         * @description For files larger than one request may be (e.g. behind Cloudflare's 100 MB body limit). PUT the chunks, then complete. sizeBytes may be up to the domain's maxUploadBytes (else 413 UPLOAD_TOO_LARGE). Counts against the upload rate limit. An open upload holds an upload slot until it is completed, cancelled or idle past expiresAt (5 minutes before its first chunk, then the session TTL after its last request). A client that already has its maximum of open uploads gets its own longest-idle one (idle for 1 minute, no request in flight) cancelled to make room, else 429 RATE_LIMITED; when all upload slots are taken, the longest-idle upload of anyone idle for 5 minutes is cancelled, else 503 SERVER_BUSY. Retry-After says when one can be.
+         */
+        post: operations["createUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/domains/{domainKey}/uploads/{uploadId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Cancel a chunked upload */
+        delete: operations["abortUpload"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/domains/{domainKey}/uploads/{uploadId}/chunks/{index}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Upload one chunk
+         * @description Raw bytes (application/octet-stream) of chunk index (0-based). Re-sending a chunk replaces it. Every chunk but the last must be exactly chunkSizeBytes: a Content-Length must match it, and a body without one (chunked transfer) must end after exactly that many bytes (else 400 with details {index, expectedBytes, contentLength}). Chunks may be sent in any order and in parallel. A refused chunk's body is read before the answer, so the client can read it.
+         */
+        put: operations["putUploadChunk"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/domains/{domainKey}/uploads/{uploadId}/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Finish a chunked upload and start the job
+         * @description Validates the assembled file exactly like POST /jobs (format, decode, duration, resolution) and enqueues the job. 409 UPLOAD_INCOMPLETE lists the missing chunks in details (an older PUT of a chunk that a newer PUT already stored is waited for, at most a few seconds, and then cut off). Afterwards the upload is gone; calling complete again returns the same outcome, except after a 500, which keeps the chunks so complete can be retried.
+         */
+        post: operations["completeUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -157,12 +234,23 @@ export interface components {
              */
             status: "queued" | "processing" | "completed" | "rejected" | "failed" | "expired";
         };
+        CreateUploadRequest: {
+            /** @description The browser's MIME type; informational (the content is sniffed). */
+            contentType?: string;
+            /** @description The file's name (shown on the job; a name containing "reject" makes the fake analyzer fail the gate). */
+            fileName: string;
+            /**
+             * Format: int64
+             * @description Exact size of the whole file.
+             */
+            sizeBytes: number;
+        };
         ErrorDetail: {
             /**
              * @description Stable machine-readable error code.
              * @enum {string}
              */
-            code: "DOMAIN_NOT_FOUND" | "ORIGIN_NOT_ALLOWED" | "UNAUTHORIZED" | "INVALID_REQUEST" | "UPLOAD_TOO_LARGE" | "UNSUPPORTED_FORMAT" | "CANNOT_DECODE" | "TOO_LONG" | "TOO_SHORT" | "RESOLUTION_TOO_LOW" | "RESOLUTION_TOO_HIGH" | "SERVER_BUSY" | "RATE_LIMITED" | "JOB_NOT_FOUND" | "IMAGE_NOT_FOUND" | "NOT_READY" | "EXPIRED" | "MODEL_UNAVAILABLE" | "MODEL_BAD_OUTPUT" | "PROCESSING_ERROR" | "NOT_FOUND" | "INTERNAL_ERROR";
+            code: "DOMAIN_NOT_FOUND" | "ORIGIN_NOT_ALLOWED" | "UNAUTHORIZED" | "INVALID_REQUEST" | "UPLOAD_TOO_LARGE" | "UNSUPPORTED_FORMAT" | "CANNOT_DECODE" | "TOO_LONG" | "TOO_SHORT" | "RESOLUTION_TOO_LOW" | "RESOLUTION_TOO_HIGH" | "SERVER_BUSY" | "UPLOAD_NOT_FOUND" | "UPLOAD_INCOMPLETE" | "RATE_LIMITED" | "JOB_NOT_FOUND" | "IMAGE_NOT_FOUND" | "NOT_READY" | "EXPIRED" | "MODEL_UNAVAILABLE" | "MODEL_BAD_OUTPUT" | "PROCESSING_ERROR" | "NOT_FOUND" | "INTERNAL_ERROR";
             details?: unknown;
             message: string;
         };
@@ -182,6 +270,7 @@ export interface components {
              * @enum {string}
              */
             status: "queued" | "processing" | "completed" | "rejected" | "failed" | "expired";
+            usage: components["schemas"]["JobUsage"];
             video: components["schemas"]["VideoInfo"];
         };
         JobError: {
@@ -201,6 +290,28 @@ export interface components {
             /** @description All images + manifest.json; null when there are no images. */
             zipUrl: string | null;
         } | null;
+        JobUsage: {
+            /** Format: int64 */
+            calls: number;
+            /** @description Every step is priced, so costUsd is the whole cost (true when there were no calls). False: some calls went to a model missing from the price table, so their cost is unknown (not 0); also false when the usage could not be read. */
+            costComplete: boolean;
+            /**
+             * Format: double
+             * @description USD, computed from the price table when each call was made. Only the full cost when costComplete.
+             */
+            costUsd: number;
+            /** Format: int64 */
+            inputTokens: number;
+            /** Format: int64 */
+            outputTokens: number;
+            steps: components["schemas"]["UsageStep"][];
+            /** @description Every call was answered by the built-in test analyzer (model "fake:..."), so nothing was charged. False when there were no calls. */
+            testMode: boolean;
+            /** Format: int64 */
+            thinkingTokens: number;
+            /** Format: int64 */
+            totalTokens: number;
+        };
         Progress: {
             /** Format: int64 */
             percent: number;
@@ -264,6 +375,8 @@ export interface components {
             reason: string;
         } | null;
         ResultImage: {
+            /** @description The frame was cropped around the subject. */
+            cropped: boolean;
             /** @description Same as url with ?download=1 (Content-Disposition: attachment). */
             downloadUrl: string;
             /** @example cars_7K2M9QXA_1_front_three_quarter_00-06.jpg */
@@ -277,6 +390,11 @@ export interface components {
              */
             index: number;
             reason: string;
+            /**
+             * Format: int64
+             * @description Degrees clockwise the source frame was rotated to make it upright (0, 90, 180, 270).
+             */
+            rotation: number;
             shotId: string;
             shotLabel: string;
             /** @description 640 px wide JPG, relative to the API base URL. */
@@ -293,6 +411,25 @@ export interface components {
         ShotRef: {
             id: string;
             label: string;
+        };
+        UploadSession: {
+            /**
+             * Format: int64
+             * @description Chunks are numbered 0..chunkCount-1.
+             */
+            chunkCount: number;
+            /**
+             * Format: int64
+             * @description Every chunk but the last has exactly this size.
+             */
+            chunkSizeBytes: number;
+            /**
+             * Format: date-time
+             * @description The session and its chunks are dropped after this unless another request arrives: 5 minutes after create until the first chunk is stored, then the session TTL after the last request. It may also be cancelled earlier to make room once it has been idle (see createUpload).
+             */
+            expiresAt: string;
+            /** @example upl_01J8ZK3M2Q7K2M9QXA4B5C6D7E */
+            uploadId: string;
         };
         UsageReport: {
             /**
@@ -327,6 +464,27 @@ export interface components {
             thinkingTokens: number;
             /** Format: double */
             videoSeconds: number;
+        };
+        UsageStep: {
+            /** Format: int64 */
+            calls: number;
+            /** Format: double */
+            costUsd: number;
+            /** Format: int64 */
+            inputTokens: number;
+            /**
+             * @description The model that answered; the built-in test analyzer reports "fake:<model>".
+             * @example gemini-3.5-flash-lite
+             */
+            model: string;
+            /** Format: int64 */
+            outputTokens: number;
+            /** @description The model has a price in the price table, or is the free test analyzer ("fake:" prefix). False: real calls to a model without a price, recorded at costUsd 0 although they were billed. */
+            priced: boolean;
+            /** @example analyze */
+            step: string;
+            /** Format: int64 */
+            thinkingTokens: number;
         };
         VideoInfo: {
             /** Format: double */
@@ -962,6 +1120,352 @@ export interface operations {
             };
             /** @description INTERNAL_ERROR */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    createUpload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Domain key, e.g. cars. */
+                domainKey: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateUploadRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadSession"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Request Entity Too Large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    abortUpload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Domain key, e.g. cars. */
+                domainKey: string;
+                /** @description Upload session ID (upl_ + ULID). */
+                uploadId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    putUploadChunk: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @example cars */
+                domainKey: string;
+                uploadId: string;
+                index: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Chunk stored */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description INVALID_REQUEST (bad index or size) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description ORIGIN_NOT_ALLOWED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description DOMAIN_NOT_FOUND | UPLOAD_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description UPLOAD_TOO_LARGE */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description RATE_LIMITED */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description INTERNAL_ERROR */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description SERVER_BUSY */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    completeUpload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Domain key, e.g. cars. */
+                domainKey: string;
+                /** @description Upload session ID (upl_ + ULID). */
+                uploadId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accepted */
+            202: {
+                headers: {
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateJobResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

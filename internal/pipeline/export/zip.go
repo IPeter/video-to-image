@@ -76,12 +76,12 @@ func writeZip(ctx context.Context, w io.Writer, items []item, manifest []byte, m
 	return zw.Close()
 }
 
-// writeStored copies one JPEG uncompressed. Size and CRC are known from the upload
+// writeStored copies one JPEG (the uploaded bytes, it.path) uncompressed. Size and CRC are known from the upload
 // pass, so they go into the local header and no data descriptor follows: some
 // streaming unzippers (Java's ZipInputStream among them) reject stored entries with a
 // descriptor. The copy re-checks both, failing if the file changed in between.
 func writeStored(ctx context.Context, zw *zip.Writer, it item, modified time.Time) error {
-	f, err := os.Open(it.FullPath)
+	f, err := os.Open(it.path)
 	if err != nil {
 		return err
 	}
@@ -107,7 +107,7 @@ func writeStored(ctx context.Context, zw *zip.Writer, it item, modified time.Tim
 		return err
 	}
 	if n != it.Bytes || h.Sum32() != it.crc {
-		return fmt.Errorf("%s changed after upload", it.FullPath)
+		return fmt.Errorf("%s changed after upload", it.path)
 	}
 	return nil
 }

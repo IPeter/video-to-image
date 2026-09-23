@@ -81,30 +81,47 @@ func TestPreviewFrameCap(t *testing.T) {
 
 func TestPreviewArgsLimits(t *testing.T) {
 	f := &FFmpeg{MaxPixels: 8912896, Threads: 2}
-	args := f.previewArgs("/in.mp4", "/out.mp4", 480, 2, 180)
-	in := argIndex(args, 0, "-i", "/in.mp4")
-	require.Positive(t, in, "%q", args)
-
-	for _, pair := range [][2]string{{"-max_pixels", "8912896"}, {"-threads", "2"}, {"-t", "180"}, {"-filter_threads", "2"}} {
-		i := argIndex(args, 0, pair[0], pair[1])
-		assert.True(t, i >= 0 && i < in, "%s %s must be an input option (before -i): %q", pair[0], pair[1], args)
-	}
-	for _, pair := range [][2]string{
-		{"-threads", "2"}, // encoder
-		{"-frames:v", "360"},
-		{"-map_metadata", "-1"}, {"-map_chapters", "-1"},
-		{"-fflags", "+bitexact"}, {"-flags:v", "+bitexact"},
+	for _, tt := range []struct {
+		plan      previewPlan
+		frameCap  string
+		fpsFilter string
+	}{
+		{previewPlan{fps: 2, skip: skipNonRef}, "360", "fps=2"},
+		// The frame cap follows the preview's real (keyframe-limited) rate, and the
+		// frames the decoder produced are printed (see decodedGapShortfall).
+		{previewPlan{fps: 1, skip: skipNonKey}, "180", decodedFramesFilter + ",fps=1:eof_action=pass"},
 	} {
-		assert.Positive(t, argIndex(args, in, pair[0], pair[1]), "%s %s must be an output option (after -i): %q", pair[0], pair[1], args)
-	}
-	assert.Equal(t, "/out.mp4", args[len(args)-1])
+		args := f.previewArgs("/in.mp4", "/out.mp4", 480, 180, tt.plan)
+		in := argIndex(args, 0, "-i", "/in.mp4")
+		require.Positive(t, in, "%q", args)
 
-	// No limits configured: none of the optional options appear.
-	args = (&FFmpeg{}).previewArgs("/in.mp4", "/out.mp4", 480, 2, 0)
-	for _, opt := range []string{"-max_pixels", "-threads", "-filter_threads", "-t", "-frames:v"} {
+		for _, pair := range [][2]string{
+			{"-max_pixels", "8912896"}, {"-threads", "2"}, {"-t", "180"}, {"-filter_threads", "2"},
+			{"-skip_frame:v", tt.plan.skip},
+		} {
+			i := argIndex(args, 0, pair[0], pair[1])
+			assert.True(t, i >= 0 && i < in, "%s %s must be an input option (before -i): %q", pair[0], pair[1], args)
+		}
+		for _, pair := range [][2]string{
+			{"-threads", "2"}, // encoder
+			{"-frames:v", tt.frameCap},
+			{"-map_metadata", "-1"}, {"-map_chapters", "-1"},
+			{"-fflags", "+bitexact"}, {"-flags:v", "+bitexact"},
+			{"-vf", "scale=-2:'min(480,trunc(ih/2)*2)'," + tt.fpsFilter},
+		} {
+			assert.Positive(t, argIndex(args, in, pair[0], pair[1]), "%s %s must be an output option (after -i): %q", pair[0], pair[1], args)
+		}
+		assert.Equal(t, 1, countPairs(args, "-skip_frame:v", tt.plan.skip))
+		assert.Equal(t, "/out.mp4", args[len(args)-1])
+	}
+
+	// No limits configured and a full decode: none of the optional options appear.
+	args := (&FFmpeg{}).previewArgs("/in.mp4", "/out.mp4", 480, 0, previewPlan{fps: 2})
+	for _, opt := range []string{"-max_pixels", "-threads", "-filter_threads", "-t", "-frames:v", "-skip_frame:v"} {
 		assert.NotContains(t, args, opt)
 	}
 	assert.Positive(t, argIndex(args, 0, "-map_metadata", "-1"), "metadata is always stripped")
+	assert.Positive(t, argIndex(args, 0, "-vf", "scale=-2:'min(480,trunc(ih/2)*2)',fps=2"))
 }
 
 func TestExtractArgsLimits(t *testing.T) {
@@ -249,14 +266,15 @@ func TestBuildPreviewMaxPixels(t *testing.T) {
 		f := New("", "", nil)
 		f.MaxPixels, f.Threads = 640*360, 2
 		out := filepath.Join(t.TempDir(), "preview.mp4")
-		require.NoError(t, f.BuildPreview(context.Background(), src, out, 480, 2, 0))
+		_, err := f.BuildPreview(context.Background(), src, out, 480, 2, 0)
+		require.NoError(t, err)
 		assert.FileExists(t, out)
 	})
 	t.Run("above the cap", func(t *testing.T) {
 		f := New("", "", nil)
 		f.MaxPixels = 640*360 - 1
 		out := filepath.Join(t.TempDir(), "preview.mp4")
-		err := f.BuildPreview(context.Background(), src, out, 480, 2, 0)
+		_, err := f.BuildPreview(context.Background(), src, out, 480, 2, 0)
 		require.ErrorIs(t, err, ErrPixelLimit)
 		var ee *ExecError
 		require.ErrorAs(t, err, &ee)
@@ -270,12 +288,14 @@ func TestBuildPreviewMaxPixels(t *testing.T) {
 		f := New("", "", nil)
 		f.MaxPixels = 100_000 // 320x240 passes, 1280x720 does not
 		out := filepath.Join(t.TempDir(), "preview.mp4")
-		require.NoError(t, f.BuildPreview(context.Background(), sw, out, 480, 2, 0))
+		_, err := f.BuildPreview(context.Background(), sw, out, 480, 2, 0)
+		require.NoError(t, err)
 		// Only the red 320x240 second was decoded (uncapped, the preview lasts 2 s).
 		assert.InDelta(t, 1.0, probeFile(t, out).duration(t), 0.05)
 
 		uncapped := filepath.Join(t.TempDir(), "uncapped.mp4")
-		require.NoError(t, New("", "", nil).BuildPreview(context.Background(), sw, uncapped, 480, 2, 0))
+		_, err = New("", "", nil).BuildPreview(context.Background(), sw, uncapped, 480, 2, 0)
+		require.NoError(t, err)
 		assert.InDelta(t, 2.0, probeFile(t, uncapped).duration(t), 0.1, "fixture sanity: the stream really switches")
 	})
 }
@@ -341,19 +361,41 @@ func TestBuildPreviewMaxDuration(t *testing.T) {
 	f := New("", "", nil)
 
 	t.Run("longer source", func(t *testing.T) {
+		// Both decode paths: a keyframe every 0.5 s (keyframes only, 2 fps) and a
+		// single keyframe (non-reference frames skipped, 2 fps).
+		for name, src := range map[string]string{
+			"keyframes only": gopVideo(t, 12, 15),
+			"noref":          gopVideo(t, 12, 1000),
+		} {
+			t.Run(name, func(t *testing.T) {
+				out := filepath.Join(t.TempDir(), "preview.mp4")
+				info, err := f.BuildPreview(context.Background(), src, out, 480, 2, 5)
+				require.NoError(t, err)
+				require.Equal(t, name == "keyframes only", info.KeyframesOnly, "fixture: decode path")
+				require.Equal(t, 2.0, info.FPS)
+				p := probeFile(t, out)
+				assert.LessOrEqual(t, p.duration(t), 5.1)
+				assert.GreaterOrEqual(t, p.duration(t), 4.9)
+				require.Len(t, p.Streams, 1)
+				assert.Equal(t, "10", p.Streams[0].NbFrames)
+
+				// A cap longer than the video changes nothing.
+				out = filepath.Join(t.TempDir(), "preview.mp4")
+				_, err = f.BuildPreview(context.Background(), src, out, 480, 2, 180)
+				require.NoError(t, err)
+				assert.InDelta(t, 12.0, probeFile(t, out).duration(t), 0.05)
+			})
+		}
+
+		// The frame cap uses the preview's real rate: 1 keyframe per second → 1 fps.
 		src := testsrcVideo(t, 320, 240, 12)
 		out := filepath.Join(t.TempDir(), "preview.mp4")
-		require.NoError(t, f.BuildPreview(context.Background(), src, out, 480, 2, 5))
+		info, err := f.BuildPreview(context.Background(), src, out, 480, 2, 5)
+		require.NoError(t, err)
+		require.Equal(t, PreviewInfo{FPS: 1, KeyframesOnly: true}, info)
 		p := probeFile(t, out)
-		assert.LessOrEqual(t, p.duration(t), 5.1)
-		assert.GreaterOrEqual(t, p.duration(t), 4.9)
-		require.Len(t, p.Streams, 1)
-		assert.Equal(t, "10", p.Streams[0].NbFrames)
-
-		// A cap longer than the video changes nothing.
-		out = filepath.Join(t.TempDir(), "preview.mp4")
-		require.NoError(t, f.BuildPreview(context.Background(), src, out, 480, 2, 180))
-		assert.InDelta(t, 12.0, probeFile(t, out).duration(t), 0.05)
+		assert.InDelta(t, 5.0, p.duration(t), 0.1)
+		assert.Equal(t, "5", p.Streams[0].NbFrames)
 	})
 
 	t.Run("mkv header understates the duration", func(t *testing.T) {
@@ -363,11 +405,13 @@ func TestBuildPreviewMaxDuration(t *testing.T) {
 		require.InDelta(t, 3.0, info.DurationSec, 0.01, "fixture: the header says 3 s")
 
 		uncapped := filepath.Join(t.TempDir(), "uncapped.mp4")
-		require.NoError(t, f.BuildPreview(context.Background(), lie, uncapped, 480, 2, 0))
+		_, err = f.BuildPreview(context.Background(), lie, uncapped, 480, 2, 0)
+		require.NoError(t, err)
 		require.InDelta(t, 12.0, probeFile(t, uncapped).duration(t), 0.05, "fixture: the stream really is 12 s")
 
 		out := filepath.Join(t.TempDir(), "preview.mp4")
-		require.NoError(t, f.BuildPreview(context.Background(), lie, out, 480, 2, info.DurationSec))
+		_, err = f.BuildPreview(context.Background(), lie, out, 480, 2, info.DurationSec)
+		require.NoError(t, err)
 		assert.LessOrEqual(t, probeFile(t, out).duration(t), 3.1)
 	})
 
@@ -376,7 +420,7 @@ func TestBuildPreviewMaxDuration(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "out.mp4")
 		bad := New("/nonexistent/ffmpeg", "", nil) // validation happens before any exec
 		for _, v := range []float64{-1, math.NaN(), math.Inf(1), math.Inf(-1)} {
-			err := bad.BuildPreview(context.Background(), src, out, 480, 2, v)
+			_, err := bad.BuildPreview(context.Background(), src, out, 480, 2, v)
 			require.Error(t, err, "%v", v)
 			var ee *ExecError
 			assert.False(t, errors.As(err, &ee), "must fail validation, not exec: %v", err)
@@ -435,7 +479,8 @@ func TestMetadataIsStripped(t *testing.T) {
 
 	t.Run("preview", func(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "preview.mp4")
-		require.NoError(t, f.BuildPreview(context.Background(), src, out, 480, 2, 0))
+		_, err := f.BuildPreview(context.Background(), src, out, 480, 2, 0)
+		require.NoError(t, err)
 		p := probeFile(t, out)
 		allowed := []string{"major_brand", "minor_version", "compatible_brands", "handler_name", "language", "vendor_id", "encoder"}
 		for k, v := range p.Format.Tags {
@@ -510,9 +555,13 @@ func TestLimitsKeepOutputUnchanged(t *testing.T) {
 	assert.Equal(t, want, frames(limited))
 
 	out := filepath.Join(t.TempDir(), "preview.mp4")
-	require.NoError(t, limited.BuildPreview(context.Background(), src, out, 480, 2, 0))
+	info, err := limited.BuildPreview(context.Background(), src, out, 480, 2, 0)
+	require.NoError(t, err)
 	streams := probeStreams(t, out)
 	require.Len(t, streams, 1)
 	assert.Equal(t, [2]int{w, h}, [2]int{streams[0].Width, streams[0].Height})
-	assert.True(t, strings.HasPrefix(streams[0].AvgFrameRate, "2/"))
+	assert.True(t, strings.HasPrefix(streams[0].AvgFrameRate, strconv.Itoa(int(info.FPS))+"/"))
+	unlimited, err := New("", "", nil).BuildPreview(context.Background(), src, filepath.Join(t.TempDir(), "p.mp4"), 480, 2, 0)
+	require.NoError(t, err)
+	assert.Equal(t, unlimited, info, "the limits do not change the decode plan")
 }

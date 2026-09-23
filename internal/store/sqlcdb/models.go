@@ -179,6 +179,8 @@ type SelectedImage struct {
 	ImagePath    *string
 	ThumbPath    *string
 	Bytes        int32
+	Rotation     int32
+	Crop         []byte
 }
 
 type UsageEvent struct {

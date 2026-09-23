@@ -81,7 +81,9 @@ All deployment settings are environment variables; see [`.env.example`](.env.exa
 `internal/config/config.go`. Production-relevant ones: `DAILY_COST_CEILING_USD` (default
 5; pauses the pipeline), `V2I_TRUSTED_PROXIES` (CIDRs of the ingress, so client IPs and
 rate limits are right behind Traefik), `V2I_INTERNAL_TOKEN` (≥ 24 random characters with a
-paid analyzer), `V2I_IP_HASH_SALT`, `V2I_MAX_CONCURRENT_UPLOADS`, `FFMPEG_THREADS`. Domain behaviour (prompts, shot list, limits, selection
+paid analyzer), `V2I_IP_HASH_SALT`, `V2I_MAX_CONCURRENT_UPLOADS`, `V2I_MAX_REQUEST_BYTES`
+(the ingress body limit; browsers upload in `V2I_UPLOAD_CHUNK_BYTES` chunks below it),
+`FFMPEG_THREADS`, `V2I_EXTRACT_CONCURRENCY`. Domain behaviour (prompts, shot list, limits, selection
 weights, retention, copy) lives in `configs/domains/<key>.yaml` and is validated at
 startup — a bad file stops the process. Adding a domain is one YAML file plus one
 frontend deployment with `DOMAIN_KEY=<key>` (see `plan/04-domain-config.md`).

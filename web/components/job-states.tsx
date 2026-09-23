@@ -5,7 +5,8 @@ import type { ReactNode } from "react";
 import { messageForCode } from "@/components/error-message";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { JobError, Rejection } from "@/lib/api";
+import { UsageSummary } from "@/components/usage-summary";
+import type { JobError, JobUsage, Rejection } from "@/lib/api";
 
 // Terminal and loading states of the job page. Each renders the page's <h1>, with the
 // id `${testId}-title` and tabIndex -1 so JobView can move focus to it when the page
@@ -55,7 +56,16 @@ function UploadAgain({ label = "Upload a video" }: { label?: string }) {
 }
 
 /** The gate refused the video. A normal outcome, so it is styled neutrally, not as an error. */
-export function RejectedState({ title, rejection }: { title: string; rejection: Rejection | null }) {
+export function RejectedState({
+  title,
+  rejection,
+  usage,
+}: {
+  title: string;
+  rejection: Rejection | null;
+  /** The model calls that led to the rejection were paid for too. */
+  usage?: JobUsage | null;
+}) {
   return (
     <StateLayout icon={<CircleHelp aria-hidden="true" className="size-6" />} title={title} testId="job-rejected">
       {rejection?.reason && <p className="text-pretty text-muted-foreground">{rejection.reason}</p>}
@@ -65,11 +75,21 @@ export function RejectedState({ title, rejection }: { title: string; rejection: 
         </p>
       )}
       <UploadAgain label="Try another video" />
+      <UsageSummary usage={usage} className="w-full" />
     </StateLayout>
   );
 }
 
-export function FailedState({ jobId, error }: { jobId: string; error: JobError | null }) {
+export function FailedState({
+  jobId,
+  error,
+  usage,
+}: {
+  jobId: string;
+  error: JobError | null;
+  /** Model calls made before the failure. */
+  usage?: JobUsage | null;
+}) {
   return (
     <StateLayout
       icon={<TriangleAlert aria-hidden="true" className="size-6" />}
@@ -82,6 +102,7 @@ export function FailedState({ jobId, error }: { jobId: string; error: JobError |
         If you contact support, mention this reference:{" "}
         <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-foreground select-all">{jobId}</code>
       </p>
+      <UsageSummary usage={usage} className="w-full" />
     </StateLayout>
   );
 }

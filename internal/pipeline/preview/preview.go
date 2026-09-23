@@ -22,20 +22,23 @@ type Input struct {
 }
 
 type Output struct {
-	Path      string
-	SizeBytes int64
-	Took      time.Duration
+	Path          string
+	SizeBytes     int64
+	Took          time.Duration
+	FPS           float64 // the preview's real frame rate (see media.PreviewInfo)
+	KeyframesOnly bool
 }
 
 // Build encodes the preview (480p, 2 fps, no audio for cars).
 func Build(ctx context.Context, ff *media.FFmpeg, in Input) (*Output, error) {
 	start := time.Now()
-	if err := ff.BuildPreview(ctx, in.SourcePath, in.OutPath, in.Height, in.FPS, in.MaxDurationSec); err != nil {
+	info, err := ff.BuildPreview(ctx, in.SourcePath, in.OutPath, in.Height, in.FPS, in.MaxDurationSec)
+	if err != nil {
 		return nil, fmt.Errorf("preview: %w", err)
 	}
 	st, err := os.Stat(in.OutPath)
 	if err != nil {
 		return nil, fmt.Errorf("preview: stat output: %w", err)
 	}
-	return &Output{Path: in.OutPath, SizeBytes: st.Size(), Took: time.Since(start)}, nil
+	return &Output{Path: in.OutPath, SizeBytes: st.Size(), Took: time.Since(start), FPS: info.FPS, KeyframesOnly: info.KeyframesOnly}, nil
 }

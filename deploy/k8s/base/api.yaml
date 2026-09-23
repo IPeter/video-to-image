@@ -85,7 +85,7 @@ spec:
           configMap: { name: v2i-domains }
         - name: data
           persistentVolumeClaim: { claimName: v2i-data }
-        - name: scratch # upload spool: V2I_MAX_CONCURRENT_UPLOADS × maxUploadBytes
-          emptyDir: { sizeLimit: 2Gi }
+        - name: scratch # upload spool + chunked sessions: V2I_MAX_CONCURRENT_UPLOADS × maxUploadBytes
+          emptyDir: { sizeLimit: 3Gi }
         - name: tmp
           emptyDir: { sizeLimit: 256Mi }

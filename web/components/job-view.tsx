@@ -18,6 +18,7 @@ import { JobSteps } from "@/components/job-steps";
 import { useAppContext } from "@/components/providers";
 import { RESULTS_HEADING_ID, ResultGrid } from "@/components/result-grid";
 import { Button } from "@/components/ui/button";
+import { UsageSummary } from "@/components/usage-summary";
 import { useDeadlinePassed } from "@/hooks/use-deadline";
 import { useNow } from "@/hooks/use-now";
 import { ApiError, isTerminalStatus, isTransientError, type Job } from "@/lib/api";
@@ -165,14 +166,14 @@ export function JobView({ jobId, pollIntervalMs = POLL_INTERVAL_MS }: JobViewPro
           kind: "rejected",
           headingId: stateHeadingId("job-rejected"),
           announcement: domain.copy.rejectedTitle,
-          node: <RejectedState title={domain.copy.rejectedTitle} rejection={job.rejection} />,
+          node: <RejectedState title={domain.copy.rejectedTitle} rejection={job.rejection} usage={job.usage} />,
         };
       case "failed":
         return {
           kind: "failed",
           headingId: stateHeadingId("job-failed"),
           announcement: "Sorry, we could not process this video.",
-          node: <FailedState jobId={job.jobId} error={job.error} />,
+          node: <FailedState jobId={job.jobId} error={job.error} usage={job.usage} />,
         };
       case "expired":
         return expiredView(domain.retentionHours);
@@ -193,6 +194,7 @@ export function JobView({ jobId, pollIntervalMs = POLL_INTERVAL_MS }: JobViewPro
               result={job.result}
               expiresAt={job.expiresAt}
               apiBaseUrl={api.baseUrl}
+              usage={job.usage}
               onDeleteNow={() => deletion.mutate()}
               deleting={deletion.isPending}
               notice={
@@ -288,6 +290,7 @@ function JobProcessing({ job, reconnecting }: { job: Job; reconnecting: boolean 
       <div className="rounded-xl border bg-card p-4 sm:p-6">
         <JobSteps progress={job.progress} status={job.status} elapsedSec={elapsedSeconds(job.createdAt, now)} />
       </div>
+      <UsageSummary usage={job.usage} />
       <ConnectionNotice show={reconnecting} />
     </section>
   );

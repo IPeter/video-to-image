@@ -24,6 +24,11 @@ const (
 	extractTimeout = 10 * time.Minute
 )
 
+// keyframeProbeTimeout bounds BuildPreview's keyframe probe even when the caller's
+// deadline is longer: the probe only demuxes the video packets (≈0.1 s on a 377 MB 4K
+// phone clip) and a slow probe just means the noref decode path is used.
+const keyframeProbeTimeout = 20 * time.Second
+
 const (
 	stderrTailBytes = 4 << 10  // ExecError.StderrTail
 	maxStdoutBytes  = 16 << 20 // ffprobe JSON is a few KB; anything bigger is a bug

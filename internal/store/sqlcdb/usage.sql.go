@@ -73,6 +73,60 @@ func (q *Queries) InsertUsage(ctx context.Context, arg InsertUsageParams) (pgtyp
 	return cost_usd, err
 }
 
+const jobUsage = `-- name: JobUsage :many
+SELECT
+    step,
+    model,
+    count(*)::bigint                          AS calls,
+    COALESCE(sum(input_tokens), 0)::bigint    AS input_tokens,
+    COALESCE(sum(output_tokens), 0)::bigint   AS output_tokens,
+    COALESCE(sum(thinking_tokens), 0)::bigint AS thinking_tokens,
+    COALESCE(sum(cost_usd), 0)::float8        AS cost_usd
+FROM usage_events
+WHERE job_id = $1::text
+GROUP BY step, model
+ORDER BY min(created_at), min(id)
+`
+
+type JobUsageRow struct {
+	Step           string
+	Model          string
+	Calls          int64
+	InputTokens    int64
+	OutputTokens   int64
+	ThinkingTokens int64
+	CostUsd        float64
+}
+
+// One row per step and model of the job, in the order the step first called the model.
+func (q *Queries) JobUsage(ctx context.Context, jobID string) ([]JobUsageRow, error) {
+	rows, err := q.db.Query(ctx, jobUsage, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []JobUsageRow{}
+	for rows.Next() {
+		var i JobUsageRow
+		if err := rows.Scan(
+			&i.Step,
+			&i.Model,
+			&i.Calls,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.ThinkingTokens,
+			&i.CostUsd,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const usageReport = `-- name: UsageReport :many
 SELECT
     (date_trunc('day', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')::timestamptz AS day,

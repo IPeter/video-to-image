@@ -85,10 +85,15 @@ Uninstall (deletes all jobs, images and the database):
 
 ## Limits of this setup
 
-- **Uploads ≤ 95 MiB** (`V2I_MAX_UPLOAD_BYTES`): Cloudflare rejects request bodies over
-  100 MB on Free/Pro plans, tunnels included. Longer or 4K phone videos exceed that;
-  chunked uploads (split in the browser, reassembled by the API) would lift it without
-  opening router ports.
+- **Uploads are chunked**: Cloudflare rejects request bodies over 100 MB on Free/Pro
+  plans, tunnels included, so the browser sends videos in 16 MiB pieces
+  (`V2I_UPLOAD_CHUNK_BYTES`) that the API reassembles in its scratch volume; the domain's
+  `maxUploadBytes` (500 MB for cars) is the real limit. The single-request upload
+  (`POST /v1/domains/{key}/jobs`, used by scripts) stays capped at 95 MiB
+  (`V2I_MAX_REQUEST_BYTES`). Unfinished uploads are dropped after 15 minutes idle
+  (`V2I_UPLOAD_SESSION_TTL`). Uploads in progress live in the API pod's scratch
+  emptyDir: a deploy (new pod) makes them fail with "upload expired", and the user
+  uploads again.
 - Client IPs come from Cloudflare's `CF-Connecting-IP`, trusted only from the Traefik pod
   network (`V2I_TRUSTED_PROXIES=10.42.0.0/16`). With the tunnel there are no open router
   ports, so only a device on the LAN talking to Traefik directly could spoof it — rate

@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, type Api, type Job } from "@/lib/api";
-import { API_BASE, JOB_ID, makeJob, makeResult } from "@/test/fixtures";
+import { API_BASE, JOB_ID, makeJob, makeResult, makeUsage, makeUsageStep } from "@/test/fixtures";
 import { renderWithProviders } from "@/test/render";
 
 import {
@@ -41,7 +41,19 @@ function fakeApi(steps: Step[], deleteImpl: () => Promise<void> = async () => {}
 const completed = makeJob({
   status: "completed",
   progress: { step: null, percent: 100, steps: [] },
+  usage: makeUsage(),
   result: makeResult(),
+});
+
+/** Usage after the gate's single analyze call. */
+const analyzeOnly = makeUsage({
+  calls: 1,
+  inputTokens: 6200,
+  outputTokens: 900,
+  thinkingTokens: 400,
+  totalTokens: 7500,
+  costUsd: 0.0031,
+  steps: [makeUsageStep()],
 });
 
 function renderJob(api: Api) {
@@ -102,6 +114,48 @@ describe("<JobView>", () => {
     const calls = getJob.mock.calls.length;
     await new Promise((r) => setTimeout(r, 120));
     expect(getJob.mock.calls.length).toBe(calls);
+  });
+
+  it("shows the AI usage with the results", async () => {
+    const { api } = fakeApi([completed]);
+    renderJob(api);
+    await screen.findByRole("list", { name: "Selected images" });
+    expect(screen.getByTestId("ai-usage")).toHaveTextContent("AI usage: 9,012 tokens · $0.0041");
+  });
+
+  it("shows the AI usage while processing only once a model call was made", async () => {
+    const { api } = fakeApi([makeJob(), makeJob({ usage: analyzeOnly }), completed]);
+    renderJob(api);
+    expect(await screen.findByTestId("job-processing")).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-usage")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("ai-usage")).toHaveTextContent("7,500 tokens · $0.0031");
+    expect(screen.getByTestId("job-processing")).toContainElement(screen.getByTestId("ai-usage"));
+    await screen.findByRole("list", { name: "Selected images" });
+    expect(screen.getByTestId("ai-usage")).toHaveTextContent("9,012 tokens · $0.0041");
+  });
+
+  it("shows what a rejected or failed job cost", async () => {
+    const rejected = makeJob({
+      status: "rejected",
+      usage: analyzeOnly,
+      rejection: { reason: "A kitchen.", detectedSubject: "room" },
+    });
+    const first = fakeApi([rejected]);
+    const { unmount } = renderJob(first.api);
+    const section = await screen.findByTestId("job-rejected");
+    expect(within(section).getByTestId("ai-usage")).toHaveTextContent("7,500 tokens · $0.0031");
+    unmount();
+
+    const failed = makeJob({ status: "failed", usage: analyzeOnly, error: { code: "MODEL_BAD_OUTPUT", message: "x" } });
+    renderJob(fakeApi([failed]).api);
+    const failedSection = await screen.findByTestId("job-failed");
+    expect(within(failedSection).getByTestId("ai-usage")).toHaveTextContent("7,500 tokens · $0.0031");
+  });
+
+  it("shows no AI usage for a job that failed before any model call", async () => {
+    renderJob(fakeApi([makeJob({ status: "failed", error: { code: "PROCESSING_ERROR", message: "x" } })]).api);
+    expect(await screen.findByTestId("job-failed")).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-usage")).not.toBeInTheDocument();
   });
 
   it("renders a rejection as a first-class outcome", async () => {

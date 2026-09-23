@@ -1,6 +1,6 @@
 // Package store is the Postgres repository (pgx v5 + sqlc). sqlc output lives in
 // internal/store/sqlcdb and is wrapped here so callers see plain Go types. The schema
-// is migrations/00001_init.sql.
+// is migrations/*.sql (goose).
 package store
 
 import (
@@ -168,6 +168,27 @@ type SelectedImage struct {
 	ImagePath    string // "" once expired
 	ThumbPath    string
 	Bytes        int64
+	Rotation     int    // degrees clockwise applied to the source frame
+	Crop         *NRect // normalised crop of the upright frame; nil = uncropped
+}
+
+// NRect is a normalised rectangle, stored as jsonb {x0,y0,x1,y1}.
+type NRect struct {
+	X0 float64 `json:"x0"`
+	Y0 float64 `json:"y0"`
+	X1 float64 `json:"x1"`
+	Y1 float64 `json:"y1"`
+}
+
+// UsageByStep is one job's model usage summed per step and model.
+type UsageByStep struct {
+	Step           string
+	Model          string
+	Calls          int64
+	InputTokens    int64
+	OutputTokens   int64
+	ThinkingTokens int64
+	CostUSD        float64
 }
 
 // AnalysisResult is the input of SaveAnalysis: everything the analyze step produced,

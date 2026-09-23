@@ -82,6 +82,10 @@ func TestValidationFailures(t *testing.T) {
 		"reserved shot id": func(s string) string {
 			return strings.Replace(s, "id: detail", "id: other", 1)
 		},
+		"imageCount unreachable under maxPerShot": func(s string) string {
+			// 13 shots + "other", one image each.
+			return strings.Replace(s, "imageCount: 8", "imageCount: 15", 1)
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -122,13 +126,61 @@ func TestShotLabel(t *testing.T) {
 	assert.Equal(t, "mystery", cars.ShotLabel("mystery"))
 }
 
-func TestCapUploadBytes(t *testing.T) {
-	reg, err := LoadDir(filepath.Join("..", "..", "configs", "domains"))
-	require.NoError(t, err)
-	assert.Nil(t, reg.CapUploadBytes(0), "0 disables the cap")
-	assert.Equal(t, []string{"cars"}, reg.CapUploadBytes(95<<20))
-	cars, _ := reg.Get("cars")
-	assert.Equal(t, int64(95<<20), cars.Limits.MaxUploadBytes)
-	assert.Equal(t, int64(95<<20), cars.Public().Limits.MaxUploadBytes, "the frontend sees the effective limit")
-	assert.Empty(t, reg.CapUploadBytes(1<<40), "never raises a limit")
+func TestMaxPerShot(t *testing.T) {
+	base := loadCarsRaw(t)
+	require.Contains(t, base, "maxPerShot: 1 ")
+	parse := func(t *testing.T, from, to string) (*Config, error) {
+		t.Helper()
+		mutated := strings.Replace(base, from, to, 1)
+		require.NotEqual(t, base, mutated, "%q not found", from)
+		return Parse([]byte(mutated))
+	}
+
+	t.Run("unset means no cap", func(t *testing.T) {
+		c, err := parse(t, "maxPerShot: 1 ", "# maxPerShot unset ")
+		require.NoError(t, err)
+		assert.Equal(t, 0, c.Selection.MaxPerShot)
+		assert.Equal(t, 0, c.Selection.EffectiveMaxPerShot())
+	})
+	t.Run("explicit cap", func(t *testing.T) {
+		c, err := parse(t, "maxPerShot: 1 ", "maxPerShot: 2 ")
+		require.NoError(t, err)
+		assert.Equal(t, 2, c.Selection.EffectiveMaxPerShot())
+	})
+	t.Run("negative is invalid", func(t *testing.T) {
+		_, err := parse(t, "maxPerShot: 1 ", "maxPerShot: -1 ")
+		assert.Error(t, err)
+	})
+
+	// cars: 13 shots + "other" under maxPerShot 1 → at most 14 images.
+	t.Run("imageCount at the limit", func(t *testing.T) {
+		_, err := parse(t, "imageCount: 8", "imageCount: 14")
+		assert.NoError(t, err)
+	})
+	t.Run("imageCount over the limit", func(t *testing.T) {
+		_, err := parse(t, "imageCount: 8", "imageCount: 15")
+		assert.ErrorContains(t, err, "selection.imageCount (15) is unreachable with maxPerShot 1: at most 14 images (13 shots + other)")
+	})
+	t.Run("a higher cap lifts the limit", func(t *testing.T) {
+		c, err := parse(t, "maxPerShot: 1 ", "maxPerShot: 2 ")
+		require.NoError(t, err)
+		c.Selection.ImageCount = 28
+		require.NoError(t, Validate(c))
+		c.Selection.ImageCount = 29
+		assert.ErrorContains(t, Validate(c), "at most 28 images")
+	})
+	t.Run("a huge cap does not overflow into a limit", func(t *testing.T) {
+		// maxPerShot × 14 wraps around to a negative "at most" with naive arithmetic.
+		for _, m := range []string{"4611686018427387904", "9223372036854775807"} {
+			c, err := parse(t, "maxPerShot: 1 ", "maxPerShot: "+m+" ")
+			require.NoError(t, err, "maxPerShot %s", m)
+			assert.Equal(t, 8, c.Selection.ImageCount)
+		}
+	})
+	t.Run("no cap, no limit", func(t *testing.T) {
+		c, err := parse(t, "maxPerShot: 1 ", "# maxPerShot unset ")
+		require.NoError(t, err)
+		c.Selection.ImageCount = 100
+		assert.NoError(t, Validate(c))
+	})
 }

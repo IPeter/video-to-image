@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -66,6 +65,6 @@ func (s *Server) getUsage(ctx context.Context, in *UsageInput) (*GetUsageOutput,
 		})
 		total += r.CostUSD
 	}
-	out.TotalCostUSD = math.Round(total*1e6) / 1e6
+	out.TotalCostUSD = roundUSD(total)
 	return &GetUsageOutput{Body: out}, nil
 }

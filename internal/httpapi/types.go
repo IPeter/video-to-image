@@ -53,6 +53,45 @@ type CreateJobResponse struct {
 	Status JobStatus `json:"status"`
 }
 
+// Chunked upload (large videos behind a proxy that caps request bodies, e.g.
+// Cloudflare's 100 MB): create a session, PUT the chunks, then complete it — which runs
+// the same validation as POST /jobs and creates the job.
+
+// CreateUploadRequest starts a chunked upload.
+type CreateUploadRequest struct {
+	FileName    string `json:"fileName" maxLength:"255" doc:"The file's name (shown on the job; a name containing \"reject\" makes the fake analyzer fail the gate)."`
+	SizeBytes   int64  `json:"sizeBytes" minimum:"1" doc:"Exact size of the whole file."`
+	ContentType string `json:"contentType,omitempty" doc:"The browser's MIME type; informational (the content is sniffed)."`
+}
+
+// UploadSession tells the client how to send the file.
+type UploadSession struct {
+	UploadID       string    `json:"uploadId" example:"upl_01J8ZK3M2Q7K2M9QXA4B5C6D7E"`
+	ChunkSizeBytes int64     `json:"chunkSizeBytes" doc:"Every chunk but the last has exactly this size."`
+	ChunkCount     int       `json:"chunkCount" doc:"Chunks are numbered 0..chunkCount-1."`
+	ExpiresAt      time.Time `json:"expiresAt" doc:"The session and its chunks are dropped after this unless another request arrives: 5 minutes after create until the first chunk is stored, then the session TTL after the last request. It may also be cancelled earlier to make room once it has been idle (see createUpload)."`
+}
+
+type CreateUploadInput struct {
+	DomainKey string `path:"domainKey" doc:"Domain key, e.g. cars." example:"cars"`
+	Body      CreateUploadRequest
+}
+
+type CreateUploadOutput struct {
+	Body UploadSession
+}
+
+type UploadPathInput struct {
+	DomainKey string `path:"domainKey" doc:"Domain key, e.g. cars." example:"cars"`
+	UploadID  string `path:"uploadId" doc:"Upload session ID (upl_ + ULID)."`
+}
+
+// CompleteUploadOutput is the 202 of completing an upload (same body as POST /jobs).
+type CompleteUploadOutput struct {
+	Location string `header:"Location"`
+	Body     CreateJobResponse
+}
+
 // VideoInfo is the public part of the probed video.
 type VideoInfo struct {
 	DurationSec float64 `json:"durationSec"`
@@ -87,6 +126,8 @@ type ResultImage struct {
 	URL            string  `json:"url" doc:"Full-resolution JPG, relative to the API base URL."`
 	DownloadURL    string  `json:"downloadUrl" doc:"Same as url with ?download=1 (Content-Disposition: attachment)."`
 	ThumbnailURL   string  `json:"thumbnailUrl" doc:"640 px wide JPG, relative to the API base URL."`
+	Rotation       int     `json:"rotation" doc:"Degrees clockwise the source frame was rotated to make it upright (0, 90, 180, 270)."`
+	Cropped        bool    `json:"cropped" doc:"The frame was cropped around the subject."`
 }
 
 type ShotRef struct {
@@ -122,6 +163,31 @@ type JobError struct {
 	Message string       `json:"message"`
 }
 
+// UsageStep is the model usage of one pipeline step (analyze, review) with one model.
+type UsageStep struct {
+	Step           string  `json:"step" example:"analyze"`
+	Model          string  `json:"model" example:"gemini-3.5-flash-lite" doc:"The model that answered; the built-in test analyzer reports \"fake:<model>\"."`
+	Calls          int64   `json:"calls"`
+	InputTokens    int64   `json:"inputTokens"`
+	OutputTokens   int64   `json:"outputTokens"`
+	ThinkingTokens int64   `json:"thinkingTokens"`
+	CostUSD        float64 `json:"costUsd"`
+	Priced         bool    `json:"priced" doc:"The model has a price in the price table, or is the free test analyzer (\"fake:\" prefix). False: real calls to a model without a price, recorded at costUsd 0 although they were billed."`
+}
+
+// JobUsage is the job's total model usage and cost (from usage_events).
+type JobUsage struct {
+	Calls          int64       `json:"calls"`
+	InputTokens    int64       `json:"inputTokens"`
+	OutputTokens   int64       `json:"outputTokens"`
+	ThinkingTokens int64       `json:"thinkingTokens"`
+	TotalTokens    int64       `json:"totalTokens"`
+	CostUSD        float64     `json:"costUsd" doc:"USD, computed from the price table when each call was made. Only the full cost when costComplete."`
+	TestMode       bool        `json:"testMode" doc:"Every call was answered by the built-in test analyzer (model \"fake:...\"), so nothing was charged. False when there were no calls."`
+	CostComplete   bool        `json:"costComplete" doc:"Every step is priced, so costUsd is the whole cost (true when there were no calls). False: some calls went to a model missing from the price table, so their cost is unknown (not 0); also false when the usage could not be read."`
+	Steps          []UsageStep `json:"steps"`
+}
+
 // Job is GET /v1/domains/{domainKey}/jobs/{jobId}.
 type Job struct {
 	JobID     string     `json:"jobId"`
@@ -131,6 +197,7 @@ type Job struct {
 	ExpiresAt time.Time  `json:"expiresAt"`
 	Video     VideoInfo  `json:"video"`
 	Progress  Progress   `json:"progress"`
+	Usage     JobUsage   `json:"usage"`
 	Result    *JobResult `json:"result"`
 	Rejection *Rejection `json:"rejection"`
 	Error     *JobError  `json:"error"`

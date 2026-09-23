@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -48,19 +50,77 @@ func testsrcVideo(t testing.TB, w, h int, durSec float64) string {
 		"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-g", "30")
 }
 
+// gopVideo is a 320x240 30 fps testsrc2 H.264 clip with a keyframe exactly every gop
+// frames (no scene-cut keyframes).
+func gopVideo(t testing.TB, durSec float64, gop int) string {
+	t.Helper()
+	return ffmpegGen(t, fmt.Sprintf("gop%d.mp4", gop),
+		"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=320x240:rate=%d:duration=%s", fixtureFPS, formatFloat(durSec)),
+		"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-g", strconv.Itoa(gop), "-sc_threshold", "0")
+}
+
 // barVideo encodes the frame number spatially: on a black w x h canvas, source frame k
 // (at k/30 s) shows a white vertical bar covering x ∈ [k·px, (k+1)·px). It is driven
 // by the timestamp (not the overlay frame counter) so frame k is exactly t = k/30.
 // Keyframes every second, so seeks land between keyframes.
 func barVideo(t testing.TB, w, h, px int, durSec float64) string {
 	t.Helper()
+	return barVideoGOP(t, w, h, px, durSec, fixtureFPS)
+}
+
+// barVideoGOP is barVideo with a keyframe every gop frames (x264 without scene-cut
+// keyframes, so the keyframes are exactly frames 0, gop, 2·gop, ...).
+func barVideoGOP(t testing.TB, w, h, px int, durSec float64, gop int) string {
+	t.Helper()
+	return ffmpegGen(t, fmt.Sprintf("bar_g%d.mp4", gop), "-f", "lavfi", "-i", barGraph(t, w, h, px, durSec),
+		"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+		"-g", strconv.Itoa(gop), "-sc_threshold", "0")
+}
+
+// barVideoKeyframes is barVideo with keyframes exactly at keyTimes (seconds; 0 must be
+// among them) and nowhere else.
+func barVideoKeyframes(t testing.TB, w, h, px int, durSec float64, keyTimes []float64) string {
+	t.Helper()
+	times := make([]string, len(keyTimes))
+	for i, k := range keyTimes {
+		times[i] = formatFloat(k)
+	}
+	return ffmpegGen(t, "bar_forced.mp4", "-f", "lavfi", "-i", barGraph(t, w, h, px, durSec),
+		"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+		"-g", strconv.Itoa(int(durSec*fixtureFPS)+1), "-sc_threshold", "0",
+		"-force_key_frames", strings.Join(times, ","))
+}
+
+// barVideoX264 is barVideo encoded with the given -x264-params plus IDR pictures forced
+// at idrTimes (seconds), e.g. intra refresh with a periodic IDR.
+func barVideoX264(t testing.TB, w, h, px int, durSec float64, params string, idrTimes []float64) string {
+	t.Helper()
+	times := make([]string, len(idrTimes))
+	for i, k := range idrTimes {
+		times[i] = formatFloat(k)
+	}
+	return ffmpegGen(t, "bar_x264.mp4", "-f", "lavfi", "-i", barGraph(t, w, h, px, durSec),
+		"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-x264-params", params,
+		"-force_key_frames", strings.Join(times, ","), "-forced-idr", "1")
+}
+
+// barGraph is barVideo's lavfi source graph.
+func barGraph(t testing.TB, w, h, px int, durSec float64) string {
+	t.Helper()
 	require.LessOrEqual(t, int(durSec*fixtureFPS)*px, w, "bar would leave the frame")
-	graph := fmt.Sprintf(
+	return fmt.Sprintf(
 		"color=c=black:s=%dx%d:r=%d:d=%s[bg];color=c=white:s=%dx%d:r=%d[bar];"+
 			"[bg][bar]overlay=x='%d*round(t*%d)':y=0:shortest=1,format=yuv420p",
 		w, h, fixtureFPS, formatFloat(durSec), px, h, fixtureFPS, px, fixtureFPS)
-	return ffmpegGen(t, "bar.mp4", "-f", "lavfi", "-i", graph,
-		"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-g", "30")
+}
+
+// x264Video is a 320x240 30 fps testsrc2 H.264 clip encoded with the given
+// -x264-params (e.g. "keyint=30:open-gop=1").
+func x264Video(t testing.TB, name string, durSec float64, params string) string {
+	t.Helper()
+	return ffmpegGen(t, name,
+		"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=320x240:rate=%d:duration=%s", fixtureFPS, formatFloat(durSec)),
+		"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-x264-params", params)
 }
 
 // barFrame decodes a JPEG written from a barVideo (srcWidth wide, px bar) and returns

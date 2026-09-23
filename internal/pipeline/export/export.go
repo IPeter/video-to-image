@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"image"
-	_ "image/jpeg" // DecodeConfig of the exported frames
 	"io"
 	"math"
 	"os"
@@ -27,18 +26,33 @@ const uploadConcurrency = 4
 // entry with sizes and CRC in the local header (no data descriptor).
 type item struct {
 	Exported
-	crc uint32
+	crc  uint32
+	path string // the uploaded bytes: FullPath, or the edited image's temporary file
+	tmp  bool   // path is a temporary file that Run removes
+	crop *NRect // applied crop for the manifest (nil if none)
+}
+
+// exporter holds what every image upload shares.
+type exporter struct {
+	st               storage.Storage
+	domainKey, jobID string
+	editSem          chan struct{} // one decoded frame at a time (see editImage)
 }
 
 // Run uploads images, thumbnails, manifest.json and export.zip (streamed through an
-// io.Pipe, no temp file) using the storage key helpers.
+// io.Pipe) using the storage key helpers.
 //
-// Full-resolution frames are stored byte for byte (image/jpeg, never re-encoded) under
-// storage.ImageKey and thumbnails under storage.ThumbKey; Width/Height come from the
-// JPEG header and Bytes is the file size. manifest.json is always written. The ZIP holds
-// every image under its FileName (stored, JPEG is already compressed) followed by
-// manifest.json (deflated); with no images there is no ZIP and Output.ZipKey and
-// Output.ZipName are empty. Output.Images keeps the order of in.Images.
+// Without an Edit (or with one that changes nothing) a full-resolution frame is stored
+// byte for byte (image/jpeg, never re-encoded) under storage.ImageKey and its
+// SmallPath thumbnail as is under storage.ThumbKey. With an Edit the frame is decoded,
+// rotated, cropped and re-encoded (quality 92), and the thumbnail is made from the
+// result (640 px wide, quality 85); edited frames are decoded one at a time and
+// written to a temporary file next to FullPath until the ZIP is done. Width/Height
+// are the stored image's and Bytes its size. manifest.json is always written. The ZIP
+// holds every stored image under its FileName (stored, JPEG is already compressed)
+// followed by manifest.json (deflated); with no images there is no ZIP and
+// Output.ZipKey and Output.ZipName are empty. Output.Images keeps the order of
+// in.Images.
 //
 // Run is idempotent: a retry overwrites the same keys. On error, objects already
 // uploaded are left for the job's retention cleanup.
@@ -48,12 +62,20 @@ func Run(ctx context.Context, st storage.Storage, in Input) (*Output, error) {
 	}
 	exportedAt := time.Now().UTC().Truncate(time.Second)
 
+	x := &exporter{st: st, domainKey: in.DomainKey, jobID: in.JobID, editSem: make(chan struct{}, 1)}
 	items := make([]item, len(in.Images))
+	defer func() {
+		for _, it := range items {
+			if it.tmp {
+				os.Remove(it.path)
+			}
+		}
+	}()
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(uploadConcurrency)
 	for i, img := range in.Images {
 		g.Go(func() error {
-			it, err := exportImage(gctx, st, in.DomainKey, in.JobID, img)
+			it, err := x.exportImage(gctx, img)
 			if err != nil {
 				return fmt.Errorf("export: image %d (%s): %w", img.Index, img.ImageID, err)
 			}
@@ -73,7 +95,7 @@ func Run(ctx context.Context, st storage.Storage, in Input) (*Output, error) {
 		out.Images[i] = it.Exported
 	}
 
-	manifest, err := json.MarshalIndent(buildManifest(in, out.Images, exportedAt), "", "  ")
+	manifest, err := json.MarshalIndent(buildManifest(in, items, exportedAt), "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("export: encode manifest: %w", err)
 	}
@@ -113,6 +135,9 @@ func validate(st storage.Storage, in Input) error {
 		case imageIDs[img.ImageID]:
 			return fmt.Errorf("export: duplicate image ID %s", img.ImageID)
 		}
+		if err := validEdit(img.Edit); err != nil {
+			return fmt.Errorf("export: image %s: %w", img.ImageID, err)
+		}
 		imageIDs[img.ImageID] = true
 		name := FileName(in.DomainKey, in.JobID, img.Index, img.ShotID, img.TimestampSec)
 		if names[name] {
@@ -123,8 +148,8 @@ func validate(st storage.Storage, in Input) error {
 	return nil
 }
 
-// exportImage uploads one frame and its thumbnail.
-func exportImage(ctx context.Context, st storage.Storage, domainKey, jobID string, img Image) (item, error) {
+// exportImage uploads one frame and its thumbnail, edited when img.Edit says so.
+func (x *exporter) exportImage(ctx context.Context, img Image) (item, error) {
 	f, err := os.Open(img.FullPath)
 	if err != nil {
 		return item{}, err
@@ -138,6 +163,19 @@ func exportImage(ctx context.Context, st storage.Storage, domainKey, jobID strin
 	if err != nil {
 		return item{}, fmt.Errorf("%s: %w", img.FullPath, err)
 	}
+	op, err := resolveEdit(img.Edit, cfg.Width, cfg.Height)
+	if err != nil {
+		return item{}, err
+	}
+	if !op.noop() {
+		return x.editImage(ctx, img, f, cfg, op)
+	}
+	return x.copyImage(ctx, img, f, fi, cfg)
+}
+
+// copyImage uploads the frame byte for byte and the extracted thumbnail as is.
+func (x *exporter) copyImage(ctx context.Context, img Image, f *os.File, fi os.FileInfo, cfg image.Config) (item, error) {
+	domainKey, jobID, st := x.domainKey, x.jobID, x.st
 	// CRC pass for the ZIP's stored entry (the file is in the page cache right after).
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return item{}, err
@@ -173,7 +211,8 @@ func exportImage(ctx context.Context, st storage.Storage, domainKey, jobID strin
 			Height:   cfg.Height,
 			Bytes:    n,
 		},
-		crc: h.Sum32(),
+		crc:  h.Sum32(),
+		path: img.FullPath,
 	}, nil
 }
 
@@ -208,7 +247,7 @@ func jpegConfig(r io.Reader) (image.Config, error) {
 	return cfg, nil
 }
 
-func buildManifest(in Input, images []Exported, exportedAt time.Time) Manifest {
+func buildManifest(in Input, images []item, exportedAt time.Time) Manifest {
 	createdAt := in.CreatedAt.UTC()
 	if in.CreatedAt.IsZero() {
 		createdAt = exportedAt
@@ -240,6 +279,8 @@ func buildManifest(in Input, images []Exported, exportedAt time.Time) Manifest {
 				ExposurePenalty: finite(e.Scores.ExposurePenalty),
 				Score:           finite(e.Scores.Score),
 			},
+			Rotation: e.Rotation,
+			Crop:     e.crop,
 		})
 	}
 	m.MissingShots = append(m.MissingShots, in.MissingShots...)

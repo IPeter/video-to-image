@@ -59,10 +59,18 @@ type Config struct {
 	// ClientIPHeader is set by a CDN in front of the trusted proxies with the visitor
 	// address (Cloudflare: CF-Connecting-IP). Honoured only from a trusted peer.
 	ClientIPHeader string `env:"V2I_CLIENT_IP_HEADER"`
-	// MaxUploadBytes caps every domain's limits.maxUploadBytes for this deployment
-	// (e.g. 95 MiB behind Cloudflare, which rejects bodies over 100 MB). 0 = no cap.
-	MaxUploadBytes      int64 `env:"V2I_MAX_UPLOAD_BYTES"`
-	StatusRatePerMinute int   `env:"V2I_STATUS_RATE_PER_MINUTE"  envDefault:"120"`
+	// MaxRequestBytes is the largest request body the ingress in front of the API
+	// accepts (e.g. 95 MiB behind Cloudflare, which rejects bodies over 100 MB). The
+	// single-request upload is capped at it; larger videos go through chunked uploads,
+	// whose chunks are kept below it. 0 = no cap.
+	MaxRequestBytes int64 `env:"V2I_MAX_REQUEST_BYTES"`
+	// UploadChunkBytes is the chunk size handed to chunked-upload clients.
+	UploadChunkBytes int64 `env:"V2I_UPLOAD_CHUNK_BYTES" envDefault:"16777216"`
+	// UploadSessionTTL is how long a chunked-upload session is kept after its last chunk.
+	UploadSessionTTL time.Duration `env:"V2I_UPLOAD_SESSION_TTL" envDefault:"15m"`
+	// MaxUploadSessionsPerClient caps open chunked-upload sessions per client.
+	MaxUploadSessionsPerClient int `env:"V2I_MAX_UPLOAD_SESSIONS_PER_CLIENT" envDefault:"2"`
+	StatusRatePerMinute        int `env:"V2I_STATUS_RATE_PER_MINUTE"  envDefault:"120"`
 	// Upload concurrency caps: each upload spools up to maxUploadBytes to scratch.
 	MaxConcurrentUploads int `env:"V2I_MAX_CONCURRENT_UPLOADS"  envDefault:"4"`
 	MaxUploadsPerClient  int `env:"V2I_MAX_UPLOADS_PER_CLIENT"  envDefault:"2"`
@@ -72,6 +80,10 @@ type Config struct {
 	// FFmpegThreads bounds -threads/-filter_threads per ffmpeg process: memory and CPU
 	// otherwise scale with the node's core count, not the pod's CPU limit. 0 = ffmpeg default.
 	FFmpegThreads int `env:"FFMPEG_THREADS" envDefault:"2"`
+	// ExtractConcurrency is how many ffmpeg processes one job's extract step runs at once.
+	// 0 = auto: GOMAXPROCS / (FFMPEG_THREADS × V2I_PIPELINE_WORKERS), at least 1 (see
+	// pipeline.ExtractConcurrency). Each 4K HEVC process holds about 450 MiB at 2 threads.
+	ExtractConcurrency int `env:"V2I_EXTRACT_CONCURRENCY" envDefault:"0"`
 }
 
 type StorageConfig struct {

@@ -85,20 +85,56 @@ selection:
   imageCount: 8
   maxScenes: 20
   sampleFps: 4
-  modelRerank: false
+  maxPerShot: 1                      # one photo per angle: no near-identical views
   dedupeMaxHamming: 6
   weights:
     relevance: 0.5
     sharpness: 0.4
     exposure: 0.1
   instructions: |
-    You are selecting moments for a used-car sales listing. Prefer moments where the whole
-    car (or the whole interior area) is in frame, the camera is steady, nothing blocks the
-    view (no people, hands, or door frames cutting the car), and lighting shows the paint
-    and condition honestly. Avoid moments with heavy motion blur, strong glare on windows or
-    paint, and moments where the car is cut off by the frame edge. If the video has both
-    exterior and interior footage, include both. Only fill shots you can actually see; do
-    not guess.
+    You are selecting moments for a used-car sales listing, where every photo must look
+    professional. Only choose moments where the WHOLE car is inside the frame for
+    exterior shots — never a half car, a car cut off by the frame edge, or a close-up
+    that hides the shape of the car — and where the whole area is visible for interior
+    shots. Prefer moments where the camera is steady and level, nothing blocks the view
+    (no people, hands, fingers or door frames in front of the car), and the lighting shows
+    the paint and condition honestly. Avoid heavy motion blur, strong glare on windows or
+    paint, and moments while the camera is turning between positions. Every scene must
+    show a DIFFERENT angle or part of the car: never return two scenes of the same view.
+    If the video has both exterior and interior footage, include both. Only fill shots you
+    can actually see; do not guess. The camera may have been rotated while filming (the
+    picture can be sideways); judge the content, not the orientation.
+
+review:
+  enabled: true
+  candidatesPerShot: 3
+  minQuality: 3
+  maxImageSide: 512
+  instructions: |
+    These are still frames for a used-car sales listing; judge each as a listing photo.
+    Exterior views (front, rear, side, 3/4 angles): subjectFullyVisible is true only if
+    the ENTIRE car — both bumpers, all wheels on that side and the roof — is inside the
+    image with some space around it; a car cut off by any image edge is not fully
+    visible. Interior and detail views: the whole feature (dashboard, seats, trunk,
+    engine bay, wheel, odometer) must be inside the image. The box must tightly enclose
+    the car (exterior) or the feature (interior/detail), not the whole image. Quality 5
+    is a photo a dealer would publish as is; 3 is acceptable; 1-2 means blurry, dark,
+    blown out, obstructed (people, hands, fingers), strongly tilted or not showing the
+    view at all. Report the view an image MAINLY shows: a picture of the whole dashboard
+    and steering wheel is interior_dashboard even if the gauges are visible (odometer only
+    when the instrument cluster fills most of the picture), and a wheel close-up is wheel,
+    not a side view. Mark near-duplicates with sameAs: the listing must never show the
+    same view twice.
+
+crop:
+  enabled: true
+  aspect: "4:3"                      # standard listing photo; upright portrait frames become landscape
+  marginPct: 6                       # best effort: shrinks when the subject would not fit 4:3
+  # Smallest short side of a cropped photo that keeps the frame's orientation (a 4K
+  # landscape frame crops to at least 1440x1080). Portrait frames turn landscape anyway:
+  # crop.Plan lowers the floor for them to their widest 4:3 crop (1080p: 1080x810,
+  # 720p: 720x540), but not below 480 px.
+  minShortSidePx: 1080
 
 retentionHours: 24
 

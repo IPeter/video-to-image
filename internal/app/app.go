@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"video-to-image/internal/analyzer/setup"
 	"video-to-image/internal/config"
 	"video-to-image/internal/domain"
+	"video-to-image/internal/ids"
 	"video-to-image/internal/media"
 	"video-to-image/internal/pipeline"
 	"video-to-image/internal/queue"
@@ -100,9 +102,6 @@ func Open(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, erro
 		return nil, err
 	}
 	log.Info("domains loaded", "keys", reg.Keys(), "dir", cfg.DomainsDir)
-	if lowered := reg.CapUploadBytes(cfg.MaxUploadBytes); len(lowered) > 0 {
-		log.Info("upload size capped for this deployment", "max_upload_bytes", cfg.MaxUploadBytes, "domains", lowered)
-	}
 
 	for _, bin := range []string{cfg.FFmpegPath, cfg.FFprobePath} {
 		if _, err := exec.LookPath(bin); err != nil {
@@ -151,7 +150,8 @@ func newFFmpeg(cfg *config.Config, reg *domain.Registry, log *slog.Logger) *medi
 const staleScratchAge = 2 * time.Hour
 
 // CleanScratch removes leftovers of crashed uploads and jobs (<scratch>/uploads/* and
-// <scratch>/jobs/*) older than staleScratchAge. Normal runs delete their own files; this
+// <scratch>/jobs/*) older than staleScratchAge, except chunked-upload session
+// directories (upl_*), whose lifetime the API manages (see httpapi upload sessions). Normal runs delete their own files; this
 // only catches SIGKILL/OOM leftovers so the emptyDir volume cannot fill up.
 func CleanScratch(dir string, log *slog.Logger) {
 	cutoff := time.Now().Add(-staleScratchAge)
@@ -161,6 +161,9 @@ func CleanScratch(dir string, log *slog.Logger) {
 			continue
 		}
 		for _, e := range entries {
+			if sub == "uploads" && e.IsDir() && strings.HasPrefix(e.Name(), ids.PrefixUpload+"_") {
+				continue // chunked-upload sessions: the API restores or expires them itself
+			}
 			info, err := e.Info()
 			if err != nil || info.ModTime().After(cutoff) {
 				continue
@@ -190,14 +193,25 @@ func (a *App) Analyzer(ctx context.Context) (analyzer.Analyzer, error) {
 
 // Runner builds the pipeline runner.
 func (a *App) Runner(an analyzer.Analyzer) *pipeline.Runner {
+	workers := a.Cfg.PipelineWorkers
+	if workers == 0 {
+		workers = queue.DefaultPipelineWorkers
+	}
+	// V2I_EXTRACT_CONCURRENCY, or auto from the CPUs this process may use (GOMAXPROCS
+	// follows the cgroup CPU limit).
+	procs := runtime.GOMAXPROCS(0)
+	perJob := pipeline.ExtractConcurrency(a.Cfg.ExtractConcurrency, procs, a.Cfg.FFmpegThreads, workers)
+	a.Log.Info("extract concurrency", "per_job", perJob, "configured", a.Cfg.ExtractConcurrency,
+		"gomaxprocs", procs, "ffmpeg_threads", a.Cfg.FFmpegThreads, "pipeline_workers", workers)
 	return &pipeline.Runner{
-		Store:      a.Store,
-		Storage:    a.Storage,
-		FFmpeg:     a.FFmpeg,
-		Analyzer:   an,
-		Registry:   a.Registry,
-		ScratchDir: a.Cfg.ScratchDir,
-		Logger:     a.Log,
+		Store:              a.Store,
+		Storage:            a.Storage,
+		FFmpeg:             a.FFmpeg,
+		Analyzer:           an,
+		Registry:           a.Registry,
+		ScratchDir:         a.Cfg.ScratchDir,
+		Logger:             a.Log,
+		ExtractConcurrency: perJob,
 	}
 }
 

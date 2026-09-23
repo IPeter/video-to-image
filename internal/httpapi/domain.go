@@ -14,7 +14,7 @@ import (
 const (
 	domainsPrefix = "/v1/domains/"
 
-	corsAllowMethods    = "GET, POST, DELETE, OPTIONS"
+	corsAllowMethods    = "GET, POST, PUT, DELETE, OPTIONS"
 	corsAllowHeaders    = "Content-Type"
 	corsExposeHeaders   = "Content-Disposition, Retry-After, Location"
 	corsMaxAgeSeconds   = "600"
@@ -26,16 +26,23 @@ type routeClass int
 
 const (
 	classOther  routeClass = iota
-	classUpload            // POST /v1/domains/{key}/jobs
+	classUpload            // POST /v1/domains/{key}/jobs and POST .../uploads: a new upload
 	classStatus            // GET  /v1/domains/{key}/jobs/... (status, images, ZIP)
+	classChunk             // .../uploads/{id}/...: chunk PUTs, complete and abort of a session
 )
+
+// chunkRatePerMinute limits chunk PUTs (plus completes and aborts) per client: a
+// 500 MB video is ~30 chunks, so this only stops a runaway client.
+const chunkRatePerMinute = 600
 
 func classify(method, rest string) routeClass {
 	switch {
-	case method == http.MethodPost && rest == "jobs":
+	case method == http.MethodPost && (rest == "jobs" || rest == "uploads"):
 		return classUpload
 	case (method == http.MethodGet || method == http.MethodHead) && strings.HasPrefix(rest, "jobs/"):
 		return classStatus
+	case strings.HasPrefix(rest, "uploads/"):
+		return classChunk
 	}
 	return classOther
 }
@@ -59,12 +66,13 @@ func splitDomainPath(p string) (key, rest string, ok bool) {
 //   - CORS preflights are answered here from the domain's Origin allowlist;
 //   - a request with an Origin header must carry an allowed one (403 ORIGIN_NOT_ALLOWED);
 //   - a request WITHOUT an Origin header may only GET/HEAD (image tags, downloads,
-//     server-side fetches of the public config). Unsafe methods need the internal
-//     token: browsers always send Origin on cross-origin POST/DELETE, so a browser
-//     request can never take this path, and a misconfigured frontend still fails
-//     loudly instead of being let through;
-//   - POST jobs and the GET job/file routes are rate limited per domain + client
-//     (rateKey: the IPv4 address or the IPv6 /64).
+//     server-side fetches of the public config). Unsafe methods (POST, PUT, DELETE)
+//     need the internal token: browsers always send Origin on cross-origin
+//     POST/PUT/DELETE, so a browser request can never take this path, and a
+//     misconfigured frontend still fails loudly instead of being let through;
+//   - new uploads (POST jobs, POST uploads), the GET job/file routes and the chunked
+//     upload routes are rate limited per domain + client (rateKey: the IPv4 address
+//     or the IPv6 /64).
 func (s *Server) domainGuard(lim *guardLimiters) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +89,7 @@ func (s *Server) domainGuard(lim *guardLimiters) func(http.Handler) http.Handler
 				writeAPIError(w, errDomainNotFound())
 				return
 			}
-			ctx := withDomain(r.Context(), dc)
+			ctx := withRequest(withDomain(r.Context(), dc), r)
 			noteDomain(ctx, dc.Key)
 			r = r.WithContext(ctx)
 
@@ -110,9 +118,11 @@ func (s *Server) domainGuard(lim *guardLimiters) func(http.Handler) http.Handler
 				h.Set("Access-Control-Expose-Headers", corsExposeHeaders)
 			case internal:
 			case origin != "":
+				s.drainRefusedChunk(w, r, dc, class)
 				s.guardReject(w, r, dc, class, errOriginNotAllowed())
 				return
 			case r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions:
+				s.drainRefusedChunk(w, r, dc, class)
 				s.guardReject(w, r, dc, class, NewAPIError(http.StatusForbidden, CodeOriginNotAllowed,
 					"requests without an Origin header need X-Internal-Token"))
 				return
@@ -126,6 +136,8 @@ func (s *Server) domainGuard(lim *guardLimiters) func(http.Handler) http.Handler
 					allowed, wait = lim.uploads.allow(dc.Key+"|"+s.rateKey(r), dc.Limits.RatePerIPPerHour, time.Hour)
 				case classStatus:
 					allowed, wait = lim.status.allow(dc.Key+"|"+s.rateKey(r), s.d.StatusRatePerMinute, time.Minute)
+				case classChunk:
+					allowed, wait = lim.chunks.allow(dc.Key+"|"+s.rateKey(r), chunkRatePerMinute, time.Minute)
 				default:
 					allowed = true
 				}
@@ -139,6 +151,18 @@ func (s *Server) domainGuard(lim *guardLimiters) func(http.Handler) http.Handler
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// drainRefusedChunk reads what is left of a refused chunk PUT's body before the
+// answer (drainRefusedBody: bounded by the domain's largest chunk, paced), so the
+// client reads the 403 instead of a connection reset.
+func (s *Server) drainRefusedChunk(w http.ResponseWriter, r *http.Request, dc *domain.Config, class routeClass) {
+	if class != classChunk || r.Method != http.MethodPut {
+		return
+	}
+	done := s.paceBody(w, r)
+	drainRefusedBody(r, s.maxChunkSize(dc)+chunkRequestHeadroom)
+	done()
 }
 
 // guardReject writes a guard rejection; rejected uploads are counted and logged like
@@ -159,6 +183,18 @@ func (s *Server) countRejection(ctx context.Context, dc *domain.Config, e *APIEr
 
 func withDomain(ctx context.Context, dc *domain.Config) context.Context {
 	return context.WithValue(ctx, ctxKeyDomain, dc)
+}
+
+// withRequest keeps the request for Huma handlers, which only get its context: they
+// need its RemoteAddr and headers (rateKey, ipHash).
+func withRequest(ctx context.Context, r *http.Request) context.Context {
+	return context.WithValue(ctx, ctxKeyRequest, r)
+}
+
+// requestFrom returns the request withRequest stored (nil outside the domain guard).
+func requestFrom(ctx context.Context) *http.Request {
+	r, _ := ctx.Value(ctxKeyRequest).(*http.Request)
+	return r
 }
 
 func domainFrom(ctx context.Context) *domain.Config {

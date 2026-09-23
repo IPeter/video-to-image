@@ -99,6 +99,18 @@ type ExtractArgs struct {
 	SmallQScale  int     // default 4
 }
 
+// PreviewInfo describes the preview BuildPreview wrote.
+type PreviewInfo struct {
+	// FPS is the preview's real frame rate. It is lower than requested when only
+	// keyframes were decoded (fast path for sources with dense keyframes, e.g. phone
+	// video); callers must tell the model this rate, not the requested one.
+	FPS float64
+	// KeyframesOnly reports the written preview comes from the fast path
+	// (-skip_frame nokey); false when that path was not taken or its output was
+	// rejected and the preview rebuilt.
+	KeyframesOnly bool
+}
+
 // ExtractResult lists the files written, sorted by frame number. Full[i] and Small[i]
 // are the same frame; frame i was sampled at StartSec + i/FPS.
 type ExtractResult struct {

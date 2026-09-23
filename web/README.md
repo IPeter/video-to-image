@@ -112,14 +112,16 @@ components/
   upload-form.tsx, upload-dropzone.tsx, upload-progress.tsx
   job-view.tsx, job-steps.tsx, job-states.tsx
   result-grid.tsx, result-card.tsx, lightbox.tsx, missing-shots.tsx, delete-job-button.tsx
+  usage-summary.tsx       "AI usage: 9,012 tokens · $0.0041" + per-step table (results, rejected, failed, processing)
   error-message.tsx       every API error code → plain-language copy
   providers.tsx           QueryClientProvider + runtime/domain context
   ui/                     shadcn/ui components
 lib/
   api.d.ts                GENERATED (openapi-typescript)
   api.ts                  typed openapi-fetch client, getJob/deleteJob, resolveApiUrl, error helpers
-  upload.ts               XMLHttpRequest upload with progress, abort and error-envelope parsing
+  upload.ts               chunked XMLHttpRequest upload: session, 2 chunks in flight, retries, complete, cancel
   upload-checks.ts        client pre-checks (size, type, duration, resolution)
+  usage.ts                token / cost formatting for the job's model usage
   video-meta.ts           reads duration/resolution and a poster frame with a hidden <video>
   runtime-config*.ts      env parsing (server-only)
   domain.ts               server-side fetch of the public domain config
@@ -204,8 +206,28 @@ writes its fetch cache under `/app/.next/cache`; with a read-only root filesyste
 
 ## Notes for the API
 
-- Uploads register an upload-progress listener, which makes browsers send a CORS preflight
-  (`OPTIONS`) for the multipart `POST`; `DELETE` is preflighted too.
+- Every upload is chunked, small files included (Cloudflare rejects request bodies over
+  100 MB): `POST …/uploads` (JSON) → `PUT …/uploads/{id}/chunks/{i}`
+  (`application/octet-stream`, sized as the session says, 2 in flight) →
+  `POST …/uploads/{id}/complete` → the job page. Cross-origin every one of these requests is
+  preflighted (`OPTIONS`), so `Access-Control-Allow-Methods` must include `PUT` and
+  `DELETE`; job `DELETE` is preflighted too.
+- A chunk is retried up to 4 times (1, 2, 4, 8 s plus up to 25 % jitter) on network
+  errors, a 60 s stall, 5xx and 429; a `Retry-After` is waited out, unless it is over a
+  minute, which ends the upload with the wait shown. Other 4xx answers are final. After
+  2 failures in a row without an answer, the chunk probes the session with `complete`:
+  `404 UPLOAD_NOT_FOUND` ends the upload with the "upload expired" copy, `409` means it
+  is alive, and a `202` (every chunk had arrived, only the answers were lost) is the job.
+- `complete` is retried the same way (network errors, a 60 s timeout, 5xx including
+  502/504/520–524, 429/503): the API replays the outcome of a repeated complete and keeps
+  the chunks after a 500. A `409 UPLOAD_INCOMPLETE` re-sends `details.missing` and
+  completes again, at most 2 rounds. Once complete is sent, Cancel is disabled and the
+  progress box says "Checking the video…".
+- The session is DELETEd (`fetch` with `keepalive`, best effort) on Cancel, on
+  `pagehide` / `beforeunload`, and when the upload fails before complete was sent, but not
+  after `UPLOAD_NOT_FOUND`. Cancel during the create call lets it finish and DELETEs the
+  session it returns. After complete was sent only a final 4xx answer DELETEs it; after a
+  network error or 5xx the job may exist, or the server keeps the chunks for a retry.
 - `<img>` thumbnails and download links are plain GETs without an `Origin` header.
 - Upload `429 RATE_LIMITED` / `503 SERVER_BUSY`: the page reads `Retry-After` (it must stay
   in `Access-Control-Expose-Headers`), says "You can upload again in about N minutes" and

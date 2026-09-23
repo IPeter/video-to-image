@@ -35,3 +35,18 @@ WHERE created_at >= @from_time
   AND (@domain_key::text = '' OR domain_key = @domain_key::text)
 GROUP BY 1, 2
 ORDER BY 1, 2;
+
+-- name: JobUsage :many
+-- One row per step and model of the job, in the order the step first called the model.
+SELECT
+    step,
+    model,
+    count(*)::bigint                          AS calls,
+    COALESCE(sum(input_tokens), 0)::bigint    AS input_tokens,
+    COALESCE(sum(output_tokens), 0)::bigint   AS output_tokens,
+    COALESCE(sum(thinking_tokens), 0)::bigint AS thinking_tokens,
+    COALESCE(sum(cost_usd), 0)::float8        AS cost_usd
+FROM usage_events
+WHERE job_id = @job_id::text
+GROUP BY step, model
+ORDER BY min(created_at), min(id);

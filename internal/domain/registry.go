@@ -37,24 +37,6 @@ func (r *Registry) Get(key string) (*Config, bool) {
 	return c, ok
 }
 
-// CapUploadBytes lowers every domain's limits.maxUploadBytes to max (when max > 0 and
-// the domain allows more). It is a deployment constraint, not domain behaviour: e.g.
-// Cloudflare's proxy rejects request bodies above 100 MB on Free/Pro plans. Call it
-// once at startup, before the registry is shared. Returns the keys that were lowered.
-func (r *Registry) CapUploadBytes(max int64) []string {
-	if max <= 0 {
-		return nil
-	}
-	var lowered []string
-	for _, k := range r.keys {
-		if c := r.byKey[k]; c.Limits.MaxUploadBytes > max {
-			c.Limits.MaxUploadBytes = max
-			lowered = append(lowered, k)
-		}
-	}
-	return lowered
-}
-
 // Keys returns all domain keys, sorted.
 func (r *Registry) Keys() []string { return append([]string(nil), r.keys...) }
 
@@ -132,7 +114,8 @@ func Parse(raw []byte) (*Config, error) {
 }
 
 // Validate runs tag validation plus the cross-field rules from the plan: unique shot
-// IDs, weights summing to 1 ± 0.01 and at least one required shot.
+// IDs, weights summing to 1 ± 0.01, at least one required shot and an imageCount the
+// shot list can fill under maxPerShot.
 func Validate(c *Config) error {
 	if err := validate.Struct(c); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
@@ -160,9 +143,25 @@ func Validate(c *Config) error {
 		// reported missing.
 		errs = append(errs, fmt.Errorf("selection.imageCount (%d) must be at least the number of required shots (%d)", c.Selection.ImageCount, required))
 	}
+	// imageCount > m*n, written so that a huge maxPerShot cannot overflow (imageCount >= 1
+	// by the tags; m*n < imageCount when it holds).
+	if m, n := c.Selection.MaxPerShot, len(ids)+1; m > 0 && (c.Selection.ImageCount-1)/n >= m {
+		// Every image fills a listed shot or "other" (analyze maps unknown shots to
+		// "other"), each at most m times: every job would report a shortfall.
+		errs = append(errs, fmt.Errorf("selection.imageCount (%d) is unreachable with maxPerShot %d: at most %d images (%d shots + other)",
+			c.Selection.ImageCount, m, m*n, len(ids)))
+	}
 	w := c.Selection.Weights
 	if sum := w.Relevance + w.Sharpness + w.Exposure; math.Abs(sum-1) > 0.01 {
 		errs = append(errs, fmt.Errorf("selection.weights must sum to 1 (got %.3f)", sum))
+	}
+	if c.Crop.Enabled && !c.Review.Enabled {
+		errs = append(errs, errors.New("crop.enabled needs review.enabled (the subject box comes from the review)"))
+	}
+	if c.Crop.Enabled {
+		if _, err := ParseAspect(c.Crop.Aspect); err != nil {
+			errs = append(errs, fmt.Errorf("crop.aspect: %w", err))
+		}
 	}
 	if c.Model.ThinkingBudget != nil && c.Model.ThinkingLevel != "" {
 		errs = append(errs, errors.New("model: set thinkingBudget or thinkingLevel, not both"))
@@ -176,4 +175,17 @@ func Validate(c *Config) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// ParseAspect parses "W:H" (e.g. "4:3", "16:9", "1:1") into W/H.
+func ParseAspect(s string) (float64, error) {
+	w, h, ok := strings.Cut(strings.TrimSpace(s), ":")
+	if !ok {
+		return 0, fmt.Errorf("%q is not W:H", s)
+	}
+	var fw, fh float64
+	if _, err := fmt.Sscanf(strings.TrimSpace(w)+" "+strings.TrimSpace(h), "%g %g", &fw, &fh); err != nil || fw <= 0 || fh <= 0 {
+		return 0, fmt.Errorf("%q is not W:H with positive numbers", s)
+	}
+	return fw / fh, nil
 }

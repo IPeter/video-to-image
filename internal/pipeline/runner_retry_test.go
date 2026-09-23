@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
+	"image/jpeg"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,6 +100,20 @@ func (f *flakyStore) SkipRemainingSteps(ctx context.Context, id string) error {
 	return f.Store.SkipRemainingSteps(ctx, id)
 }
 
+func (f *flakyStore) ReplaceCandidates(ctx context.Context, id string, cands []store.CandidateFrame) error {
+	if err := f.hit(ctx, "ReplaceCandidates"); err != nil {
+		return err
+	}
+	return f.Store.ReplaceCandidates(ctx, id, cands)
+}
+
+func (f *flakyStore) MergeStepMeta(ctx context.Context, id, name string, meta map[string]any) error {
+	if err := f.hit(ctx, "MergeStepMeta"); err != nil {
+		return err
+	}
+	return f.Store.MergeStepMeta(ctx, id, name, meta)
+}
+
 func (f *flakyStore) InsertUsage(ctx context.Context, e store.UsageEvent) error {
 	if err := f.hit(ctx, "InsertUsage"); err != nil {
 		return err
@@ -128,9 +143,11 @@ func TestRunSaveAnalysisBlipIsRetriedWithoutPayingTwice(t *testing.T) {
 	got, err := e.store.GetJob(ctx, job.ID)
 	require.NoError(t, err)
 	assert.Equal(t, store.StatusCompleted, got.Status, got.InternalLog)
-	assert.Equal(t, int32(1), a.calls.Load(), "the model is called once")
+	assert.Equal(t, int32(1), a.analyzeCalls.Load(), "the video is analysed once")
 	assert.Equal(t, 2, fs.count("SaveAnalysis"), "the write is retried in-process")
-	assert.Equal(t, 2, fs.count("InsertUsage"), "usage is retried too, so the cost ceiling sees it")
+	// analyze's usage (failed once, retried) + the frame review's two calls
+	// (orientation, judgement).
+	assert.Equal(t, 4, fs.count("InsertUsage"), "usage is retried too, so the cost ceiling sees it")
 	assert.Equal(t, "Synthetic walkaround (fake analyzer).", got.VideoSummary)
 	fs.assertBounded(t, "SaveAnalysis", 15*time.Second)
 }
@@ -153,9 +170,11 @@ func TestRunCancelledAfterModelAnswerKeepsTheAnswer(t *testing.T) {
 	require.Equal(t, store.StatusProcessing, got.Status)
 	require.NotNil(t, got.Gate)
 
-	second := &scripted{} // any model call would fail the job
+	// The first attempt was interrupted before the frame review, so the retry may review
+	// once; the paid analyze answer must be reused.
+	second := &countingAnalyzer{Analyzer: newFake(t)}
 	require.NoError(t, e.runner(second).Run(context.Background(), job.ID))
-	assert.Zero(t, second.calls.Load(), "the retry does not pay again")
+	assert.Zero(t, second.analyzeCalls.Load(), "the retry does not pay for analyze again")
 	got, _ = e.store.GetJob(context.Background(), job.ID)
 	assert.Equal(t, store.StatusCompleted, got.Status, got.InternalLog)
 }
@@ -352,43 +371,83 @@ func TestRunRetriedExportLeavesNoOrphans(t *testing.T) {
 
 // rerankPicker answers analyze with the fake analyzer and re-rank by picking the LAST
 // candidate listed for each shot (not the best-scoring one), counting re-rank calls.
-type rerankPicker struct {
+// reviewer answers the frame review itself (rotation, view, visibility, box) and
+// counts review calls; every other step goes to the wrapped analyzer.
+type reviewer struct {
 	analyzer.Analyzer
-	reranks atomic.Int32
+	rotate int
+	box    [4]int // box_2d on the UPRIGHT frame: ymin, xmin, ymax, xmax in 0-1000
+	// orient, when set, answers the orientation call instead of the grid cell for rotate.
+	orient func(r *analyzer.Request) (*analyzer.Response, error)
+	// judge, when set, answers the judgement call instead of the default answer (every
+	// frame fully visible, quality 4, in its proposed view); frames maps each id sent to
+	// its candidate and proposed view.
+	judge   func(r *analyzer.Request, ids []string, frames map[string]sentFrame) (*analyzer.Response, error)
+	reviews atomic.Int32 // judgement calls
+	orients atomic.Int32 // orientation calls
 }
 
-func (p *rerankPicker) Generate(ctx context.Context, r *analyzer.Request) (*analyzer.Response, error) {
-	if r.Step != analyzer.StepRerank {
+// sentFrame is one frame of a judgement request.
+type sentFrame struct {
+	candidate string // candidate ID (the name of the image file sent)
+	view      string // proposed view
+}
+
+func (p *reviewer) Generate(ctx context.Context, r *analyzer.Request) (*analyzer.Response, error) {
+	if r.Step != analyzer.StepReview {
 		return p.Analyzer.Generate(ctx, r)
 	}
-	p.reranks.Add(1)
-	last := map[string]string{}
-	var order []string
-	shot := ""
-	for _, part := range r.Parts {
-		f := strings.Fields(part.Text)
-		switch {
-		case len(f) >= 2 && f[0] == "Shot":
-			shot = f[1]
-			order = append(order, shot)
-		case len(f) == 2 && f[0] == "Candidate":
-			last[shot] = strings.TrimSuffix(f[1], ":")
+	ids := r.ResponseSchema.Properties["images"].Items.Properties["id"].Enum
+	if _, orient := r.ResponseSchema.Properties["images"].Items.Properties["upright"]; orient {
+		p.orients.Add(1)
+		if p.orient != nil {
+			return p.orient(r)
+		}
+		// The orientation call: pick the grid cell that shows the frame upright.
+		cell := map[int]string{0: "top-left", 90: "top-right", 180: "bottom-left", 270: "bottom-right"}[p.rotate]
+		var ans []string
+		for _, id := range ids {
+			ans = append(ans, fmt.Sprintf(`{"id":%q,"upright":%q}`, id, cell))
+		}
+		return &analyzer.Response{Text: `{"images":[` + strings.Join(ans, ",") + `]}`, Usage: analyzer.Usage{Model: r.Model, InputTokens: 1100 * len(ids)}}, nil
+	}
+	p.reviews.Add(1)
+	frames := map[string]sentFrame{}
+	for k, part := range r.Parts {
+		// "Image <n> — id <key>, proposed view: <shot>", then the image itself.
+		if i := strings.Index(part.Text, "id "); i >= 0 && strings.Contains(part.Text, "proposed view:") {
+			rest := part.Text[i+3:]
+			id := strings.TrimSuffix(strings.Fields(rest)[0], ",")
+			f := sentFrame{view: strings.TrimSpace(part.Text[strings.Index(part.Text, "proposed view:")+len("proposed view:"):])}
+			if k+1 < len(r.Parts) {
+				f.candidate = strings.TrimSuffix(filepath.Base(r.Parts[k+1].FilePath), ".jpg")
+			}
+			frames[id] = f
 		}
 	}
-	type pick struct {
-		ShotID      string `json:"shotId"`
-		CandidateID string `json:"candidateId"`
-		Reason      string `json:"reason"`
+	if p.judge != nil {
+		return p.judge(r, ids, frames)
 	}
-	var picks []pick
-	for _, s := range order {
-		picks = append(picks, pick{ShotID: s, CandidateID: last[s], Reason: "test pick"})
+	views := map[string]string{}
+	for id, f := range frames {
+		views[id] = f.view
 	}
-	b, err := json.Marshal(map[string]any{"picks": picks})
-	if err != nil {
-		return nil, err
+	type img struct {
+		ID           string `json:"id"`
+		View         string `json:"view"`
+		FullyVisible bool   `json:"subjectFullyVisible"`
+		Quality      int    `json:"quality"`
+		Box          [4]int `json:"box_2d"`
+		Issues       string `json:"issues"`
 	}
-	return &analyzer.Response{Text: string(b), Usage: analyzer.Usage{Model: r.Model, InputTokens: 10, OutputTokens: 10}}, nil
+	var out struct {
+		Images []img `json:"images"`
+	}
+	for _, id := range ids {
+		out.Images = append(out.Images, img{ID: id, View: views[id], FullyVisible: true, Quality: 4, Box: p.box})
+	}
+	b, _ := json.Marshal(out)
+	return &analyzer.Response{Text: string(b), Usage: analyzer.Usage{Model: r.Model, InputTokens: 258 * len(ids), OutputTokens: 40 * len(ids)}}, nil
 }
 
 type shotAt struct {
@@ -396,30 +455,24 @@ type shotAt struct {
 	ts   float64
 }
 
-func TestRunRetryReusesRerankPicks(t *testing.T) {
+func TestRunRetryReusesReview(t *testing.T) {
 	e := newEnv(t)
-	dom, ok := e.reg.Get("cars")
-	require.True(t, ok)
-	dom.Selection.ModelRerank = true
-	// The synthetic clip's neighbouring frames are near-identical: keep them all so each
-	// shot has several eligible candidates to re-rank.
-	dom.Selection.DedupeMaxHamming = -1
 	job := e.createJob("car.mp4")
 	ctx := context.Background()
 	e.storage = &flakyStorage{Storage: e.storage}
-	a := &rerankPicker{Analyzer: newFake(t)}
+	a := &reviewer{Analyzer: newFake(t), box: [4]int{150, 100, 850, 900}}
 
 	require.Error(t, e.runner(a).Run(ctx, job.ID), "export hiccup")
-	require.Equal(t, int32(1), a.reranks.Load())
+	require.Equal(t, int32(1), a.reviews.Load())
 	steps, err := e.store.ListSteps(ctx, job.ID)
 	require.NoError(t, err)
-	var picks map[string]any
+	var stored []any
 	for _, s := range steps {
 		if s.Name == store.StepNameSelect {
-			picks, _ = s.Meta["rerankPreferred"].(map[string]any)
+			stored, _ = s.Meta["review"].([]any)
 		}
 	}
-	require.NotEmpty(t, picks, "the picks are stored with the select step")
+	require.NotEmpty(t, stored, "the verdicts are stored with the select step")
 	cands, err := e.store.ListCandidates(ctx, job.ID)
 	require.NoError(t, err)
 	var first []shotAt
@@ -428,18 +481,9 @@ func TestRunRetryReusesRerankPicks(t *testing.T) {
 			first = append(first, shotAt{c.ShotID, c.TimestampSec})
 		}
 	}
-	applied := 0
-	for shot, ts := range picks {
-		for _, s := range first {
-			if s.shot == shot && math.Abs(s.ts-ts.(float64)) < 1e-3 {
-				applied++
-			}
-		}
-	}
-	require.NotZero(t, applied, "the picks changed the selection")
 
 	require.NoError(t, e.runner(a).Run(ctx, job.ID))
-	assert.Equal(t, int32(1), a.reranks.Load(), "the retry reuses the stored picks instead of paying again")
+	assert.Equal(t, int32(1), a.reviews.Load(), "the retry reuses the stored verdicts instead of paying again")
 	got, _ := e.store.GetJob(ctx, job.ID)
 	require.Equal(t, store.StatusCompleted, got.Status, got.InternalLog)
 	imgs, err := e.store.ListSelectedImages(ctx, job.ID)
@@ -449,6 +493,51 @@ func TestRunRetryReusesRerankPicks(t *testing.T) {
 		second = append(second, shotAt{im.ShotID, im.TimestampSec})
 	}
 	assert.ElementsMatch(t, first, second, "the retry selects the same frames")
+	usage, err := e.store.JobUsage(ctx, job.ID)
+	require.NoError(t, err)
+	var reviewCalls int64
+	for _, u := range usage {
+		if u.Step == analyzer.StepReview {
+			reviewCalls += u.Calls
+		}
+	}
+	assert.Equal(t, int64(2), reviewCalls, "one review (orientation + judgement) is billed, not repeated on retry")
+}
+
+// A frame the review says is sideways is exported upright and, when the subject fits,
+// cropped to the domain aspect around the reviewed box.
+func TestRunReviewRotatesAndCrops(t *testing.T) {
+	e := newEnv(t)
+	dom, _ := e.reg.Get("cars")
+	dom.Crop.MinShortSidePx = 300 // the 1280x720 test clip is small
+	job := e.createJob("car.mp4")
+	ctx := context.Background()
+	// Upright, the stored 1280x720 frame is 720x1280 (portrait). The box is car-shaped on
+	// the upright frame (wide, short): x 0.1-0.9, y 0.375-0.625 (box_2d is ymin, xmin,
+	// ymax, xmax).
+	a := &reviewer{Analyzer: newFake(t), rotate: 90, box: [4]int{375, 100, 625, 900}}
+	require.NoError(t, e.runner(a).Run(ctx, job.ID))
+	got, _ := e.store.GetJob(ctx, job.ID)
+	require.Equal(t, store.StatusCompleted, got.Status, got.InternalLog)
+	imgs, err := e.store.ListSelectedImages(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, imgs)
+	seen := map[string]bool{}
+	for _, im := range imgs {
+		assert.False(t, seen[im.ShotID], "one image per shot: %s", im.ShotID)
+		seen[im.ShotID] = true
+		assert.Equal(t, 90, im.Rotation)
+		require.NotNil(t, im.Crop, "cropped to 4:3")
+		assert.Greater(t, im.Width, im.Height, "landscape after the crop")
+		assert.InDelta(t, 4.0/3, float64(im.Width)/float64(im.Height), 0.02)
+		rc, err := e.storage.Get(ctx, im.ImagePath)
+		require.NoError(t, err)
+		cfg, err := jpeg.DecodeConfig(rc)
+		rc.Close()
+		require.NoError(t, err)
+		assert.Equal(t, im.Width, cfg.Width, "the stored JPEG is the edited image")
+		assert.Equal(t, im.Height, cfg.Height)
+	}
 }
 
 // previewProbe records the duration of the preview each analyze call receives.

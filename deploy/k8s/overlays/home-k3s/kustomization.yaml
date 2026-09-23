@@ -34,7 +34,7 @@ patches:
 images:
   - name: v2i
     newName: localhost/v2i
-    newTag: 2c0f05b-20260923123915
+    newTag: c3d6792-20260923175233
   - name: v2i-web
     newName: localhost/v2i-web
-    newTag: 2c0f05b-20260923123915
+    newTag: c3d6792-20260923175233

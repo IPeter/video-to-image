@@ -9,7 +9,8 @@ import { Lightbox } from "@/components/lightbox";
 import { MissingShots } from "@/components/missing-shots";
 import { ResultCard } from "@/components/result-card";
 import { Button } from "@/components/ui/button";
-import { resolveApiUrl, type JobResult } from "@/lib/api";
+import { UsageSummary } from "@/components/usage-summary";
+import { resolveApiUrl, type JobResult, type JobUsage } from "@/lib/api";
 import { formatDateTime, pluralize } from "@/lib/format";
 
 /** Id of the results <h1>, the focus target when processing finishes (see JobView). */
@@ -21,6 +22,8 @@ export interface ResultGridProps {
   expiresAt: string;
   /** Browser-facing API base URL; every URL in `result` is relative to it. */
   apiBaseUrl: string;
+  /** The job's model usage, shown as "AI usage: … tokens · $…" under the heading. */
+  usage?: JobUsage | null;
   /** Shows a "Delete now" action when set. */
   onDeleteNow?: () => void;
   deleting?: boolean;
@@ -31,7 +34,16 @@ export interface ResultGridProps {
 }
 
 /** Results page body: header with summary and actions, missing-shot callout, image grid. */
-export function ResultGrid({ result, expiresAt, apiBaseUrl, onDeleteNow, deleting, notice, locale }: ResultGridProps) {
+export function ResultGrid({
+  result,
+  expiresAt,
+  apiBaseUrl,
+  usage,
+  onDeleteNow,
+  deleting,
+  notice,
+  locale,
+}: ResultGridProps) {
   const [openIndex, setOpenIndex] = useState<number | null>(null);
   const images = result.images;
   const expiry = formatDateTime(expiresAt, locale);
@@ -55,6 +67,7 @@ export function ResultGrid({ result, expiresAt, apiBaseUrl, onDeleteNow, deletin
               Available until <time dateTime={expiresAt}>{expiry}</time>
             </p>
           )}
+          <UsageSummary usage={usage} />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {result.zipUrl && images.length > 0 && (

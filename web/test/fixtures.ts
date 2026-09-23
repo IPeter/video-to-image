@@ -1,4 +1,4 @@
-import type { Job, JobResult, PublicDomain, ResultImage } from "@/lib/api";
+import type { Job, JobResult, JobUsage, PublicDomain, ResultImage, UsageStep } from "@/lib/api";
 
 // Test data shaped exactly like the API contract (lib/api.d.ts).
 
@@ -47,6 +47,8 @@ export function makeImage(index: number, overrides: Partial<ResultImage> = {}): 
     url: base,
     downloadUrl: `${base}?download=1`,
     thumbnailUrl: `${base}/thumb`,
+    rotation: 0,
+    cropped: false,
     ...overrides,
   };
 }
@@ -62,6 +64,52 @@ export function makeResult(overrides: Partial<JobResult> = {}): JobResult {
     missingShots: [{ id: "rear_three_quarter", label: "Rear 3/4" }],
     explanation: "3 images selected. The rear 3/4 angle was not clearly visible in the video.",
     zipUrl: `/v1/domains/cars/jobs/${JOB_ID}/download.zip`,
+    ...overrides,
+  };
+}
+
+/** A job before its first model call. */
+export const NO_USAGE: JobUsage = {
+  calls: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  thinkingTokens: 0,
+  totalTokens: 0,
+  costUsd: 0,
+  testMode: false,
+  costComplete: true,
+  steps: [],
+};
+
+export function makeUsageStep(overrides: Partial<UsageStep> = {}): UsageStep {
+  return {
+    step: "analyze",
+    model: "gemini-3.5-flash-lite",
+    calls: 1,
+    inputTokens: 6200,
+    outputTokens: 900,
+    thinkingTokens: 400,
+    costUsd: 0.0031,
+    priced: true,
+    ...overrides,
+  };
+}
+
+/** A finished job's usage: one analyze and one review call, 9,012 tokens, $0.0041. */
+export function makeUsage(overrides: Partial<JobUsage> = {}): JobUsage {
+  return {
+    calls: 2,
+    inputTokens: 7400,
+    outputTokens: 1112,
+    thinkingTokens: 500,
+    totalTokens: 9012,
+    costUsd: 0.0041,
+    testMode: false,
+    costComplete: true,
+    steps: [
+      makeUsageStep(),
+      makeUsageStep({ step: "review", inputTokens: 1200, outputTokens: 212, thinkingTokens: 100, costUsd: 0.001 }),
+    ],
     ...overrides,
   };
 }
@@ -85,6 +133,7 @@ export function makeJob(overrides: Partial<Job> = {}): Job {
         { name: "analyze", status: "running" },
       ],
     },
+    usage: NO_USAGE,
     result: null,
     rejection: null,
     error: null,

@@ -22,6 +22,8 @@ type Config struct {
 	Gate      Gate      `yaml:"gate"`
 	Shots     []Shot    `yaml:"shots" validate:"required,min=1,dive"` // ordered by priority
 	Selection Selection `yaml:"selection"`
+	Review    Review    `yaml:"review"`
+	Crop      Crop      `yaml:"crop"`
 
 	RetentionHours int `yaml:"retentionHours" validate:"required,min=1"`
 
@@ -107,9 +109,53 @@ type Selection struct {
 	Instructions     string  `yaml:"instructions"     validate:"required"`
 	MaxScenes        int     `yaml:"maxScenes"        validate:"required,min=1"`
 	SampleFPS        int     `yaml:"sampleFps"        validate:"required,min=1"`
-	ModelRerank      bool    `yaml:"modelRerank"`
 	Weights          Weights `yaml:"weights"`
 	DedupeMaxHamming int     `yaml:"dedupeMaxHamming" validate:"gte=0,lte=64"`
+	// MaxPerShot caps images per shot (and per "other"), so the fill pass cannot add a
+	// second, near-identical view of a covered shot. 0 → no cap: the fill pass adds
+	// any distinct frame by score (plan/03 step 5).
+	MaxPerShot int `yaml:"maxPerShot" validate:"gte=0"`
+}
+
+// EffectiveMaxPerShot returns the per-shot cap selection applies; 0 means no cap.
+func (s Selection) EffectiveMaxPerShot() int {
+	return max(s.MaxPerShot, 0)
+}
+
+// Review configures the model's check of the shortlisted still frames (it replaces
+// the plan's optional re-rank): for each frame the model reports the rotation that
+// makes it upright, the view it really shows, whether the subject is fully in frame,
+// a 1-5 quality score and the subject's bounding box. Selection then only uses frames
+// that pass, and export rotates and crops them.
+type Review struct {
+	Enabled bool `yaml:"enabled"`
+	// CandidatesPerShot is how many top-scored frames per shot are sent. 0 → 3.
+	CandidatesPerShot int `yaml:"candidatesPerShot" validate:"gte=0,lte=10"`
+	// MinQuality is the lowest acceptable 1-5 quality. 0 → 3.
+	MinQuality int `yaml:"minQuality" validate:"gte=0,lte=5"`
+	// MaxImageSide is the long side (px) of the frames sent to the model. 0 → 512.
+	MaxImageSide int `yaml:"maxImageSide" validate:"gte=0"`
+	// Instructions describe what a good frame is for this domain.
+	Instructions string `yaml:"instructions" validate:"required_if=Enabled true"`
+}
+
+// Crop configures reframing of the selected images around the reviewed subject box.
+// It never cuts into the subject and never produces an image with a short side below
+// the floor (MinShortSidePx, see there): the frame is kept uncropped instead. Needs
+// review.enabled. crop.Params has the exact rules.
+type Crop struct {
+	Enabled bool `yaml:"enabled"`
+	// Aspect is the target width:height, e.g. "4:3" (a listing photo).
+	Aspect string `yaml:"aspect" validate:"required_if=Enabled true"`
+	// MarginPct is the space kept around the subject box, in percent of the box's
+	// larger side. Best effort: where the full margin would not fit the aspect in the
+	// frame, the largest margin that does is used (down to none). 0 → 6.
+	MarginPct float64 `yaml:"marginPct" validate:"gte=0,lte=50"`
+	// MinShortSidePx is the smallest acceptable short side of a cropped image. 0 → 1080.
+	// A crop that changes the orientation (a landscape aspect from an upright portrait
+	// frame, or the reverse) may go lower, to the largest short side the frame allows,
+	// but never below 480 px (crop.ReorientedMinShortSidePx).
+	MinShortSidePx int `yaml:"minShortSidePx" validate:"gte=0"`
 }
 
 type Weights struct {

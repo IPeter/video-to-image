@@ -43,3 +43,10 @@ SET status      = 'skipped',
         ELSE greatest(0, round(extract(epoch FROM now() - started_at) * 1000))::integer
     END
 WHERE job_id = @job_id AND status IN ('pending', 'running');
+
+-- name: MergeStepMeta :execrows
+-- Drops the keys in @remove from meta, then adds or replaces the keys of @set; status
+-- and times are unchanged.
+UPDATE job_steps
+SET meta = (meta - @remove::text[]) || @set::jsonb
+WHERE job_id = @job_id AND name = @name;

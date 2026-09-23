@@ -38,7 +38,7 @@ func (q *Queries) ExpireSelectedImages(ctx context.Context, jobID string) (int64
 }
 
 const getSelectedImage = `-- name: GetSelectedImage :one
-SELECT id, job_id, candidate_id, idx, shot_id, timestamp_sec, width, height, reason, file_name, image_path, thumb_path, bytes FROM selected_images WHERE job_id = $1 AND id = $2
+SELECT id, job_id, candidate_id, idx, shot_id, timestamp_sec, width, height, reason, file_name, image_path, thumb_path, bytes, rotation, crop FROM selected_images WHERE job_id = $1 AND id = $2
 `
 
 type GetSelectedImageParams struct {
@@ -63,6 +63,8 @@ func (q *Queries) GetSelectedImage(ctx context.Context, arg GetSelectedImagePara
 		&i.ImagePath,
 		&i.ThumbPath,
 		&i.Bytes,
+		&i.Rotation,
+		&i.Crop,
 	)
 	return i, err
 }
@@ -81,10 +83,12 @@ type InsertSelectedImagesParams struct {
 	ImagePath    *string
 	ThumbPath    *string
 	Bytes        int32
+	Rotation     int32
+	Crop         []byte
 }
 
 const listSelectedImages = `-- name: ListSelectedImages :many
-SELECT id, job_id, candidate_id, idx, shot_id, timestamp_sec, width, height, reason, file_name, image_path, thumb_path, bytes FROM selected_images WHERE job_id = $1 ORDER BY idx
+SELECT id, job_id, candidate_id, idx, shot_id, timestamp_sec, width, height, reason, file_name, image_path, thumb_path, bytes, rotation, crop FROM selected_images WHERE job_id = $1 ORDER BY idx
 `
 
 func (q *Queries) ListSelectedImages(ctx context.Context, jobID string) ([]SelectedImage, error) {
@@ -110,6 +114,8 @@ func (q *Queries) ListSelectedImages(ctx context.Context, jobID string) ([]Selec
 			&i.ImagePath,
 			&i.ThumbPath,
 			&i.Bytes,
+			&i.Rotation,
+			&i.Crop,
 		); err != nil {
 			return nil, err
 		}

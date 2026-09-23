@@ -53,6 +53,7 @@ const (
 	ctxKeyInfo ctxKey = iota
 	ctxKeyDomain
 	ctxKeyInternal
+	ctxKeyRequest
 )
 
 // requestInfo collects what the request log line reports once the handler returned.
@@ -163,7 +164,7 @@ func routePattern(routes chi.Routes, r *http.Request) string {
 // allowedMethods lists the methods that have a route for the request path.
 func allowedMethods(routes chi.Routes, r *http.Request) string {
 	var allow []string
-	for _, m := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+	for _, m := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete} {
 		if routes.Find(chi.NewRouteContext(), m, routingPath(r)) != "" {
 			allow = append(allow, m)
 		}
@@ -264,6 +265,11 @@ func (s *Server) apiError(ctx context.Context, op string, err error) *APIError {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		return apiErr
+	}
+	if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+		// The client went away (e.g. a poll aborted on navigation); nobody reads this.
+		s.d.Logger.InfoContext(ctx, "httpapi: "+op+": client went away", "err", err)
+		return errInternal()
 	}
 	s.d.Logger.ErrorContext(ctx, "httpapi: "+op, "err", err)
 	return errInternal()

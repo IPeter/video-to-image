@@ -200,6 +200,92 @@ func TestRerank(t *testing.T) {
 	assert.Equal(t, int(DefaultDurationSec*100)+500, resp.Usage.InputTokens)
 }
 
+// reviewSchema mimics the schema internal/pipeline/review sends: the candidate IDs are
+// the enum of images.items.properties.id.
+func reviewSchema(ids ...string) *analyzer.Schema {
+	return &analyzer.Schema{
+		Type: "object",
+		Properties: map[string]*analyzer.Schema{
+			"images": {
+				Type: "array",
+				Items: &analyzer.Schema{
+					Type: "object",
+					Properties: map[string]*analyzer.Schema{
+						"id":   {Type: "string", Enum: ids},
+						"view": {Type: "string", Enum: []string{"front", "rear", "other", "none"}},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestReview(t *testing.T) {
+	a := newFake(t, Options{})
+	parts := []analyzer.Part{
+		{Text: "Review these frames.\n- front: Front — straight-on front, proposed view: bogus"},
+		{Text: "Image 1 — id cf_1, proposed view: front"}, {FilePath: "a.jpg", MIMEType: "image/jpeg"},
+		{Text: "Image 2 — id cf_2, proposed view: rear"}, {FilePath: "b.jpg", MIMEType: "image/jpeg"},
+		{Text: "Image 3 — id cf_3, proposed view: other"}, {FilePath: "c.jpg", MIMEType: "image/jpeg"},
+		{FilePath: "d.jpg", MIMEType: "image/jpeg"}, // cf_4 has no text part
+		{Text: "Return JSON only."},
+	}
+	resp, err := a.Generate(context.Background(), &analyzer.Request{
+		Step: analyzer.StepReview, Model: "m", Parts: parts,
+		ResponseSchema: reviewSchema("cf_1", "cf_2", "cf_3", "cf_4"),
+	})
+	require.NoError(t, err)
+
+	dec := json.NewDecoder(strings.NewReader(resp.Text))
+	dec.DisallowUnknownFields()
+	var out struct {
+		Images []struct {
+			ID                  string `json:"id"`
+			Rotation            int    `json:"rotation"`
+			View                string `json:"view"`
+			SubjectFullyVisible bool   `json:"subjectFullyVisible"`
+			Quality             int    `json:"quality"`
+			Box2D               []int  `json:"box_2d"`
+			Issues              string `json:"issues"`
+		} `json:"images"`
+	}
+	require.NoError(t, dec.Decode(&out), resp.Text)
+	require.Len(t, out.Images, 4, "one entry per id, in schema order")
+	wantViews := []string{"front", "rear", "other", "other"}
+	for i, img := range out.Images {
+		assert.Equal(t, fmt.Sprintf("cf_%d", i+1), img.ID)
+		assert.Equal(t, wantViews[i], img.View, "proposed view echoed (other when unknown)")
+		assert.Zero(t, img.Rotation)
+		assert.True(t, img.SubjectFullyVisible)
+		assert.Equal(t, 4, img.Quality)
+		assert.Equal(t, []int{150, 100, 850, 900}, img.Box2D)
+		assert.Empty(t, img.Issues)
+	}
+	assert.Len(t, resp.FileHandles, len(parts))
+	assert.Equal(t, "fake:m", resp.Usage.Model)
+	assert.Equal(t, ReviewBaseTokens+4*ReviewTokensPerImage, resp.Usage.InputTokens)
+	assert.Equal(t, 4*ReviewOutputTokensPerImage, resp.Usage.OutputTokens)
+
+	// Deterministic.
+	again, err := a.Generate(context.Background(), &analyzer.Request{
+		Step: analyzer.StepReview, Model: "m", Parts: parts,
+		ResponseSchema: reviewSchema("cf_1", "cf_2", "cf_3", "cf_4"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, resp.Text, again.Text)
+
+	// No schema (or no id enum) → a valid, empty answer; the canned file is not used.
+	path := filepath.Join(t.TempDir(), "canned.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"gate":{}}`), 0o600))
+	for _, s := range []*analyzer.Schema{nil, {Type: "object"}, reviewSchema()} {
+		resp, err := newFake(t, Options{ResponseFile: path}).Generate(context.Background(),
+			&analyzer.Request{Step: analyzer.StepReview, ResponseSchema: s})
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"images":[]}`, resp.Text)
+		assert.Equal(t, ReviewBaseTokens, resp.Usage.InputTokens)
+	}
+}
+
 func TestUnknownStepAndNilRequest(t *testing.T) {
 	a := newFake(t, Options{})
 	_, err := a.Generate(context.Background(), &analyzer.Request{Step: "summarise"})

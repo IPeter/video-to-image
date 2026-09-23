@@ -14,6 +14,7 @@ const (
 	PrefixJob       = "job"
 	PrefixImage     = "img"
 	PrefixCandidate = "cf"
+	PrefixUpload    = "upl"
 )
 
 // New returns prefix + "_" + a new ULID.
@@ -24,6 +25,7 @@ func New(prefix string) string {
 func NewJob() string       { return New(PrefixJob) }
 func NewImage() string     { return New(PrefixImage) }
 func NewCandidate() string { return New(PrefixCandidate) }
+func NewUpload() string    { return New(PrefixUpload) }
 
 // Valid reports whether id is prefix_ followed by a well-formed ULID. Handlers use it to
 // reject junk path parameters before touching the database.

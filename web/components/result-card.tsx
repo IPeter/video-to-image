@@ -18,6 +18,47 @@ export function imageAltText(image: Pick<ResultImage, "shotLabel" | "timestampLa
   return `${image.shotLabel}, frame at ${image.timestampLabel}. ${image.reason}`.trim();
 }
 
+/** How the export reframed a video frame: the badge text and its explanation. */
+export interface ReframeInfo {
+  /** "Straightened", "Cropped" or "Straightened · Cropped". */
+  label: string;
+  /** Full sentence for the tooltip and screen readers. */
+  description: string;
+}
+
+/** Null when the image is the video frame as recorded (no rotation, no crop). */
+export function reframeInfo(image: Pick<ResultImage, "rotation" | "cropped">): ReframeInfo | null {
+  const degrees = (((Math.round(image.rotation) % 360) + 360) % 360) || 0;
+  const straightened = degrees !== 0;
+  if (!straightened && !image.cropped) return null;
+  const labels: string[] = [];
+  const actions: string[] = [];
+  if (straightened) {
+    labels.push("Straightened");
+    actions.push(`rotated ${degrees}° clockwise to stand upright`);
+  }
+  if (image.cropped) {
+    labels.push("Cropped");
+    actions.push("cropped to frame the subject");
+  }
+  return {
+    label: labels.join(" · "),
+    description: `Reframed from the video frame: ${actions.join(" and ")}.`,
+  };
+}
+
+/** Small muted badge for a straightened or cropped image; nothing for an untouched frame. */
+export function ReframeBadge({ image }: { image: Pick<ResultImage, "rotation" | "cropped"> }) {
+  const info = reframeInfo(image);
+  if (!info) return null;
+  return (
+    <Badge variant="outline" className="font-normal text-muted-foreground" title={info.description} data-testid="reframed">
+      <span aria-hidden="true">{info.label}</span>
+      <span className="sr-only">{info.description}</span>
+    </Badge>
+  );
+}
+
 /** One selected image: thumbnail (opens the lightbox), shot label, timestamp, reason, download. */
 export function ResultCard({ image, apiBaseUrl, onOpen }: ResultCardProps) {
   return (
@@ -30,8 +71,10 @@ export function ResultCard({ image, apiBaseUrl, onOpen }: ResultCardProps) {
         type="button"
         onClick={onOpen}
         className="relative block w-full overflow-hidden bg-muted outline-none focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:ring-inset"
-        // Frames of one video share dimensions, so cards in a row line up; 4:3 if unknown.
-        style={{ aspectRatio: image.width > 0 && image.height > 0 ? `${image.width} / ${image.height}` : "4 / 3" }}
+        // One frame shape for every card, so a row lines up even when photos differ
+        // (straightened portrait frames, 4:3 crops, 16:9 originals): the image is
+        // letterboxed inside the 4:3 listing shape.
+        style={{ aspectRatio: "4 / 3" }}
         aria-label={`View ${image.shotLabel} at ${image.timestampLabel} in full size`}
       >
         <img
@@ -48,14 +91,17 @@ export function ResultCard({ image, apiBaseUrl, onOpen }: ResultCardProps) {
         </span>
       </button>
       <div className="flex flex-1 flex-col gap-2 p-3">
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <Badge id={`${image.id}-label`} variant="secondary" data-testid="shot-label">
             {image.shotLabel}
           </Badge>
-          <span className="flex items-center gap-1 text-xs tabular-nums text-muted-foreground">
-            <Clock aria-hidden="true" className="size-3.5" />
-            <span className="sr-only">Timestamp</span>
-            <span data-testid="timestamp">{image.timestampLabel}</span>
+          <span className="ml-auto flex flex-wrap items-center justify-end gap-2">
+            <ReframeBadge image={image} />
+            <span className="flex items-center gap-1 text-xs tabular-nums text-muted-foreground">
+              <Clock aria-hidden="true" className="size-3.5" />
+              <span className="sr-only">Timestamp</span>
+              <span data-testid="timestamp">{image.timestampLabel}</span>
+            </span>
           </span>
         </div>
         <div className="flex items-center gap-2">

@@ -137,11 +137,16 @@ func previewFrameCap(maxDurationSec float64, fps int) int {
 	return max(1, int(math.Ceil(maxDurationSec*float64(fps)-1e-9)))
 }
 
-// previewArgs is BuildPreview's ffmpeg argument list (in and tmp are absolute).
-func (f *FFmpeg) previewArgs(in, tmp string, height, fps int, maxDurationSec float64) []string {
+// previewArgs is BuildPreview's ffmpeg argument list (in and tmp are absolute) for
+// plan (its fps is the output rate, also for the frame cap).
+func (f *FFmpeg) previewArgs(in, tmp string, height int, maxDurationSec float64, plan previewPlan) []string {
 	args := []string{"-y", "-hide_banner", "-nostdin", "-loglevel", "error"}
 	args = append(args, f.threadArgs("-filter_threads")...)
 	args = append(args, f.inputLimitArgs()...)
+	if plan.skip != "" {
+		// A decoder option, so an input option.
+		args = append(args, "-skip_frame:v", plan.skip)
+	}
 	if maxDurationSec > 0 {
 		// An input option: stop reading the source after maxDurationSec, whatever its
 		// header claims.
@@ -149,13 +154,24 @@ func (f *FFmpeg) previewArgs(in, tmp string, height, fps int, maxDurationSec flo
 	}
 	args = append(args, "-i", in, "-map", "0:V:0")
 	args = append(args, stripMetadataArgs...)
+	vf := fmt.Sprintf("scale=-2:'min(%d,trunc(ih/2)*2)',", height)
+	fps := fmt.Sprintf("fps=%d", plan.fps)
+	if plan.keyframesOnly() {
+		// The decoder may skip some of the keyframes (see decodedGapShortfall): report
+		// the frames it produced on stdout.
+		vf += decodedFramesFilter + ","
+		// The last keyframe's own tick lies at or past the end the fps filter derives
+		// from it (its pts plus one source frame), so "round" would drop it and end the
+		// preview a keyframe interval early; "pass" keeps it, like a full decode does.
+		fps += ":eof_action=pass"
+	}
 	args = append(args,
-		"-vf", fmt.Sprintf("scale=-2:'min(%d,trunc(ih/2)*2)',fps=%d", height, fps),
+		"-vf", vf+fps,
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p")
 	args = append(args, f.threadArgs("-threads")...)
 	if maxDurationSec > 0 {
 		// A hard bound on what the model sees, independent of timestamps.
-		args = append(args, "-frames:v", strconv.Itoa(previewFrameCap(maxDurationSec, fps)))
+		args = append(args, "-frames:v", strconv.Itoa(previewFrameCap(maxDurationSec, plan.fps)))
 	}
 	return append(args,
 		"-an", "-sn", "-dn",
@@ -163,14 +179,40 @@ func (f *FFmpeg) previewArgs(in, tmp string, height, fps int, maxDurationSec flo
 		"-f", "mp4", tmp)
 }
 
-// BuildPreview writes a small analysis copy (the file the model sees):
+// BuildPreview writes a small analysis copy (the file the model sees) and reports its
+// real frame rate:
 //
-//	ffmpeg [-filter_threads n] [-threads n] [-max_pixels N] [-t max] -i in -map 0:V:0 \
-//	  -map_metadata -1 -map_chapters -1 -fflags +bitexact -flags:v +bitexact \
-//	  -vf "scale=-2:'min(<height>,trunc(ih/2)*2)',fps=<fps>" -c:v libx264 -preset veryfast \
-//	  -crf 28 -pix_fmt yuv420p [-threads n] [-frames:v cap] -an -sn -dn -movflags +faststart out.mp4
+//	ffmpeg [-filter_threads n] [-threads n] [-max_pixels N] -skip_frame:v nokey|noref [-t max] \
+//	  -i in -map 0:V:0 -map_metadata -1 -map_chapters -1 -fflags +bitexact -flags:v +bitexact \
+//	  -vf "scale=-2:'min(<height>,trunc(ih/2)*2)',[<decodedFramesFilter>,]fps=<fps>[:eof_action=pass]" \
+//	  -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p [-threads n] [-frames:v cap] \
+//	  -an -sn -dn -movflags +faststart out.mp4
 //
 // Rotation is applied (auto-rotate), so the preview is display-oriented.
+//
+// Decoding the source dominates the cost, so not every frame is decoded. A cheap
+// ffprobe pass first reads the keyframe layout of the whole video stream from the
+// packet flags (demux only, see probeKeyframes). When no stretch of the video goes
+// longer than one output frame interval without a keyframe (phone video: a keyframe
+// about every second; see planPreview), only keyframes are decoded
+// (-skip_frame:v nokey) and the preview runs at min(fps, ⌊1/largest gap⌋), at least 1.
+// Otherwise non-reference frames are skipped (-skip_frame:v noref) at the requested
+// fps; the same happens when the probe fails.
+//
+// A skip mode can silently produce a broken preview: the H.264 decoder decodes only IDR
+// pictures under nokey, so an open-GOP or intra-refresh source (whose recovery points
+// the container flags as keyframes) yields an empty file or a single frame, and ffmpeg
+// still exits 0; when the source also has periodic IDR pictures, the decoder shows one
+// picture from IDR to IDR instead. So a skip-mode preview is read back (see
+// probePreviewOutput and previewShortfall) and must have a video stream with at least
+// 80% of the expected frames and reach the source's end, and a keyframes-only one must
+// not have skipped keyframes (the frames the decoder produced are printed during the
+// encode, see decodedGapShortfall); if it does not, or ffmpeg fails, the preview is
+// rebuilt with noref at the requested fps and then from a full decode (which is
+// accepted as long as it has a frame). PreviewInfo describes the preview that was kept,
+// and the model must be told its FPS, not the requested fps. On a 59 s 4K HEVC 60 fps
+// iPhone clip with a keyframe every 0.93 s (2 threads) the preview took 173 s decoding
+// every frame, 90 s with noref and 4.5 s keyframes-only (1 fps, 59 frames).
 //
 // The source is never upscaled: the output height is min(height, source height),
 // rounded down to even, and the width keeps the aspect ratio (also even). Output is
@@ -181,46 +223,123 @@ func (f *FFmpeg) previewArgs(in, tmp string, height, fps int, maxDurationSec flo
 // Limits:
 //   - maxDurationSec > 0 caps the length independently of the container header: the
 //     source is read for at most maxDurationSec (-t as an input option) and at most
-//     ceil(maxDurationSec·fps) frames are written, so the preview lasts less than
-//     maxDurationSec + 1/fps even when the header claims a shorter duration than the
-//     stream really has. 0 means no cap; a negative or non-finite value is an error.
+//     ceil(maxDurationSec·fps) frames are written (fps being the preview's real rate),
+//     so the preview lasts less than maxDurationSec + 1/fps even when the header
+//     claims a shorter duration than the stream really has. 0 means no cap; a
+//     negative or non-finite value is an error.
 //   - FFmpeg.MaxPixels makes the decoder refuse larger frames (also after a mid-stream
 //     resolution change); a file that trips it fails with an error wrapping
 //     ErrPixelLimit.
 //   - FFmpeg.Threads bounds the decoder, filter and encoder thread counts.
 //   - No metadata of the source is copied (see stripMetadataArgs): no GPS location,
 //     title, comment or chapters reach the model.
-func (f *FFmpeg) BuildPreview(ctx context.Context, in, out string, height, fps int, maxDurationSec float64) error {
+func (f *FFmpeg) BuildPreview(ctx context.Context, in, out string, height, fps int, maxDurationSec float64) (PreviewInfo, error) {
 	if height <= 0 || fps <= 0 {
-		return fmt.Errorf("media: preview: height (%d) and fps (%d) must be positive", height, fps)
+		return PreviewInfo{}, fmt.Errorf("media: preview: height (%d) and fps (%d) must be positive", height, fps)
 	}
 	if math.IsNaN(maxDurationSec) || math.IsInf(maxDurationSec, 0) || maxDurationSec < 0 {
-		return fmt.Errorf("media: preview: invalid max duration %v (0 = no cap)", maxDurationSec)
+		return PreviewInfo{}, fmt.Errorf("media: preview: invalid max duration %v (0 = no cap)", maxDurationSec)
 	}
 	inAbs, err := absPath(in)
 	if err != nil {
-		return fmt.Errorf("media: preview input: %w", err)
+		return PreviewInfo{}, fmt.Errorf("media: preview input: %w", err)
 	}
 	outAbs, err := absPath(out)
 	if err != nil {
-		return fmt.Errorf("media: preview output: %w", err)
+		return PreviewInfo{}, fmt.Errorf("media: preview output: %w", err)
 	}
 	if inAbs == outAbs {
-		return fmt.Errorf("media: preview: output %s would overwrite the input", out)
+		return PreviewInfo{}, fmt.Errorf("media: preview: output %s would overwrite the input", out)
 	}
 	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
-		return fmt.Errorf("media: preview: %w", err)
+		return PreviewInfo{}, fmt.Errorf("media: preview: %w", err)
 	}
 	tmp := filepath.Join(filepath.Dir(outAbs), "."+filepath.Base(outAbs)+".partial")
 	defer os.Remove(tmp) // no-op after a successful rename
 
-	if _, err := f.run(ctx, previewTimeout, f.ffmpegBin(), f.previewArgs(inAbs, tmp, height, fps, maxDurationSec)...); err != nil {
-		return withPixelLimit(err)
+	plan, sourceSec := previewPlan{fps: fps, skip: skipNonRef}, 0.0
+	if st, err := f.probeKeyframes(ctx, inAbs); err != nil {
+		f.logger().Debug("media: preview keyframe probe failed; skipping non-reference frames only", "err", err)
+	} else {
+		plan, sourceSec = planPreview(st, fps), st.DurationSec()
+		f.logger().Debug("media: preview decode plan", "keyframes", st.Keyframes, "maxKeyframeGapSec", st.MaxGapSec,
+			"durationSec", sourceSec, "skipFrame", plan.skip, "fps", plan.fps, "requestedFps", fps)
 	}
-	if err := os.Rename(tmp, outAbs); err != nil {
-		return fmt.Errorf("media: preview: %w", err)
+	return f.encodePreview(ctx, inAbs, tmp, outAbs, height, maxDurationSec, sourceSec, previewAttempts(plan, fps))
+}
+
+// previewAttempts is the order BuildPreview tries decode modes in, starting with plan:
+// keyframes only, then non-reference frames skipped at the requested fps, then a full
+// decode at the requested fps.
+func previewAttempts(plan previewPlan, requested int) []previewPlan {
+	full := previewPlan{fps: requested}
+	switch plan.skip {
+	case "":
+		return []previewPlan{full}
+	case skipNonRef:
+		return []previewPlan{{fps: requested, skip: skipNonRef}, full}
+	default:
+		return []previewPlan{plan, {fps: requested, skip: skipNonRef}, full}
 	}
-	return nil
+}
+
+// encodePreview runs the preview encode for each attempt in turn into tmp until one is
+// usable (see tryPreview), and renames it to out. sourceSec is the source stream's
+// length (0 = unknown).
+func (f *FFmpeg) encodePreview(ctx context.Context, in, tmp, out string, height int, maxDurationSec, sourceSec float64, attempts []previewPlan) (PreviewInfo, error) {
+	err := errors.New("media: preview: no decode mode to try")
+	var prev previewPlan
+	for i, p := range attempts {
+		if i > 0 {
+			f.logger().Warn("media: preview unusable; retrying with another decode mode",
+				"skipFrame", prev.skip, "fps", prev.fps, "retrySkipFrame", p.skip, "retryFps", p.fps, "err", err)
+		}
+		var retry bool
+		retry, err = f.tryPreview(ctx, in, tmp, height, maxDurationSec, sourceSec, p, i == len(attempts)-1)
+		if err == nil {
+			if err := os.Rename(tmp, out); err != nil {
+				return PreviewInfo{}, fmt.Errorf("media: preview: %w", err)
+			}
+			return p.info(), nil
+		}
+		if !retry || ctx.Err() != nil {
+			break
+		}
+		prev = p
+	}
+	return PreviewInfo{}, err
+}
+
+// tryPreview encodes one attempt into tmp and reads the result back. The attempt is
+// unusable when ffmpeg exits with a failure or its output has no video frame (ffmpeg
+// exits 0 and writes an empty MP4 when the decoder produced nothing); a skip-mode
+// attempt that is not the last one must also pass previewShortfall and, keyframes
+// only, decodedGapShortfall. retry reports whether another decode mode may do better:
+// not after a pixel-limit failure (every mode hits it) or when ffmpeg or ffprobe did
+// not run to completion (a missing binary, a signal, a timeout).
+func (f *FFmpeg) tryPreview(ctx context.Context, in, tmp string, height int, maxDurationSec, sourceSec float64, p previewPlan, last bool) (retry bool, err error) {
+	stdout, err := f.run(ctx, previewTimeout, f.ffmpegBin(), f.previewArgs(in, tmp, height, maxDurationSec, p)...)
+	if err != nil {
+		err = withPixelLimit(err)
+		return isExitFailure(err) && !errors.Is(err, ErrPixelLimit), err
+	}
+	got, err := f.probePreviewOutput(ctx, tmp, p.fps)
+	if err != nil {
+		var ee *ExecError
+		return isExitFailure(err) || !errors.As(err, &ee),
+			fmt.Errorf("media: preview check (-skip_frame %q, %d fps): %w", p.skip, p.fps, err)
+	}
+	if last || p.skip == "" {
+		return false, nil
+	}
+	why := previewShortfall(got, p.fps, sourceSec, maxDurationSec)
+	if why == "" && p.keyframesOnly() {
+		why = decodedGapShortfall(parseDecodedFrames(stdout), p.fps)
+	}
+	if why != "" {
+		return true, fmt.Errorf("media: preview with -skip_frame %s at %d fps is incomplete: %s", p.skip, p.fps, why)
+	}
+	return false, nil
 }
 
 // ExpectedFrames is the number of frames ExtractFrames writes for a window of

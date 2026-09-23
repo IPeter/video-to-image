@@ -5,8 +5,10 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"image/jpeg"
 	"io"
 	"log/slog"
 	"math"
@@ -22,10 +24,11 @@ import (
 	"video-to-image/internal/media"
 	"video-to-image/internal/metrics"
 	"video-to-image/internal/pipeline/analyze"
+	"video-to-image/internal/pipeline/crop"
 	"video-to-image/internal/pipeline/export"
 	"video-to-image/internal/pipeline/extract"
 	"video-to-image/internal/pipeline/preview"
-	"video-to-image/internal/pipeline/rerank"
+	"video-to-image/internal/pipeline/review"
 	"video-to-image/internal/pipeline/score"
 	"video-to-image/internal/pipeline/selectr"
 	"video-to-image/internal/pricing"
@@ -62,6 +65,7 @@ type Store interface {
 	ListSteps(ctx context.Context, jobID string) ([]store.Step, error)
 	StartStep(ctx context.Context, jobID, name string) error
 	FinishStep(ctx context.Context, jobID, name string, status store.StepStatus, meta any) error
+	MergeStepMeta(ctx context.Context, jobID, name string, meta map[string]any) error
 	SkipRemainingSteps(ctx context.Context, jobID string) error
 	ListScenes(ctx context.Context, jobID string) ([]store.Scene, error)
 	ReplaceCandidates(ctx context.Context, jobID string, cands []store.CandidateFrame) error
@@ -78,17 +82,37 @@ type Runner struct {
 	Registry   *domain.Registry
 	ScratchDir string
 	Logger     *slog.Logger
+	// ExtractConcurrency bounds the ffmpeg processes one job's extract step runs at once
+	// (extract.Input.Concurrency; ≤ 0 → extract.DefaultConcurrency). The worker sets it
+	// with the ExtractConcurrency function.
+	ExtractConcurrency int
 
 	// persistBackoff overrides defaultPersistBackoff (tests).
 	persistBackoff []time.Duration
+}
+
+// ExtractConcurrency is the Runner.ExtractConcurrency for a process: configured when it
+// is positive, else as many ffmpeg processes per job as keep every pipeline worker
+// within procs CPUs, max(1, procs / (ffmpegThreads × workers)) with workers ≥ 1. An
+// uncapped ffmpeg (ffmpegThreads ≤ 0) already uses every core, so auto gives 1. Memory
+// scales the same way: one 4K HEVC extract process holds about 450 MiB at 2 threads
+// (700 MiB at 4), and running processes side by side under a CPU limit barely helps.
+func ExtractConcurrency(configured, procs, ffmpegThreads, workers int) int {
+	if configured > 0 {
+		return configured
+	}
+	if ffmpegThreads <= 0 {
+		return 1
+	}
+	return max(1, procs/(ffmpegThreads*max(1, workers)))
 }
 
 // Bounds for work that must not be cut short by the job context (it runs on
 // context.WithoutCancel) but must not hang a worker slot either.
 const (
 	// persistTimeout bounds one attempt of a write that records money already spent
-	// (the analyze outcome, usage) or a terminal outcome (FailJob, RejectJob, the
-	// failed-step mark).
+	// (the analyze and review outcomes, usage) or a terminal outcome (FailJob,
+	// RejectJob, the failed-step mark).
 	persistTimeout = 15 * time.Second
 	// cleanupTimeout bounds best-effort cleanup: provider file release, storage
 	// deletes, skipping the remaining steps.
@@ -96,9 +120,6 @@ const (
 	// previewSlackSec is how much longer than its cap a built preview may be (encoder
 	// rounding) before it is treated as a lying container header.
 	previewSlackSec = 1.0
-	// rerankPicksMetaKey is the select step's meta key holding the re-rank picks as
-	// shotId → candidate timestamp, reused on a retry instead of paying for a new call.
-	rerankPicksMetaKey = "rerankPreferred"
 )
 
 // defaultPersistBackoff is the wait before each retry of a persist write: 4 attempts.
@@ -130,6 +151,18 @@ type run struct {
 	log   *slog.Logger
 	work  string
 	steps map[string]store.Step
+	// previewFPS is the preview's real frame rate (keyframe-only previews are slower
+	// than requested); the model is told to sample at it.
+	previewFPS float64
+	// assessments are the model review's verdicts by candidate ID (nil: no review).
+	assessments map[string]review.Assessment
+	// rotations is the review's orientation answer by candidate ID: the clockwise
+	// rotation that makes a shortlisted frame upright. It is kept apart from assessments
+	// because it survives a failed judgement (selection then runs on scores alone), and
+	// editFor falls back to it for frames without a verdict.
+	rotations map[string]int
+	// scored is the select step's input (editFor looks up the scene of oriented frames).
+	scored []score.Scored
 }
 
 // Run processes jobID. It returns nil once the job reached a terminal status (set by
@@ -138,12 +171,13 @@ type run struct {
 //
 // Paid work is recorded before anything else can fail: the analyze outcome (gate,
 // summary, scenes, step done and, for a rejection, the rejected status) is written in
-// one transaction on a detached context and retried in-process, and a terminal failure
-// is recorded the same way. Re-delivery resumes after a done analyze step (and reuses
-// stored re-rank picks), and re-applies a failure an earlier attempt decided but could
-// not record, so a retry does not pay for the model again. The model is called again
-// only when an attempt died between the model's answer and the database (for example
-// the database stayed down for every in-process retry).
+// one transaction on a detached context and retried in-process, a terminal failure is
+// recorded the same way, and the frame review's outcome is merged into the select step
+// as soon as it returns. Re-delivery resumes after a done analyze step (and reuses the
+// stored review outcome, see reuseReview), and re-applies a failure an earlier attempt
+// decided but could not record, so a retry does not pay for the model again. The model
+// is called again only when an attempt died between the model's answer and the
+// database (for example the database stayed down for every in-process retry).
 func (r *Runner) Run(ctx context.Context, jobID string) error {
 	logger := r.Logger
 	if logger == nil {
@@ -291,6 +325,9 @@ func (rn *run) stepPreview(ctx context.Context, original string) (string, error)
 			if err := rn.checkPreview(ctx, previewPath, maxSec); err != nil {
 				return "", err
 			}
+			if fps, ok := rn.steps[store.StepNamePreview].Meta["fps"].(float64); ok {
+				rn.previewFPS = fps
+			}
 			return previewPath, nil
 		} else if !errors.Is(err, storage.ErrNotFound) {
 			return "", err
@@ -319,7 +356,11 @@ func (rn *run) stepPreview(ctx context.Context, original string) (string, error)
 		if err := rn.upload(ctx, key, previewPath, "video/mp4"); err != nil {
 			return nil, err
 		}
-		return map[string]any{"sizeBytes": out.SizeBytes, "height": rn.dom.Model.PreviewHeight, "fps": rn.dom.Model.PreviewFPS}, nil
+		rn.previewFPS = out.FPS
+		return map[string]any{
+			"sizeBytes": out.SizeBytes, "height": rn.dom.Model.PreviewHeight,
+			"fps": out.FPS, "keyframesOnly": out.KeyframesOnly, "tookMs": out.Took.Milliseconds(),
+		}, nil
 	})
 	if err != nil {
 		return "", err
@@ -376,6 +417,7 @@ func (rn *run) stepAnalyze(ctx context.Context, previewPath string) (*analyze.Ou
 		DurationSec: rn.job.VideoInfo.DurationSec,
 		CacheKey:    rn.job.VideoInfo.SHA256,
 		SourceName:  rn.job.VideoInfo.OriginalName,
+		PreviewFPS:  rn.previewFPS,
 	})
 	metrics.StepDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
 	if out != nil {
@@ -446,6 +488,7 @@ func (rn *run) stepExtract(ctx context.Context, original string, scenes []analyz
 			Ranges:        ranges,
 			SampleFPS:     rn.dom.Selection.SampleFPS,
 			MaxCandidates: rn.dom.Limits.MaxCandidateFrames,
+			Concurrency:   rn.ExtractConcurrency,
 		})
 		if err != nil {
 			return nil, mediaFailure(err)
@@ -458,7 +501,11 @@ func (rn *run) stepExtract(ctx context.Context, original string, scenes []analyz
 				"endSec": p.PadEndSec, "fps": p.FPS, "expected": p.Expected,
 			}
 		}
-		return map[string]any{"candidates": len(cands), "ranges": plans}, nil
+		concurrency := rn.ExtractConcurrency
+		if concurrency <= 0 {
+			concurrency = extract.DefaultConcurrency
+		}
+		return map[string]any{"candidates": len(cands), "ranges": plans, "concurrency": concurrency}, nil
 	})
 	return cands, err
 }
@@ -490,40 +537,22 @@ func (rn *run) stepSelect(ctx context.Context, scored []score.Scored) (*selectr.
 	err := rn.step(ctx, store.StepNameSelect, func() (any, error) {
 		params := selectr.ParamsFor(rn.dom)
 		meta := map[string]any{}
-		if rn.dom.Selection.ModelRerank {
-			if picks, ok := storedRerankPicks(rn.steps[store.StepNameSelect].Meta); ok {
-				// A retry (e.g. after an export hiccup): candidate IDs are new, but the
-				// frames are the same, so map the stored picks back by shot and timestamp.
-				params.Preferred = picksToCandidates(picks, scored)
-				meta["rerankReused"] = true
-			} else {
-				pre := make(map[string]float64, len(scored))
-				for _, s := range scored {
-					pre[s.ID] = selectr.Score(s, rn.dom.Selection.Weights)
-				}
-				rr, err := rerank.Run(ctx, rn.Analyzer, rerank.Input{
-					Domain: rn.dom, JobID: rn.job.ID, CacheKey: rn.job.VideoInfo.SHA256,
-					Candidates: scored, Scores: pre,
-				})
-				if rr != nil {
-					rn.recordUsage(ctx, analyzer.StepRerank, rr.Calls, 0)
-					params.Preferred = rr.Preferred
-				}
-				if err != nil {
-					if ctx.Err() != nil {
-						return nil, ctx.Err()
-					}
-					// The re-rank is an optional refinement: continue on sharpness alone.
-					rn.log.Warn("pipeline: rerank failed; continuing without it", "err", err)
-					meta["rerankError"] = err.Error()
-				}
+		rn.scored = scored
+		if rn.dom.Review.Enabled {
+			assess, err := rn.reviewFrames(ctx, scored, meta)
+			if err != nil {
+				return nil, err
 			}
-			meta["rerankPicks"] = len(params.Preferred)
-			// Also stored when empty, so a retry reproduces this selection without a call.
-			meta[rerankPicksMetaKey] = candidatesToPicks(params.Preferred, scored)
+			if assess != nil {
+				rn.assessments = assess
+				params.Assessments = selectrAssessments(assess)
+			}
 		}
 
 		sel = selectr.Select(scored, params)
+		if hint := cutOffHint(sel, rn.assessments); hint != "" {
+			sel.Explanation += " " + hint
+		}
 
 		selected := make(map[string]bool, len(sel.Images))
 		for _, im := range sel.Images {
@@ -573,7 +602,12 @@ func (rn *run) stepExport(ctx context.Context, sel *selectr.Output) error {
 		}
 		for i, s := range sel.Images {
 			c := s.Candidate
+			edit, err := rn.editFor(c)
+			if err != nil {
+				return nil, err
+			}
 			in.Images = append(in.Images, export.Image{
+				Edit:         edit,
 				Index:        i + 1,
 				ImageID:      ids.NewImage(),
 				CandidateID:  c.ID,
@@ -600,7 +634,7 @@ func (rn *run) stepExport(ctx context.Context, sel *selectr.Output) error {
 				ID: e.ImageID, JobID: rn.job.ID, CandidateID: e.CandidateID, Idx: e.Index,
 				ShotID: e.ShotID, TimestampSec: e.TimestampSec, Width: e.Width, Height: e.Height,
 				Reason: e.Reason, FileName: e.FileName, ImagePath: e.ImageKey, ThumbPath: e.ThumbKey,
-				Bytes: e.Bytes,
+				Bytes: e.Bytes, Rotation: e.Rotation, Crop: storeCrop(e),
 			})
 		}
 		return map[string]any{"images": len(images), "zipKey": zipKey}, nil
@@ -1004,54 +1038,473 @@ func truncate(s string, n int) string {
 	return s[:n] + "…(truncated)"
 }
 
-// storedRerankPicks reads the re-rank picks (shotId → candidate timestamp) an earlier
-// attempt stored in the select step's meta. ok is false when there are none.
-func storedRerankPicks(meta map[string]any) (map[string]float64, bool) {
-	raw, ok := meta[rerankPicksMetaKey].(map[string]any)
-	if !ok {
+// Select step meta keys of the model review outcome. Verdicts and orientation answers
+// are keyed by the candidates' (scene shot, timestamp): a retry (e.g. after an export
+// hiccup) re-extracts the same frames with new IDs. The outcome is merged into the
+// step's meta as soon as the review returns, before selection and export, so a River
+// retry reuses it instead of paying again. Meta written before these keys existed
+// (only review, reviewSent, reviewUsable, reviewError) still loads.
+const (
+	reviewMetaKey             = "review"                 // []storedAssessment: the verdicts
+	reviewRotationsKey        = "reviewRotations"        // []storedRotation: the orientation answer
+	reviewSentKey             = "reviewSent"             // frames sent
+	reviewAnsweredKey         = "reviewAnswered"         // frames with a verdict
+	reviewUsableKey           = "reviewUsable"           // usable verdicts
+	reviewErrorKey            = "reviewError"            // why the verdicts are not used (text)
+	reviewFailureKey          = "reviewFailure"          // failure kind, one of reviewFail*
+	reviewOrientationErrorKey = "reviewOrientationError" // the orientation call failed: frames judged as stored
+	reviewReusedKey           = "reviewReused"           // this attempt reused an earlier attempt's outcome
+)
+
+// reviewKeys are every key of the review outcome: a new outcome replaces all of them.
+var reviewKeys = []string{
+	reviewMetaKey, reviewRotationsKey, reviewSentKey, reviewAnsweredKey, reviewUsableKey,
+	reviewErrorKey, reviewFailureKey, reviewOrientationErrorKey, reviewReusedKey,
+}
+
+// Kinds of review failure (reviewFailureKey). Only reviewFailUnavailable is retried by a
+// later attempt: the others were paid for (or are deterministic) and would fail again.
+const (
+	reviewFailBadOutput   = "badOutput"   // the judgement answer could not be parsed
+	reviewFailTooFew      = "tooFew"      // fewer than half of the frames sent got a verdict
+	reviewFailUnavailable = "unavailable" // no judgement answer: provider down or the call timed out
+	reviewFailOther       = "other"       // any other error (e.g. the frames could not be prepared)
+)
+
+// rotationReachSec is how far from an oriented frame of the same scene editFor applies
+// its rotation to a frame the orientation call did not see (the phone's orientation does
+// not change within a second).
+const rotationReachSec = 1.0
+
+// storedAssessment is one review verdict as kept in job_steps.meta.
+type storedAssessment struct {
+	// SceneIdx tells apart two scenes of one shot whose padded ranges overlap (they
+	// sample the same timestamps). nil in meta stored before it was kept.
+	SceneIdx     *int       `json:"sceneIdx,omitempty"`
+	ShotID       string     `json:"shotId"`
+	TimestampSec float64    `json:"timestampSec"`
+	RotateCW     int        `json:"rotateCw"`
+	View         string     `json:"view"`
+	FullyVisible bool       `json:"fullyVisible"`
+	Quality      int        `json:"quality"`
+	Box          [4]float64 `json:"box"`
+	Issues       string     `json:"issues,omitempty"`
+	// Usable is informational: a reuse recomputes it with the current minimum quality.
+	Usable bool `json:"usable"`
+	// SameAs is the index (in this stored list) of the frame this one duplicates, -1 none.
+	SameAs int `json:"sameAs"`
+}
+
+// UnmarshalJSON defaults SameAs to -1: meta stored before near-duplicate links existed
+// has no sameAs key, and 0 would link every frame to the first one.
+func (s *storedAssessment) UnmarshalJSON(b []byte) error {
+	type plain storedAssessment // without this method
+	p := plain{SameAs: -1}
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*s = storedAssessment(p)
+	return nil
+}
+
+// storedRotation is one orientation answer as kept in job_steps.meta.
+type storedRotation struct {
+	SceneIdx     *int    `json:"sceneIdx,omitempty"` // see storedAssessment.SceneIdx
+	ShotID       string  `json:"shotId"`
+	TimestampSec float64 `json:"timestampSec"`
+	RotateCW     int     `json:"rotateCw"`
+}
+
+// reviewFrames runs (or, on a retry, reuses) the model review of the shortlisted
+// frames. It returns nil assessments when the review failed, answered fewer than half
+// of the frames sent, or could not run: the job then continues on scores alone (the
+// review is a refinement, not a gate), with the orientation answer still applied at
+// export when that call succeeded (rn.rotations).
+func (rn *run) reviewFrames(ctx context.Context, scored []score.Scored, meta map[string]any) (map[string]review.Assessment, error) {
+	if assess, done := rn.reuseReview(scored, meta); done {
+		return assess, nil
+	}
+	pre := make(map[string]float64, len(scored))
+	for _, s := range scored {
+		pre[s.ID] = selectr.Score(s, rn.dom.Selection.Weights)
+	}
+	out, err := review.Run(ctx, rn.Analyzer, review.Input{
+		Domain: rn.dom, JobID: rn.job.ID, CacheKey: rn.job.VideoInfo.SHA256,
+		WorkDir: rn.work, Candidates: scored, Scores: pre,
+	})
+	if out == nil {
+		out = &review.Output{}
+	}
+	rn.recordUsage(ctx, analyzer.StepReview, out.Calls, 0)
+	if err != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err == nil && out.Sent == 0 {
+		meta[reviewSentKey] = 0 // nothing eligible to review, no call made
+		return nil, nil
+	}
+
+	outcome := make(map[string]any, len(reviewKeys)) // nil values clear an earlier attempt's keys
+	for _, k := range reviewKeys {
+		outcome[k] = nil
+	}
+	outcome[reviewSentKey] = out.Sent
+	if len(out.Rotations) > 0 {
+		rn.rotations = out.Rotations
+		outcome[reviewRotationsKey] = rotationsToMeta(out.Rotations, scored)
+	}
+	if out.OrientationErr != nil {
+		outcome[reviewOrientationErrorKey] = out.OrientationErr.Error()
+	}
+	defer rn.saveReview(ctx, outcome, meta) // on every return below, before selection runs
+
+	if err != nil {
+		kind := reviewFailureKind(err)
+		rn.log.Warn("pipeline: frame review failed; selecting on scores alone", "err", err, "kind", kind)
+		outcome[reviewErrorKey] = err.Error()
+		outcome[reviewFailureKey] = kind
+		return nil, nil
+	}
+	answered := len(out.Assessments)
+	outcome[reviewAnsweredKey] = answered
+	if 2*answered < out.Sent {
+		// An empty or mostly missing answer says nothing about the frames: treating every
+		// frame without a verdict as rejected would end a paid job with no photos.
+		msg := fmt.Sprintf("review answered %d of %d frames", answered, out.Sent)
+		rn.log.Warn("pipeline: frame review incomplete; selecting on scores alone", "answered", answered, "sent", out.Sent)
+		outcome[reviewErrorKey] = msg
+		outcome[reviewFailureKey] = reviewFailTooFew
+		return nil, nil
+	}
+	outcome[reviewUsableKey] = countUsable(out.Assessments)
+	outcome[reviewMetaKey] = assessmentsToMeta(out.Assessments, scored)
+	return out.Assessments, nil
+}
+
+// reuseReview applies the review outcome an earlier attempt stored in the select step's
+// meta. done is false when the review must run (again): nothing stored, the provider was
+// unavailable, the verdicts no longer map onto this attempt's candidates (the sampling
+// changed), or the frames were judged without the orientation (it must be redone).
+func (rn *run) reuseReview(scored []score.Scored, meta map[string]any) (map[string]review.Assessment, bool) {
+	prev := rn.steps[store.StepNameSelect].Meta
+	if len(prev) == 0 {
 		return nil, false
 	}
-	picks := make(map[string]float64, len(raw))
-	for shot, v := range raw {
-		if ts, ok := v.(float64); ok {
-			picks[shot] = ts
-		}
-	}
-	return picks, true
-}
-
-// candidatesToPicks turns re-rank preferences (shotId → candidate ID) into shotId →
-// timestamp, which survives re-extraction (candidate IDs do not).
-func candidatesToPicks(preferred map[string]string, scored []score.Scored) map[string]float64 {
-	byID := make(map[string]float64, len(scored))
-	for _, s := range scored {
-		byID[s.ID] = s.TimestampSec
-	}
-	picks := make(map[string]float64, len(preferred))
-	for shot, id := range preferred {
-		if ts, ok := byID[id]; ok {
-			picks[shot] = ts
-		}
-	}
-	return picks
-}
-
-// picksToCandidates maps stored picks back onto this attempt's candidates: for each
-// shot, the candidate of that shot closest to the stored timestamp (within 1 ms; the
-// sampling plan is deterministic). Picks without a match are dropped.
-func picksToCandidates(picks map[string]float64, scored []score.Scored) map[string]string {
-	const tolerance = 1e-3
-	preferred := make(map[string]string, len(picks))
-	for shot, ts := range picks {
-		best, bestDiff := "", math.Inf(1)
-		for _, s := range scored {
-			if d := math.Abs(s.TimestampSec - ts); s.ShotID == shot && d <= tolerance && d < bestDiff {
-				best, bestDiff = s.ID, d
+	keep := func() {
+		for _, k := range reviewKeys {
+			if v, ok := prev[k]; ok && v != nil {
+				meta[k] = v
 			}
 		}
-		if best != "" {
-			preferred[shot] = best
+		meta[reviewReusedKey] = true
+		rn.rotations = rotationsFromMeta(prev[reviewRotationsKey], scored)
+	}
+
+	if raw := prev[reviewMetaKey]; raw != nil && prev[reviewOrientationErrorKey] == nil {
+		assess, n, ok := assessmentsFromMeta(raw, scored, reviewMinQuality(rn.dom.Review))
+		sent, _ := prev[reviewSentKey].(float64)
+		switch {
+		case !ok:
+			rn.log.Warn("pipeline: stored review verdicts do not match this attempt's frames; reviewing again", "stored", n)
+			return nil, false
+		case n == 0 || 2*float64(n) < sent:
+			// Stored before an incomplete answer counted as a failure (or nothing was
+			// sent): the outcome is now scores alone, without paying again.
+			keep()
+			delete(meta, reviewMetaKey)
+			if sent > 0 {
+				meta[reviewErrorKey] = fmt.Sprintf("review answered %d of %.0f frames", n, sent)
+				meta[reviewFailureKey] = reviewFailTooFew
+			}
+			return nil, true
+		}
+		keep()
+		meta[reviewUsableKey] = countUsable(assess)
+		return assess, true
+	}
+	if kind, _ := prev[reviewFailureKey].(string); kind != "" && kind != reviewFailUnavailable {
+		rn.log.Info("pipeline: the frame review failed in an earlier attempt; selecting on scores alone", "kind", kind)
+		keep()
+		return nil, true
+	}
+	return nil, false
+}
+
+// saveReview copies the review outcome into the step meta and merges it into the stored
+// select step right away (the step's final meta only lands after selection), so a retry
+// does not pay for the review again. A failed write is logged: the outcome still lands
+// with the step's final meta.
+func (rn *run) saveReview(ctx context.Context, outcome, meta map[string]any) {
+	for k, v := range outcome {
+		if v != nil {
+			meta[k] = v
 		}
 	}
-	return preferred
+	if err := rn.persist(ctx, "save review", func(ctx context.Context) error {
+		return rn.Store.MergeStepMeta(ctx, rn.job.ID, store.StepNameSelect, outcome)
+	}); err != nil {
+		rn.log.Warn("pipeline: save review outcome; a retry may pay for the review again", "err", err)
+	}
+}
+
+// reviewFailureKind classifies a review.Run error (reviewFailureKey).
+func reviewFailureKind(err error) string {
+	switch {
+	case errors.Is(err, analyze.ErrBadOutput):
+		return reviewFailBadOutput
+	case errors.Is(err, analyzer.ErrUnavailable), errors.Is(err, context.DeadlineExceeded):
+		return reviewFailUnavailable
+	default:
+		return reviewFailOther
+	}
+}
+
+// reviewMinQuality is the domain's minimum usable quality, with review's default.
+func reviewMinQuality(r domain.Review) int {
+	if r.MinQuality > 0 {
+		return r.MinQuality
+	}
+	return review.DefaultMinQuality
+}
+
+func countUsable(assess map[string]review.Assessment) int {
+	n := 0
+	for _, a := range assess {
+		if a.Usable {
+			n++
+		}
+	}
+	return n
+}
+
+func assessmentsToMeta(assess map[string]review.Assessment, scored []score.Scored) []storedAssessment {
+	out := make([]storedAssessment, 0, len(assess))
+	pos := map[string]int{}
+	for _, s := range scored {
+		a, ok := assess[s.ID]
+		if !ok {
+			continue
+		}
+		pos[s.ID] = len(out)
+		out = append(out, storedAssessment{
+			SceneIdx: &s.SceneIdx, ShotID: s.ShotID, TimestampSec: s.TimestampSec, RotateCW: a.RotateCW, View: a.View,
+			FullyVisible: a.FullyVisible, Quality: a.Quality, Box: [4]float64{a.Box.X0, a.Box.Y0, a.Box.X1, a.Box.Y1},
+			Issues: a.Issues, Usable: a.Usable, SameAs: -1,
+		})
+	}
+	for _, s := range scored {
+		if a, ok := assess[s.ID]; ok && a.DuplicateOf != "" {
+			if j, ok := pos[a.DuplicateOf]; ok {
+				out[pos[s.ID]].SameAs = j
+			}
+		}
+	}
+	return out
+}
+
+// assessmentsFromMeta maps stored verdicts back onto this attempt's candidates (see
+// matchCandidate) and recomputes Usable from the verdict with minQuality, the current
+// domain minimum. n is the number of stored verdicts. ok is false when the meta cannot
+// be decoded or any stored verdict matches no candidate (not taken by an earlier one):
+// the verdicts then belong to a different sampling and must not be reused, since every
+// candidate without a verdict would count as rejected.
+func assessmentsFromMeta(raw any, scored []score.Scored, minQuality int) (assess map[string]review.Assessment, n int, ok bool) {
+	var stored []storedAssessment
+	if !decodeStored(raw, &stored) {
+		return nil, 0, false
+	}
+	assess = make(map[string]review.Assessment, len(stored))
+	ids := make([]string, len(stored)) // stored index → this attempt's candidate ID
+	taken := make(map[int]bool, len(stored))
+	for k, st := range stored {
+		i := matchCandidate(scored, st.SceneIdx, st.ShotID, st.TimestampSec, taken)
+		if i < 0 {
+			return nil, len(stored), false
+		}
+		id := scored[i].ID
+		ids[k] = id
+		a := review.Assessment{
+			CandidateID: id, RotateCW: st.RotateCW, View: st.View, FullyVisible: st.FullyVisible,
+			Quality: st.Quality, Box: review.Box{X0: st.Box[0], Y0: st.Box[1], X1: st.Box[2], Y1: st.Box[3]},
+			Issues: st.Issues,
+		}
+		a.Usable = a.FullyVisible && a.Quality >= minQuality && a.View != review.ViewNone
+		assess[id] = a
+	}
+	for k, st := range stored {
+		if st.SameAs >= 0 && st.SameAs < len(ids) && st.SameAs != k {
+			a := assess[ids[k]]
+			a.DuplicateOf = ids[st.SameAs]
+			assess[ids[k]] = a
+		}
+	}
+	return assess, len(stored), true
+}
+
+func rotationsToMeta(rot map[string]int, scored []score.Scored) []storedRotation {
+	out := make([]storedRotation, 0, len(rot))
+	for _, s := range scored {
+		if r, ok := rot[s.ID]; ok {
+			out = append(out, storedRotation{SceneIdx: &s.SceneIdx, ShotID: s.ShotID, TimestampSec: s.TimestampSec, RotateCW: r})
+		}
+	}
+	return out
+}
+
+// rotationsFromMeta maps stored orientation answers back onto this attempt's candidates.
+// It is best effort (the answer only straightens exported frames): entries that match no
+// candidate or hold no right angle are dropped, and undecodable meta gives nil.
+func rotationsFromMeta(raw any, scored []score.Scored) map[string]int {
+	var stored []storedRotation
+	if raw == nil || !decodeStored(raw, &stored) {
+		return nil
+	}
+	out := make(map[string]int, len(stored))
+	taken := make(map[int]bool, len(stored))
+	for _, st := range stored {
+		if st.RotateCW%90 != 0 || st.RotateCW < 0 || st.RotateCW >= 360 {
+			continue
+		}
+		if i := matchCandidate(scored, st.SceneIdx, st.ShotID, st.TimestampSec, taken); i >= 0 {
+			out[scored[i].ID] = st.RotateCW
+		}
+	}
+	return out
+}
+
+// matchCandidate returns the index in scored of the first candidate not yet taken with
+// this scene shot and timestamp (within 1 ms: the sampling plan is deterministic) and,
+// when sceneIdx is known, this scene, and marks it taken; -1 if there is none. Stored
+// entries are in scored order, so entries without a scene still pair up in order.
+func matchCandidate(scored []score.Scored, sceneIdx *int, shotID string, ts float64, taken map[int]bool) int {
+	const tolerance = 1e-3
+	for i, s := range scored {
+		if taken[i] || s.ShotID != shotID || math.Abs(s.TimestampSec-ts) > tolerance ||
+			(sceneIdx != nil && s.SceneIdx != *sceneIdx) {
+			continue
+		}
+		taken[i] = true
+		return i
+	}
+	return -1
+}
+
+// decodeStored decodes a value read back from job_steps.meta (generic JSON) into dst.
+func decodeStored(raw, dst any) bool {
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal(b, dst) == nil
+}
+
+func selectrAssessments(assess map[string]review.Assessment) map[string]selectr.Assessment {
+	out := make(map[string]selectr.Assessment, len(assess))
+	for id, a := range assess {
+		view := a.View
+		if view == review.ViewNone {
+			view = domain.OtherShotID // never usable anyway
+		}
+		out[id] = selectr.Assessment{View: view, Usable: a.Usable, Quality: a.Quality, DuplicateOf: a.DuplicateOf}
+	}
+	return out
+}
+
+// editFor plans how a selected frame is reframed: rotated upright per the review and,
+// with crop enabled, cropped to the domain's aspect around the reviewed subject box. A
+// frame without a verdict (the judgement failed) is only rotated, per rotationFor.
+// nil means the frame is exported as extracted.
+func (rn *run) editFor(c score.Scored) (*export.Edit, error) {
+	a, ok := rn.assessments[c.ID]
+	if !ok {
+		rot, _ := rn.rotationFor(c)
+		return export.NewEdit(rot, nil), nil
+	}
+	if !rn.dom.Crop.Enabled || !a.Box.Valid() {
+		return export.NewEdit(a.RotateCW, nil), nil
+	}
+	w, h, err := jpegSize(c.FullPath)
+	if err != nil {
+		return nil, terminal(CodeProcessingError, err, "")
+	}
+	params, err := crop.ParamsFor(rn.dom.Crop)
+	if err != nil {
+		return nil, terminal(CodeProcessingError, err, "")
+	}
+	plan := crop.Plan(crop.Frame{
+		Width: w, Height: h, RotateCW: a.RotateCW,
+		Box: [4]float64{a.Box.X0, a.Box.Y0, a.Box.X1, a.Box.Y1},
+	}, params)
+	rn.log.Debug("pipeline: crop plan", "candidate", c.ID, "rotate", plan.RotateCW, "cropped", plan.Crop != nil, "reason", plan.Reason)
+	return export.NewEdit(plan.RotateCW, plan.Crop), nil
+}
+
+// rotationFor is the orientation answer for c: its own, else that of the nearest
+// oriented frame of the same scene within rotationReachSec. ok is false when neither
+// exists (the frame is then exported as extracted).
+func (rn *run) rotationFor(c score.Scored) (rot int, ok bool) {
+	if r, found := rn.rotations[c.ID]; found {
+		return r, true
+	}
+	best := math.Inf(1)
+	for _, s := range rn.scored {
+		r, found := rn.rotations[s.ID]
+		if !found || s.SceneIdx != c.SceneIdx {
+			continue
+		}
+		if d := math.Abs(s.TimestampSec - c.TimestampSec); d <= rotationReachSec && d < best {
+			best, rot, ok = d, r, true
+		}
+	}
+	return rot, ok
+}
+
+func jpegSize(path string) (int, int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, fmt.Errorf("pipeline: open frame: %w", err)
+	}
+	defer f.Close()
+	cfg, err := jpeg.DecodeConfig(f)
+	if err != nil {
+		return 0, 0, fmt.Errorf("pipeline: frame size %s: %w", path, err)
+	}
+	return cfg.Width, cfg.Height, nil
+}
+
+func storeCrop(e export.Exported) *store.NRect {
+	if !e.Cropped || e.Edit == nil || e.Edit.Crop == nil {
+		return nil
+	}
+	c := e.Edit.Crop
+	return &store.NRect{X0: c.X0, Y0: c.Y0, X1: c.X1, Y1: c.Y1}
+}
+
+// cutOffHint explains missing views the review did see but never with the whole subject
+// inside the frame (a close walkaround filmed in portrait), so the user knows to film
+// them from further away instead of assuming the model missed them. A view with at least
+// one fully visible take is left out: it went missing for another reason (blur, a
+// duplicate), and "film from further away" would be the wrong advice.
+func cutOffHint(sel *selectr.Output, assess map[string]review.Assessment) string {
+	if sel == nil || len(assess) == 0 || len(sel.MissingShots) == 0 {
+		return ""
+	}
+	seen, visible := map[string]bool{}, map[string]bool{}
+	for _, a := range assess {
+		seen[a.View] = true
+		if a.FullyVisible {
+			visible[a.View] = true
+		}
+	}
+	var labels []string
+	for _, m := range sel.MissingShots {
+		if seen[m.ID] && !visible[m.ID] {
+			labels = append(labels, m.Label)
+		}
+	}
+	if len(labels) == 0 {
+		return ""
+	}
+	return "The frame edge cut off part of the subject in every take of: " + strings.Join(labels, ", ") +
+		". Film these views from further away so the whole subject fits in the picture."
 }

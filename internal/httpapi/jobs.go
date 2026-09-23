@@ -10,9 +10,11 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"video-to-image/internal/analyzer/fake"
 	"video-to-image/internal/domain"
 	"video-to-image/internal/ids"
 	"video-to-image/internal/pipeline/export"
+	"video-to-image/internal/pricing"
 	"video-to-image/internal/storage"
 	"video-to-image/internal/store"
 )
@@ -95,7 +97,8 @@ func (s *Server) getJob(ctx context.Context, in *JobPathInput) (*GetJobOutput, e
 	return &GetJobOutput{CacheControl: "no-store", Body: dto}, nil
 }
 
-// jobDTO maps a job row (plus its steps and, when completed, its images) to the wire.
+// jobDTO maps a job row (plus its steps, its model usage and, when completed, its
+// images) to the wire.
 func (s *Server) jobDTO(ctx context.Context, dc *domain.Config, job *store.Job) (Job, error) {
 	steps, err := s.d.Store.ListSteps(ctx, job.ID)
 	if err != nil {
@@ -114,6 +117,7 @@ func (s *Server) jobDTO(ctx context.Context, dc *domain.Config, job *store.Job) 
 			FPS:         job.VideoInfo.FPS,
 		},
 		Progress: buildProgress(job.Status, steps),
+		Usage:    s.jobUsage(ctx, dc, job.ID),
 	}
 	switch job.Status {
 	case store.StatusCompleted:
@@ -129,6 +133,63 @@ func (s *Server) jobDTO(ctx context.Context, dc *domain.Config, job *store.Job) 
 	}
 	return out, nil
 }
+
+// jobUsage reads the job's model usage. It is informational, so a store error is
+// logged and reads as zero usage (with the cost marked incomplete) instead of
+// failing the poll.
+func (s *Server) jobUsage(ctx context.Context, dc *domain.Config, jobID string) JobUsage {
+	rows, err := s.d.Store.JobUsage(ctx, jobID)
+	if err != nil {
+		s.d.Logger.WarnContext(ctx, "httpapi: get job: usage unavailable, reporting zero",
+			"domain", dc.Key, "job_id", jobID, "err", err)
+		u := buildUsage(nil)
+		u.CostComplete = false
+		return u
+	}
+	return buildUsage(rows)
+}
+
+// buildUsage totals the per-step usage rows. TotalTokens counts input, output and
+// thinking tokens; costs are rounded to micro-dollars (the usage_events scale), so
+// float sums never show as 0.30000000000000004. Steps is never nil. A step is priced
+// when the price table knows its model or it is the test analyzer's; TestMode means
+// every call was the test analyzer's, CostComplete that every step is priced (a real
+// model missing from the table is recorded at cost 0, which is not "free").
+func buildUsage(rows []store.UsageByStep) JobUsage {
+	u := JobUsage{Steps: make([]UsageStep, 0, len(rows)), TestMode: len(rows) > 0, CostComplete: true}
+	var cost float64
+	for _, r := range rows {
+		test := isTestModel(r.Model)
+		_, known := pricing.Lookup(r.Model)
+		priced := known || test
+		u.TestMode = u.TestMode && test
+		u.CostComplete = u.CostComplete && priced
+		u.Steps = append(u.Steps, UsageStep{
+			Step:           r.Step,
+			Model:          r.Model,
+			Calls:          r.Calls,
+			InputTokens:    r.InputTokens,
+			OutputTokens:   r.OutputTokens,
+			ThinkingTokens: r.ThinkingTokens,
+			CostUSD:        roundUSD(r.CostUSD),
+			Priced:         priced,
+		})
+		u.Calls += r.Calls
+		u.InputTokens += r.InputTokens
+		u.OutputTokens += r.OutputTokens
+		u.ThinkingTokens += r.ThinkingTokens
+		cost += r.CostUSD
+	}
+	u.TotalTokens = u.InputTokens + u.OutputTokens + u.ThinkingTokens
+	u.CostUSD = roundUSD(cost)
+	return u
+}
+
+// isTestModel reports usage recorded by the built-in test analyzer (fake.ModelPrefix).
+func isTestModel(model string) bool { return strings.HasPrefix(model, fake.ModelPrefix) }
+
+// roundUSD rounds a dollar amount to 6 decimals.
+func roundUSD(v float64) float64 { return math.Round(v*1e6) / 1e6 }
 
 // buildProgress lists the steps in pipeline order. Done and skipped steps count fully
 // towards percent, the running step half; a terminal job is always 100.
@@ -195,6 +256,8 @@ func buildResult(dc *domain.Config, job *store.Job, images []store.SelectedImage
 			URL:            u,
 			DownloadURL:    u + "?download=1",
 			ThumbnailURL:   u + "/thumb",
+			Rotation:       img.Rotation,
+			Cropped:        img.Crop != nil,
 		})
 	}
 	for _, id := range job.MissingShots {

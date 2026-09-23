@@ -31,6 +31,11 @@ describe("messageForCode", () => {
     expect(messageForCode("SERVER_BUSY")).toBe("We're busy processing other uploads. Please try again in a minute.");
   });
 
+  it("tells the user to upload again when a chunked upload went wrong", () => {
+    expect(messageForCode("UPLOAD_NOT_FOUND")).toBe("The upload expired or was interrupted. Please upload the video again.");
+    expect(messageForCode("UPLOAD_INCOMPLETE")).toBe("Part of the video did not arrive. Please try the upload again.");
+  });
+
   it("degrades gracefully without limits", () => {
     expect(messageForCode("UPLOAD_TOO_LARGE")).toBe(
       "The file is too large. Try a shorter clip or export it at a lower resolution.",

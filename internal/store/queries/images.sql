@@ -4,12 +4,13 @@
 DELETE FROM selected_images WHERE job_id = @job_id;
 
 -- name: InsertSelectedImages :copyfrom
+-- crop is NULL (nil) for an uncropped image.
 INSERT INTO selected_images (
     id, job_id, candidate_id, idx, shot_id, timestamp_sec, width, height, reason, file_name,
-    image_path, thumb_path, bytes
+    image_path, thumb_path, bytes, rotation, crop
 ) VALUES (
     @id, @job_id, @candidate_id, @idx, @shot_id, @timestamp_sec, @width, @height, @reason, @file_name,
-    @image_path, @thumb_path, @bytes
+    @image_path, @thumb_path, @bytes, @rotation, @crop
 );
 
 -- name: ListSelectedImages :many

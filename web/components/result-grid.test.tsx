@@ -2,9 +2,9 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
-import { API_BASE, JOB_ID, makeImage, makeResult } from "@/test/fixtures";
+import { API_BASE, JOB_ID, makeImage, makeResult, makeUsage, NO_USAGE } from "@/test/fixtures";
 
-import { ResultCard } from "./result-card";
+import { reframeInfo, ResultCard } from "./result-card";
 import { ResultGrid } from "./result-grid";
 
 const expiresAt = "2026-09-24T10:00:00Z";
@@ -53,6 +53,67 @@ describe("<ResultGrid>", () => {
     const image = makeImage(1, { thumbnailUrl: "https://minio.example.com/v2i/thumb.jpg?sig=1" });
     render(<ResultCard image={image} apiBaseUrl={API_BASE} onOpen={() => {}} />);
     expect(screen.getByRole("img")).toHaveAttribute("src", "https://minio.example.com/v2i/thumb.jpg?sig=1");
+  });
+
+  it("shows the AI usage line in the header, collapsed", () => {
+    renderGrid({ usage: makeUsage() });
+    const header = screen.getByRole("banner");
+    const panel = within(header).getByTestId("ai-usage");
+    expect(panel).toHaveTextContent("AI usage: 9,012 tokens · $0.0041");
+    expect(panel).not.toHaveAttribute("open");
+  });
+
+  it("shows the AI usage line on an empty result too", () => {
+    renderGrid({ usage: makeUsage(), result: makeResult({ images: [], zipUrl: null }) });
+    expect(screen.getByTestId("ai-usage")).toHaveTextContent("9,012 tokens");
+  });
+
+  it("hides the AI usage line without model calls", () => {
+    const { unmount } = renderGrid({ usage: NO_USAGE });
+    expect(screen.queryByTestId("ai-usage")).not.toBeInTheDocument();
+    unmount();
+    renderGrid();
+    expect(screen.queryByTestId("ai-usage")).not.toBeInTheDocument();
+  });
+
+  it("marks straightened and cropped images next to the timestamp", () => {
+    const images = [
+      makeImage(1),
+      makeImage(2, { rotation: 90 }),
+      makeImage(3, { cropped: true }),
+      makeImage(4, { rotation: 270, cropped: true }),
+    ];
+    renderGrid({ result: makeResult({ images }) });
+    const cards = within(screen.getByRole("list", { name: "Selected images" })).getAllByRole("listitem");
+    expect(within(cards[0]).queryByTestId("reframed")).not.toBeInTheDocument();
+
+    const straightened = within(cards[1]).getByTestId("reframed");
+    expect(straightened).toHaveTextContent(/^Straightened/);
+    expect(straightened).toHaveAttribute("title", "Reframed from the video frame: rotated 90° clockwise to stand upright.");
+    // Same row as the timestamp.
+    expect(straightened.parentElement).toContainElement(within(cards[1]).getByTestId("timestamp"));
+
+    const cropped = within(cards[2]).getByTestId("reframed");
+    expect(cropped).toHaveTextContent(/^Cropped/);
+    expect(cropped).toHaveAttribute("title", "Reframed from the video frame: cropped to frame the subject.");
+
+    const both = within(cards[3]).getByTestId("reframed");
+    expect(both).toHaveTextContent(/^Straightened · Cropped/);
+    expect(both).toHaveAttribute(
+      "title",
+      "Reframed from the video frame: rotated 270° clockwise to stand upright and cropped to frame the subject.",
+    );
+    // Screen readers get the explanation, not just the short label.
+    expect(both).toHaveTextContent("rotated 270° clockwise");
+  });
+
+  it("describes reframing, ignoring full turns", () => {
+    expect(reframeInfo({ rotation: 0, cropped: false })).toBeNull();
+    expect(reframeInfo({ rotation: 360, cropped: false })).toBeNull();
+    expect(reframeInfo({ rotation: -90, cropped: false })?.description).toContain("rotated 270°");
+    expect(reframeInfo({ rotation: 180, cropped: false })?.label).toBe("Straightened");
+    expect(reframeInfo({ rotation: 0, cropped: true })?.label).toBe("Cropped");
+    expect(reframeInfo({ rotation: 90, cropped: true })?.label).toBe("Straightened · Cropped");
   });
 
   it("lists missing shots with a re-shoot hint", () => {
@@ -119,6 +180,7 @@ describe("<ResultGrid>", () => {
     await user.click(screen.getByRole("button", { name: "View Side profile at 00:14 in full size" }));
     let dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent("Side profile");
+    expect(within(dialog).queryByTestId("reframed")).not.toBeInTheDocument();
     expect(dialog).toHaveTextContent("2 of 3");
     expect(within(dialog).getByRole("img")).toHaveAttribute("src", `${API_BASE}${result.images[1].url}`);
 
@@ -141,5 +203,15 @@ describe("<ResultGrid>", () => {
 
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+});
+
+describe("<Lightbox> reframe badge", () => {
+  it("shows the badge for a cropped image", async () => {
+    const user = userEvent.setup();
+    renderGrid({ result: makeResult({ images: [makeImage(1, { cropped: true, rotation: 90 })] }) });
+    await user.click(screen.getByRole("button", { name: /in full size/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByTestId("reframed")).toHaveTextContent(/^Straightened · Cropped/);
   });
 });

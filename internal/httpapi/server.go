@@ -37,6 +37,7 @@ type JobStore interface {
 	GetSelectedImage(ctx context.Context, jobID, imageID string) (*store.SelectedImage, error)
 	ExpireJob(ctx context.Context, id string) error
 	UsageReport(ctx context.Context, from, to time.Time, domainKey string) ([]store.UsageRow, error)
+	JobUsage(ctx context.Context, jobID string) ([]store.UsageByStep, error)
 }
 
 // Enqueuer inserts the River pipeline job inside the job-creation transaction.
@@ -51,10 +52,16 @@ type Prober interface {
 
 // Defaults for zero Deps fields.
 const (
-	defaultStatusRatePerMinute  = 120
-	defaultMaxConcurrentUploads = 4
-	defaultMaxUploadsPerClient  = 2
-	ipHashKeyBytes              = 32
+	defaultStatusRatePerMinute        = 120
+	defaultMaxConcurrentUploads       = 4
+	defaultMaxUploadsPerClient        = 2
+	defaultChunkSizeBytes             = 16 << 20
+	defaultUploadSessionTTL           = 15 * time.Minute
+	defaultMaxUploadSessionsPerClient = 2
+	// chunkRequestHeadroom is what a chunk request keeps free below MaxRequestBytes
+	// (headers, and proxies that count them against the body limit).
+	chunkRequestHeadroom = 1 << 20
+	ipHashKeyBytes       = 32
 )
 
 type Deps struct {
@@ -83,10 +90,34 @@ type Deps struct {
 	MaxConcurrentUploads int
 	// MaxUploadsPerClient caps one client's concurrent uploads. Beyond it: 429.
 	MaxUploadsPerClient int
-	ScratchDir          string
-	PresignDownloads    bool   // redirect downloads to storage.PresignGet URLs
-	FFmpegVersion       string // reported by /healthz to X-Internal-Token callers
-	Now                 func() time.Time
+	// MaxRequestBytes is the largest request body the ingress in front of the API
+	// accepts (Cloudflare Free/Pro: 100 MB); 0 = no cap. POST /jobs then refuses a
+	// body or file above min(domain limit, MaxRequestBytes) with 413 UPLOAD_TOO_LARGE,
+	// and larger videos (up to the domain limit) take the chunked upload, whose chunks
+	// stay chunkRequestHeadroom below it.
+	MaxRequestBytes int64
+	// ChunkSizeBytes is the chunk size given to new chunked uploads (default 16 MiB),
+	// clamped to MaxRequestBytes - 1 MiB when that is set.
+	ChunkSizeBytes int64
+	// UploadSessionTTL drops a chunked upload, with its chunks, once it has been idle
+	// this long after a chunk was stored (default 15 min). Every request on the
+	// session extends it. A session with no chunk stored yet is dropped after 5 min
+	// idle (or this TTL when shorter).
+	UploadSessionTTL time.Duration
+	// MaxUploadSessionsPerClient caps one client's open chunked uploads (default 2).
+	// A client at the cap that starts another gets its own longest-idle session
+	// evicted when that one has been idle for a minute with no request in flight, else
+	// 429 (Retry-After: until one can be evicted). Every open session also holds one
+	// of MaxConcurrentUploads (disk safety); when they are all taken, the longest-idle
+	// session of anyone idle for 5 minutes is evicted, else 503.
+	MaxUploadSessionsPerClient int
+	// ScratchDir holds the upload spool files and the chunked-upload sessions
+	// (<ScratchDir>/uploads). Only when it is set does New restore the sessions a
+	// previous process left there. Empty → $TMPDIR/v2i.
+	ScratchDir       string
+	PresignDownloads bool   // redirect downloads to storage.PresignGet URLs
+	FFmpegVersion    string // reported by /healthz to X-Internal-Token callers
+	Now              func() time.Time
 }
 
 // Server holds the router and the Huma API.
@@ -99,15 +130,32 @@ type Server struct {
 	healthLimiter *keyedLimiter // /healthz per client
 	tokenFailures *keyedLimiter // wrong X-Internal-Token values per client
 	uploads       *uploadSlots
+	sessions      *uploadSessions // chunked uploads
 
-	// Upload body pacing and the scratch free-space probe; tests shrink/replace them.
+	// Upload body pacing, the scratch free-space probe and how long complete waits for
+	// superseded chunk PUTs; tests shrink/replace them.
 	uploadReadWindow time.Duration
 	uploadReadChunk  int64
 	freeSpace        func(dir string) (uint64, error)
+	staleWriterWait  time.Duration
 }
 
-// New builds the server and registers every route.
+// New builds the server and registers every route. It restores the chunked uploads
+// a previous process left in Deps.ScratchDir; Close stops their expiry sweeper.
 func New(d Deps) *Server {
+	s := newServer(d)
+	if d.ScratchDir != "" {
+		s.loadUploadSessions()
+	}
+	return s
+}
+
+// Close stops the background expiry of chunked uploads (their files stay on disk for
+// the next process). It does not affect requests in flight and may be called twice.
+func (s *Server) Close() { s.sessions.stopSweeper() }
+
+// newServer is New without touching the scratch directory.
+func newServer(d Deps) *Server {
 	if d.Logger == nil {
 		d.Logger = slog.Default()
 	}
@@ -123,6 +171,16 @@ func New(d Deps) *Server {
 	if d.MaxUploadsPerClient <= 0 {
 		d.MaxUploadsPerClient = defaultMaxUploadsPerClient
 	}
+	if d.MaxUploadSessionsPerClient <= 0 {
+		d.MaxUploadSessionsPerClient = defaultMaxUploadSessionsPerClient
+	}
+	if d.UploadSessionTTL <= 0 {
+		d.UploadSessionTTL = defaultUploadSessionTTL
+	}
+	if d.MaxRequestBytes < 0 {
+		d.MaxRequestBytes = 0
+	}
+	d.ChunkSizeBytes = effectiveChunkSize(d.ChunkSizeBytes, d.MaxRequestBytes)
 	r := chi.NewRouter()
 	s := &Server{
 		d:                d,
@@ -130,10 +188,12 @@ func New(d Deps) *Server {
 		ipKey:            []byte(d.IPHashSalt),
 		healthLimiter:    newKeyedLimiter(d.Now, defaultMaxLimiterEntries),
 		tokenFailures:    newKeyedLimiter(d.Now, defaultMaxLimiterEntries),
-		uploads:          newUploadSlots(d.MaxConcurrentUploads, d.MaxUploadsPerClient),
+		uploads:          newUploadSlots(d.MaxConcurrentUploads, d.MaxUploadsPerClient, d.MaxUploadSessionsPerClient),
+		sessions:         newUploadSessions(),
 		uploadReadWindow: defaultUploadReadWindow,
 		uploadReadChunk:  defaultUploadReadChunk,
 		freeSpace:        diskFreeBytes,
+		staleWriterWait:  defaultStaleWriterWait,
 	}
 	if len(s.ipKey) == 0 {
 		s.ipKey = make([]byte, ipHashKeyBytes)
@@ -162,7 +222,7 @@ func (s *Server) OpenAPI() *huma.OpenAPI { return s.api.OpenAPI() }
 // OpenAPISpec returns the indented OpenAPI 3.1 JSON without needing any dependency.
 // `v2i openapi` writes it to api/openapi.json for the frontend type generation.
 func OpenAPISpec() ([]byte, error) {
-	s := New(Deps{Registry: domain.NewRegistry(), IPHashSalt: "openapi", Logger: slog.New(slog.DiscardHandler)})
+	s := newServer(Deps{Registry: domain.NewRegistry(), IPHashSalt: "openapi", Logger: slog.New(slog.DiscardHandler)})
 	return json.MarshalIndent(s.OpenAPI(), "", "  ")
 }
 
@@ -225,11 +285,52 @@ func (s *Server) registerOperations() {
 		Errors:      []int{http.StatusBadRequest, http.StatusUnauthorized},
 	}, s.getUsage)
 
+	huma.Register(s.api, huma.Operation{
+		OperationID: "createUpload",
+		Method:      http.MethodPost,
+		Path:        "/v1/domains/{domainKey}/uploads",
+		Summary:     "Start a chunked upload",
+		Description: "For files larger than one request may be (e.g. behind Cloudflare's 100 MB body limit). PUT the chunks, then complete. " +
+			"sizeBytes may be up to the domain's maxUploadBytes (else 413 UPLOAD_TOO_LARGE). Counts against the upload rate limit. " +
+			"An open upload holds an upload slot until it is completed, cancelled or idle past expiresAt (5 minutes before its first chunk, " +
+			"then the session TTL after its last request). A client that already has its maximum of open uploads gets its own longest-idle one " +
+			"(idle for 1 minute, no request in flight) cancelled to make room, else 429 RATE_LIMITED; when all upload slots are taken, " +
+			"the longest-idle upload of anyone idle for 5 minutes is cancelled, else 503 SERVER_BUSY. Retry-After says when one can be.",
+		Tags:          []string{"uploads"},
+		DefaultStatus: http.StatusCreated,
+		Errors:        []int{http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusRequestEntityTooLarge, http.StatusTooManyRequests, http.StatusServiceUnavailable},
+	}, s.createUpload)
+
+	huma.Register(s.api, huma.Operation{
+		OperationID: "completeUpload",
+		Method:      http.MethodPost,
+		Path:        "/v1/domains/{domainKey}/uploads/{uploadId}/complete",
+		Summary:     "Finish a chunked upload and start the job",
+		Description: "Validates the assembled file exactly like POST /jobs (format, decode, duration, resolution) and enqueues the job. " +
+			"409 UPLOAD_INCOMPLETE lists the missing chunks in details (an older PUT of a chunk that a newer PUT already stored is waited for, " +
+			"at most a few seconds, and then cut off). Afterwards the upload is gone; calling complete again returns the same outcome, " +
+			"except after a 500, which keeps the chunks so complete can be retried.",
+		Tags:          []string{"uploads"},
+		DefaultStatus: http.StatusAccepted,
+		Errors:        []int{http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusTooManyRequests, http.StatusServiceUnavailable},
+	}, s.completeUpload)
+
+	huma.Register(s.api, huma.Operation{
+		OperationID:   "abortUpload",
+		Method:        http.MethodDelete,
+		Path:          "/v1/domains/{domainKey}/uploads/{uploadId}",
+		Summary:       "Cancel a chunked upload",
+		Tags:          []string{"uploads"},
+		DefaultStatus: http.StatusNoContent,
+		Errors:        []int{http.StatusForbidden, http.StatusNotFound},
+	}, s.abortUpload)
+
 	s.documentRawOperations()
 }
 
 func (s *Server) registerRawRoutes(r chi.Router) {
 	r.Post("/v1/domains/{domainKey}/jobs", s.createJob)
+	r.Put("/v1/domains/{domainKey}/uploads/{uploadId}/chunks/{index}", s.putUploadChunk)
 	r.Get("/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}", s.getImage)
 	r.Get("/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}/thumb", s.getThumbnail)
 	r.Get("/v1/domains/{domainKey}/jobs/{jobId}/download.zip", s.downloadZip)
@@ -270,9 +371,10 @@ func (s *Server) documentRawOperations() {
 		Method:      http.MethodPost,
 		Path:        "/v1/domains/{domainKey}/jobs",
 		Summary:     "Upload a video and start a job",
-		Description: "multipart/form-data with one field `video`. Streams to storage, validates with ffprobe, enqueues.",
-		Tags:        []string{"jobs"},
-		Parameters:  []*huma.Param{domainParam},
+		Description: "multipart/form-data with one field `video`. Streams to storage, validates with ffprobe, enqueues. " +
+			"A body above what one request may carry in this deployment is 413 UPLOAD_TOO_LARGE with details.maxRequestBytes: send such a video as a chunked upload (createUpload).",
+		Tags:       []string{"jobs"},
+		Parameters: []*huma.Param{domainParam},
 		RequestBody: &huma.RequestBody{Required: true, Content: map[string]*huma.MediaType{
 			"multipart/form-data": {Schema: &huma.Schema{
 				Type:       huma.TypeObject,
@@ -285,6 +387,34 @@ func (s *Server) documentRawOperations() {
 			"400": errResp("UNSUPPORTED_FORMAT | CANNOT_DECODE | TOO_LONG | TOO_SHORT | RESOLUTION_TOO_LOW | RESOLUTION_TOO_HIGH | INVALID_REQUEST"),
 			"403": errResp("ORIGIN_NOT_ALLOWED"),
 			"404": errResp("DOMAIN_NOT_FOUND"),
+			"413": errResp("UPLOAD_TOO_LARGE"),
+			"429": errResp("RATE_LIMITED"),
+			"500": errResp("INTERNAL_ERROR"),
+			"503": errResp("SERVER_BUSY"),
+		},
+	})
+
+	oapi.AddOperation(&huma.Operation{
+		OperationID: "putUploadChunk",
+		Method:      http.MethodPut,
+		Path:        "/v1/domains/{domainKey}/uploads/{uploadId}/chunks/{index}",
+		Summary:     "Upload one chunk",
+		Description: "Raw bytes (application/octet-stream) of chunk index (0-based). Re-sending a chunk replaces it. Every chunk but the last must be exactly chunkSizeBytes: " +
+			"a Content-Length must match it, and a body without one (chunked transfer) must end after exactly that many bytes (else 400 with details " +
+			"{index, expectedBytes, contentLength}). Chunks may be sent in any order and in parallel. A refused chunk's body is read before the answer, " +
+			"so the client can read it.",
+		Tags: []string{"uploads"},
+		Parameters: []*huma.Param{domainParam,
+			{Name: "uploadId", In: "path", Required: true, Schema: &huma.Schema{Type: huma.TypeString}},
+			{Name: "index", In: "path", Required: true, Schema: &huma.Schema{Type: huma.TypeInteger, Minimum: ptrFloat(0)}}},
+		RequestBody: &huma.RequestBody{Required: true, Content: map[string]*huma.MediaType{
+			"application/octet-stream": {Schema: &huma.Schema{Type: huma.TypeString, Format: "binary"}},
+		}},
+		Responses: map[string]*huma.Response{
+			"204": {Description: "Chunk stored"},
+			"400": errResp("INVALID_REQUEST (bad index or size)"),
+			"403": errResp("ORIGIN_NOT_ALLOWED"),
+			"404": errResp("DOMAIN_NOT_FOUND | UPLOAD_NOT_FOUND"),
 			"413": errResp("UPLOAD_TOO_LARGE"),
 			"429": errResp("RATE_LIMITED"),
 			"500": errResp("INTERNAL_ERROR"),
@@ -337,4 +467,21 @@ func (s *Server) documentRawOperations() {
 			"500": errResp("INTERNAL_ERROR"),
 		},
 	})
+}
+
+func ptrFloat(v float64) *float64 { return &v }
+
+// effectiveChunkSize applies the default and the MaxRequestBytes clamp.
+func effectiveChunkSize(size, maxRequest int64) int64 {
+	if size <= 0 {
+		size = defaultChunkSizeBytes
+	}
+	if maxRequest > 0 {
+		limit := maxRequest - chunkRequestHeadroom
+		if limit <= 0 { // not a real deployment; keep chunks below the cap anyway
+			limit = max(maxRequest/2, 1)
+		}
+		size = min(size, limit)
+	}
+	return size
 }

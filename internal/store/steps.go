@@ -75,6 +75,34 @@ func (s *Store) FinishStep(ctx context.Context, jobID, name string, status StepS
 	return nil
 }
 
+// MergeStepMeta updates the step's meta in place: keys whose value is nil are removed,
+// the others are added or replaced (jsonb ||, top level only). Status and times are
+// unchanged. It lets a running step record paid work before it finishes (FinishStep
+// replaces the whole meta). An unknown job or step → ErrNotFound.
+func (s *Store) MergeStepMeta(ctx context.Context, jobID, name string, meta map[string]any) error {
+	set := make(map[string]any, len(meta))
+	remove := []string{} // never NULL: meta - NULL is NULL
+	for k, v := range meta {
+		if v == nil {
+			remove = append(remove, k)
+		} else {
+			set[k] = v
+		}
+	}
+	b, err := jsonbObject(set)
+	if err != nil {
+		return fmt.Errorf("store: merge step meta %s of %s: %w", name, jobID, err)
+	}
+	n, err := s.q.MergeStepMeta(ctx, sqlcdb.MergeStepMetaParams{Remove: remove, Set: b, JobID: jobID, Name: name})
+	if err != nil {
+		return fmt.Errorf("store: merge step meta %s of %s: %w", name, jobID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: merge step meta %s of %s: %w", name, jobID, ErrNotFound)
+	}
+	return nil
+}
+
 // SkipRemainingSteps marks every pending or running step of the job as skipped.
 // finished_at is set and duration_ms computed for steps that had started.
 func (s *Store) SkipRemainingSteps(ctx context.Context, jobID string) error {

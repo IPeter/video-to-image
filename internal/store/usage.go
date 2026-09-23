@@ -84,6 +84,29 @@ func (s *Store) CostSince(ctx context.Context, since time.Time) (float64, error)
 	return total, nil
 }
 
+// JobUsage sums the job's usage_events per step and model, ordered by the step's first
+// call (created_at, then id). No usage → empty slice, nil error; a missing job reads
+// the same (usage_events rows are deleted with their job).
+func (s *Store) JobUsage(ctx context.Context, jobID string) ([]UsageByStep, error) {
+	rows, err := s.q.JobUsage(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("store: job usage %s: %w", jobID, err)
+	}
+	out := make([]UsageByStep, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, UsageByStep{
+			Step:           r.Step,
+			Model:          r.Model,
+			Calls:          r.Calls,
+			InputTokens:    r.InputTokens,
+			OutputTokens:   r.OutputTokens,
+			ThinkingTokens: r.ThinkingTokens,
+			CostUSD:        r.CostUsd,
+		})
+	}
+	return out, nil
+}
+
 // UsageReport groups usage_events in [from, to) by UTC day and domain, ordered by day
 // then domain. domainKey "" means all domains.
 // Jobs counts distinct non-NULL job ids.

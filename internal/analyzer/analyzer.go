@@ -1,7 +1,7 @@
 // Package analyzer is the model-provider boundary. An Analyzer sends media + a prompt
 // to a model and returns the raw text answer plus token usage. Prompt composition,
 // JSON parsing, validation and the "return valid JSON only" nudge live in the pipeline
-// steps (internal/pipeline/analyze, internal/pipeline/rerank), so every provider —
+// steps (internal/pipeline/analyze, internal/pipeline/review), so every provider —
 // gemini, fake, recorded — is interchangeable.
 package analyzer
 
@@ -14,7 +14,8 @@ import (
 // Step names used in Request.Step and usage_events.step.
 const (
 	StepAnalyze = "analyze"
-	StepRerank  = "rerank"
+	StepRerank  = "rerank" // legacy, replaced by StepReview
+	StepReview  = "review"
 )
 
 // ErrUnavailable means the provider failed after its own transient-error retries
@@ -26,7 +27,7 @@ var ErrNoRecording = errors.New("analyzer: no recording for request")
 
 // Request is one model call.
 type Request struct {
-	Step      string // StepAnalyze | StepRerank
+	Step      string // StepAnalyze | StepReview
 	JobID     string // for logs
 	DomainKey string // for logs
 	// CacheKey identifies the request for recording/replay. It must be stable across

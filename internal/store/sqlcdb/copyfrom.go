@@ -128,6 +128,8 @@ func (r iteratorForInsertSelectedImages) Values() ([]interface{}, error) {
 		r.rows[0].ImagePath,
 		r.rows[0].ThumbPath,
 		r.rows[0].Bytes,
+		r.rows[0].Rotation,
+		r.rows[0].Crop,
 	}, nil
 }
 
@@ -135,6 +137,7 @@ func (r iteratorForInsertSelectedImages) Err() error {
 	return nil
 }
 
+// crop is NULL (nil) for an uncropped image.
 func (q *Queries) InsertSelectedImages(ctx context.Context, arg []InsertSelectedImagesParams) (int64, error) {
-	return q.db.CopyFrom(ctx, []string{"selected_images"}, []string{"id", "job_id", "candidate_id", "idx", "shot_id", "timestamp_sec", "width", "height", "reason", "file_name", "image_path", "thumb_path", "bytes"}, &iteratorForInsertSelectedImages{rows: arg})
+	return q.db.CopyFrom(ctx, []string{"selected_images"}, []string{"id", "job_id", "candidate_id", "idx", "shot_id", "timestamp_sec", "width", "height", "reason", "file_name", "image_path", "thumb_path", "bytes", "rotation", "crop"}, &iteratorForInsertSelectedImages{rows: arg})
 }

@@ -69,6 +69,10 @@ export function messageForCode(code: ErrorCode, limits: MessageLimits = {}): str
       return resolutionTooHigh(limits);
     case "SERVER_BUSY":
       return "We're busy processing other uploads. Please try again in a minute.";
+    case "UPLOAD_NOT_FOUND":
+      return "The upload expired or was interrupted. Please upload the video again.";
+    case "UPLOAD_INCOMPLETE":
+      return "Part of the video did not arrive. Please try the upload again.";
     case "RATE_LIMITED":
       return "You have sent a lot of requests in a short time. Please wait a while and try again.";
     case "JOB_NOT_FOUND":

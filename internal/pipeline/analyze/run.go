@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"video-to-image/internal/analyzer"
+	"video-to-image/internal/domain"
 )
 
 // CallTimeout bounds one model call (plan/03-pipeline.md step 2), including the file
@@ -104,7 +105,7 @@ func buildRequest(in Input) *analyzer.Request {
 			{
 				FilePath:   in.PreviewPath,
 				MIMEType:   "video/mp4",
-				VideoFPS:   float64(d.Model.PreviewFPS),
+				VideoFPS:   videoFPS(in, d),
 				FileHandle: in.FileHandle,
 			},
 			{Text: user},
@@ -244,4 +245,14 @@ func ParseResponse(text string) (*ModelResponse, error) {
 		VideoSummary: Truncate(w.VideoSummary, MaxVideoSummaryRunes),
 		Scenes:       w.Scenes,
 	}, nil
+}
+
+// videoFPS is the rate the model is told to sample the preview at: the preview's real
+// frame rate when known (a keyframe-only preview has fewer frames than requested), else
+// the domain's preview rate.
+func videoFPS(in Input, d *domain.Config) float64 {
+	if in.PreviewFPS > 0 {
+		return in.PreviewFPS
+	}
+	return float64(d.Model.PreviewFPS)
 }

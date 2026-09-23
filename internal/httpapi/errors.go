@@ -25,6 +25,8 @@ const (
 	CodeResolutionTooLow  ErrorCode = "RESOLUTION_TOO_LOW"
 	CodeResolutionTooHigh ErrorCode = "RESOLUTION_TOO_HIGH" // width×height > maxPixels, or fps > maxFps
 	CodeServerBusy        ErrorCode = "SERVER_BUSY"         // too many concurrent uploads / scratch disk low (503)
+	CodeUploadNotFound    ErrorCode = "UPLOAD_NOT_FOUND"    // unknown or expired chunked-upload session (404)
+	CodeUploadIncomplete  ErrorCode = "UPLOAD_INCOMPLETE"   // complete called before every chunk arrived (409)
 	CodeRateLimited       ErrorCode = "RATE_LIMITED"
 	CodeJobNotFound       ErrorCode = "JOB_NOT_FOUND"
 	CodeImageNotFound     ErrorCode = "IMAGE_NOT_FOUND"
@@ -41,7 +43,7 @@ const (
 var AllErrorCodes = []ErrorCode{
 	CodeDomainNotFound, CodeOriginNotAllowed, CodeUnauthorized, CodeInvalidRequest,
 	CodeUploadTooLarge, CodeUnsupportedFormat, CodeCannotDecode, CodeTooLong, CodeTooShort,
-	CodeResolutionTooLow, CodeResolutionTooHigh, CodeServerBusy, CodeRateLimited, CodeJobNotFound, CodeImageNotFound, CodeNotReady,
+	CodeResolutionTooLow, CodeResolutionTooHigh, CodeServerBusy, CodeUploadNotFound, CodeUploadIncomplete, CodeRateLimited, CodeJobNotFound, CodeImageNotFound, CodeNotReady,
 	CodeExpired, CodeModelUnavailable, CodeModelBadOutput, CodeProcessingError, CodeNotFound,
 	CodeInternal,
 }

@@ -59,7 +59,12 @@ async function uploadFixture(page: Page, file: string) {
   await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
   await page.getByLabel("Choose a video file").setInputFiles(file);
   await expect(page.getByRole("region", { name: "Selected video" })).toContainText(path.basename(file));
+  // Every upload goes through the chunked API (small files as one chunk).
+  const firstChunk = page.waitForResponse(
+    (res) => res.request().method() === "PUT" && /\/uploads\/upl_[A-Za-z0-9]+\/chunks\/0$/.test(res.url()),
+  );
   await page.getByRole("button", { name: "Upload and find the best shots" }).click();
+  expect((await firstChunk).status()).toBe(204);
   await page.waitForURL(/\/jobs\/job_[A-Za-z0-9]+$/, { timeout: 60_000 });
 }
 
@@ -68,6 +73,9 @@ test("uploads a walkaround video and shows the selected images", async ({ page }
 
   const grid = page.getByRole("list", { name: "Selected images" });
   await expect(grid).toBeVisible({ timeout: 90_000 });
+
+  // The fake analyzer's calls are recorded as usage at zero cost.
+  await expect(page.getByTestId("ai-usage")).toContainText(/AI usage: [\d,]+ tokens · \$0\.00 \(free test mode\)/);
 
   const cards = grid.getByRole("listitem");
   expect(await cards.count()).toBeGreaterThanOrEqual(1);
@@ -114,4 +122,6 @@ test("a video that is not a car ends in the rejected state", async ({ page }) =>
   await expect(rejected).toBeVisible({ timeout: 90_000 });
   await expect(rejected.getByRole("heading", { level: 1 })).toHaveText(rejectedTitle);
   await expect(rejected.getByRole("link", { name: "Try another video" })).toHaveAttribute("href", "/");
+  // The gate call that rejected it is accounted for too.
+  await expect(rejected.getByTestId("ai-usage")).toContainText(/AI usage: [\d,]+ tokens/);
 });

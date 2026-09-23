@@ -1,6 +1,6 @@
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
 import { carsDomain, JOB_ID } from "@/test/fixtures";
 import { FakeXhr } from "@/test/fake-xhr";
@@ -20,6 +20,65 @@ function videoFile(name = "walkaround.mp4", size = 50 * 1024 * 1024, type = "vid
   return file;
 }
 
+const MiB = 1024 * 1024;
+const UPLOADS = "http://api.test:4000/v1/domains/cars/uploads";
+const UPLOAD_ID = "upl_01J8ZK3M2Q7K2M9QXA4B5C6D7E";
+
+function session(chunkSizeBytes: number, sizeBytes: number) {
+  return {
+    uploadId: UPLOAD_ID,
+    chunkSizeBytes,
+    chunkCount: Math.max(1, Math.ceil(sizeBytes / chunkSizeBytes)),
+    expiresAt: "2026-09-23T12:00:00Z",
+  };
+}
+
+/** The pending create call (POST .../uploads). */
+function createCall(): Promise<FakeXhr> {
+  return waitFor(() => {
+    const [create] = FakeXhr.pending("POST", UPLOADS).filter((x) => x.url === UPLOADS);
+    expect(create).toBeDefined();
+    return create;
+  });
+}
+
+function chunksInFlight(count: number): Promise<FakeXhr[]> {
+  return waitFor(() => {
+    const pending = FakeXhr.pending("PUT", "/chunks/");
+    expect(pending).toHaveLength(count);
+    return pending;
+  });
+}
+
+function completeCall(): Promise<FakeXhr> {
+  return waitFor(() => {
+    const [complete] = FakeXhr.pending("POST", `${UPLOADS}/${UPLOAD_ID}/complete`);
+    expect(complete).toBeDefined();
+    return complete;
+  });
+}
+
+/** Picks a 50 MB video, starts the upload and answers the create call. */
+async function startUpload(user: ReturnType<typeof userEvent.setup>, chunkSizeBytes = 64 * MiB) {
+  await user.upload(fileInput(), videoFile());
+  await user.click(screen.getByRole("button", { name: "Upload and find the best shots" }));
+  const create = await createCall();
+  await act(async () => create.respond(201, session(chunkSizeBytes, 50 * MiB)));
+}
+
+/** Uploads the (single-chunk) video and returns the pending complete call. */
+async function uploadUntilComplete(user: ReturnType<typeof userEvent.setup>): Promise<FakeXhr> {
+  await startUpload(user);
+  const [chunk] = await chunksInFlight(1);
+  await act(async () => chunk.respond(204));
+  return completeCall();
+}
+
+/** The session DELETE goes out through fetch with keepalive. */
+let fetchMock: Mock<typeof fetch>;
+const sessionDeletes = () =>
+  fetchMock.mock.calls.filter(([, init]) => init?.method === "DELETE").map(([url, init]) => [String(url), init?.keepalive]);
+
 function renderForm() {
   return renderWithProviders(<UploadForm limits={carsDomain.limits} />);
 }
@@ -35,8 +94,10 @@ beforeEach(() => {
     metadata: { durationSec: 74.2, width: 1920, height: 1080 },
     posterDataUrl: "data:image/jpeg;base64,AAAA",
   });
-  FakeXhr.last = null;
+  FakeXhr.reset();
   vi.stubGlobal("XMLHttpRequest", FakeXhr);
+  fetchMock = vi.fn<typeof fetch>(() => Promise.resolve({ ok: true, status: 204 } as Response));
+  vi.stubGlobal("fetch", fetchMock);
 });
 
 afterEach(() => {
@@ -79,6 +140,14 @@ describe("<UploadForm>", () => {
     expect(probe).not.toHaveBeenCalled();
   });
 
+  it("accepts a 377 MB phone video: the limit is the domain's, not one request's", async () => {
+    const user = userEvent.setup();
+    renderForm();
+    await user.upload(fileInput(), videoFile("IMG_1972.MOV", 377 * 1000 * 1000, "video/quicktime"));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Upload and find the best shots" })).toBeEnabled();
+  });
+
   it("blocks files that are not videos", async () => {
     const user = userEvent.setup({ applyAccept: false });
     renderForm();
@@ -111,33 +180,109 @@ describe("<UploadForm>", () => {
     expect(screen.getByRole("button", { name: "Upload and find the best shots" })).toBeEnabled();
   });
 
-  it("uploads with progress and opens the job page on 202", async () => {
+  it("uploads in chunks with progress and opens the job page on 202", async () => {
     const user = userEvent.setup();
     renderForm();
     await user.upload(fileInput(), videoFile());
     await user.click(screen.getByRole("button", { name: "Upload and find the best shots" }));
 
-    const xhr = FakeXhr.last!;
-    expect(xhr.method).toBe("POST");
-    expect(xhr.url).toBe("http://api.test:4000/v1/domains/cars/jobs");
-    expect(xhr.body?.get("video")).toBeInstanceOf(File);
+    const create = await createCall();
+    expect(create.json).toEqual({ fileName: "walkaround.mp4", sizeBytes: 50 * MiB, contentType: "video/mp4" });
+    await act(async () => create.respond(201, session(16 * MiB, 50 * MiB)));
 
-    act(() => xhr.progress(25 * 1024 * 1024, 50 * 1024 * 1024));
-    expect(screen.getByRole("progressbar", { name: "Upload progress" })).toHaveAttribute("aria-valuenow", "50");
-    expect(screen.getByText("50%")).toBeInTheDocument();
+    const [c0, c1] = await chunksInFlight(2);
+    expect(c0.url).toBe(`${UPLOADS}/${UPLOAD_ID}/chunks/0`);
+    expect(c1.url).toBe(`${UPLOADS}/${UPLOAD_ID}/chunks/1`);
+    act(() => {
+      c0.progress(8 * MiB, 16 * MiB);
+      c1.progress(4.5 * MiB, 16 * MiB);
+    });
+    expect(screen.getByRole("progressbar", { name: "Upload progress" })).toHaveAttribute("aria-valuenow", "25");
+    expect(screen.getByTestId("upload-progress-text")).toHaveTextContent("Uploading… 25% (12.5 MB of 50 MB)");
     expect(screen.getByRole("button", { name: "Choose a different video" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Cancel upload" })).toBeEnabled();
 
-    act(() => xhr.respond(202, { jobId: JOB_ID, status: "queued" }));
+    await act(async () => {
+      c0.respond(204);
+      c1.respond(204);
+    });
+    const rest = await chunksInFlight(2);
+    await act(async () => rest.forEach((x) => x.respond(204)));
+
+    const complete = await completeCall();
+    expect(screen.getByTestId("upload-progress-text")).toHaveTextContent("Checking the video…");
+    await act(async () => complete.respond(202, { jobId: JOB_ID, status: "queued" }));
     await waitFor(() => expect(push).toHaveBeenCalledWith(`/jobs/${JOB_ID}`));
     expect(screen.getByText(/Opening your job/)).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("disables Cancel once complete was sent, and keeps it so while complete is retried", async () => {
+    const user = userEvent.setup();
+    renderForm();
+    await startUpload(user);
+    const [chunk] = await chunksInFlight(1);
+    expect(screen.getByRole("button", { name: "Cancel upload" })).toBeEnabled();
+    await act(async () => chunk.respond(204));
+    const complete = await completeCall();
+    expect(screen.getByTestId("upload-progress-text")).toHaveTextContent("Checking the video…");
+    expect(screen.getByRole("button", { name: "Cancel upload" })).toBeDisabled();
+
+    // A lost answer: complete is sent again (the server replays its outcome).
+    await act(async () => complete.respond(502, "<html>Bad gateway</html>"));
+    expect(screen.getByRole("button", { name: "Cancel upload" })).toBeDisabled();
+    const again = await waitFor(
+      () => {
+        const pending = FakeXhr.pending("POST", `${UPLOADS}/${UPLOAD_ID}/complete`);
+        expect(pending).toHaveLength(1);
+        return pending[0];
+      },
+      { timeout: 3000 },
+    );
+    expect(again).not.toBe(complete);
+    await act(async () => again.respond(202, { jobId: JOB_ID, status: "queued" }));
+    await waitFor(() => expect(push).toHaveBeenCalledWith(`/jobs/${JOB_ID}`));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("says so while a chunk is being sent again", async () => {
+    const user = userEvent.setup();
+    renderForm();
+    await startUpload(user);
+    const [chunk] = await chunksInFlight(1);
+    await act(async () => chunk.respond(503, { error: { code: "SERVER_BUSY", message: "x" } }));
+    expect(screen.getByTestId("upload-retrying")).toHaveTextContent("Having trouble reaching the server. Retrying…");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    // The retry follows after about a second.
+    const [again] = await waitFor(
+      () => {
+        const pending = FakeXhr.pending("PUT", "/chunks/0");
+        expect(pending).toHaveLength(1);
+        return pending;
+      },
+      { timeout: 3000 },
+    );
+    expect(again).not.toBe(chunk);
+    expect(screen.getByTestId("upload-retrying")).toBeEmptyDOMElement();
+  });
+
+  it("explains an expired upload session", async () => {
+    const user = userEvent.setup();
+    renderForm();
+    await startUpload(user);
+    const [chunk] = await chunksInFlight(1);
+    await act(async () => chunk.respond(404, { error: { code: "UPLOAD_NOT_FOUND", message: "no such upload" } }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("The upload expired or was interrupted. Please upload the video again.");
+    expect(screen.getByRole("button", { name: "Try the upload again" })).toBeEnabled();
   });
 
   it("maps a server error code to copy and never shows the raw message", async () => {
     const user = userEvent.setup();
     renderForm();
-    await user.upload(fileInput(), videoFile());
-    await user.click(screen.getByRole("button", { name: "Upload and find the best shots" }));
-    act(() => FakeXhr.last!.respond(400, { error: { code: "TOO_LONG", message: "duration 312.4s > 180s" } }));
+    const complete = await uploadUntilComplete(user);
+    await act(async () => complete.respond(400, { error: { code: "TOO_LONG", message: "duration 312.4s > 180s" } }));
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("The video is too long. Videos must be between 5 and 180 seconds long.");
@@ -151,8 +296,9 @@ describe("<UploadForm>", () => {
     renderForm();
     await user.upload(fileInput(), videoFile());
     await user.click(screen.getByRole("button", { name: "Upload and find the best shots" }));
-    act(() =>
-      FakeXhr.last!.respond(429, { error: { code: "RATE_LIMITED", message: "slow down" } }, { "Retry-After": "360" }),
+    const create = await createCall();
+    await act(async () =>
+      create.respond(429, { error: { code: "RATE_LIMITED", message: "slow down" } }, { "Retry-After": "360" }),
     );
 
     const alert = await screen.findByRole("alert");
@@ -172,7 +318,8 @@ describe("<UploadForm>", () => {
     renderForm();
     await user.upload(fileInput(), videoFile());
     await user.click(screen.getByRole("button", { name: "Upload and find the best shots" }));
-    act(() => FakeXhr.last!.respond(503, { error: { code: "SERVER_BUSY", message: "busy" } }, { "Retry-After": "1" }));
+    const create = await createCall();
+    await act(async () => create.respond(503, { error: { code: "SERVER_BUSY", message: "busy" } }, { "Retry-After": "1" }));
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("We're busy processing other uploads. Please try again in a minute.");
@@ -183,7 +330,7 @@ describe("<UploadForm>", () => {
     await waitFor(() => expect(retry).toBeEnabled(), { timeout: 3000 });
     expect(alert).toHaveTextContent("You can upload again now.");
     await user.click(retry);
-    expect(FakeXhr.last!.method).toBe("POST");
+    expect(await createCall()).not.toBe(create);
     expect(screen.getByRole("progressbar", { name: "Upload progress" })).toBeInTheDocument();
   });
 
@@ -192,7 +339,8 @@ describe("<UploadForm>", () => {
     renderForm();
     await user.upload(fileInput(), videoFile());
     await user.click(screen.getByRole("button", { name: "Upload and find the best shots" }));
-    act(() => FakeXhr.last!.respond(429, { error: { code: "RATE_LIMITED", message: "x" } }));
+    const create = await createCall();
+    await act(async () => create.respond(429, { error: { code: "RATE_LIMITED", message: "x" } }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Please wait a while and try again.");
     expect(screen.queryByTestId("upload-retry-wait")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Try the upload again" })).toBeEnabled();
@@ -203,19 +351,20 @@ describe("<UploadForm>", () => {
     renderForm();
     await user.upload(fileInput(), videoFile());
     await user.click(screen.getByRole("button", { name: "Upload and find the best shots" }));
-    act(() => FakeXhr.last!.networkError());
+    const create = await createCall();
+    await act(async () => create.networkError());
     expect(await screen.findByRole("alert")).toHaveTextContent("could not reach the server");
   });
 
-  it("cancels an upload", async () => {
+  it("cancels an upload: aborts the chunks in flight and discards the session", async () => {
     const user = userEvent.setup();
     renderForm();
-    await user.upload(fileInput(), videoFile());
-    await user.click(screen.getByRole("button", { name: "Upload and find the best shots" }));
-    const xhr = FakeXhr.last!;
+    await startUpload(user, 16 * MiB);
+    const inFlight = await chunksInFlight(2);
     await user.click(screen.getByRole("button", { name: "Cancel upload" }));
 
-    expect(xhr.aborted).toBe(true);
+    expect(inFlight.every((x) => x.aborted)).toBe(true);
+    expect(sessionDeletes()).toEqual([[`${UPLOADS}/${UPLOAD_ID}`, true]]);
     expect(await screen.findByText("Upload cancelled.")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
@@ -239,10 +388,39 @@ describe("<UploadForm>", () => {
   it("aborts an in-flight upload on unmount", async () => {
     const user = userEvent.setup();
     const { unmount } = renderForm();
+    await startUpload(user);
+    const [chunk] = await chunksInFlight(1);
+    unmount();
+    expect(chunk.aborted).toBe(true);
+    expect(sessionDeletes()).toEqual([[`${UPLOADS}/${UPLOAD_ID}`, true]]);
+  });
+
+  it("discards the session when the page is left mid-upload", async () => {
+    const user = userEvent.setup();
+    renderForm();
+    await startUpload(user);
+    const [chunk] = await chunksInFlight(1);
+    act(() => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+    expect(chunk.aborted).toBe(true);
+    expect(sessionDeletes()).toEqual([[`${UPLOADS}/${UPLOAD_ID}`, true]]);
+    expect(await screen.findByText("Upload cancelled.")).toBeInTheDocument();
+  });
+
+  it("cancelled while the session is being created: DELETEs it once the answer arrives", async () => {
+    const user = userEvent.setup();
+    renderForm();
     await user.upload(fileInput(), videoFile());
     await user.click(screen.getByRole("button", { name: "Upload and find the best shots" }));
-    const xhr = FakeXhr.last!;
-    unmount();
-    expect(xhr.aborted).toBe(true);
+    const create = await createCall();
+    await user.click(screen.getByRole("button", { name: "Cancel upload" }));
+    expect(await screen.findByText("Upload cancelled.")).toBeInTheDocument();
+    expect(create.aborted).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await act(async () => create.respond(201, session(64 * MiB, 50 * MiB)));
+    await waitFor(() => expect(sessionDeletes()).toEqual([[`${UPLOADS}/${UPLOAD_ID}`, true]]));
+    expect(FakeXhr.requests("PUT")).toHaveLength(0);
   });
 });

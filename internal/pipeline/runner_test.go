@@ -406,22 +406,26 @@ func TestRunResumesWithoutPayingTwice(t *testing.T) {
 	got, _ := e.store.GetJob(ctx, job.ID)
 	require.Equal(t, store.StatusProcessing, got.Status)
 	assert.Equal(t, store.StepDone, e.steps(job.ID)["analyze"])
-	assert.Equal(t, int32(1), first.calls.Load())
+	assert.Equal(t, int32(3), first.calls.Load(), "analyze + frame review (orientation, judgement)")
 
 	second := &countingAnalyzer{Analyzer: newFake(t)}
 	require.NoError(t, e.runner(second).Run(ctx, job.ID))
-	assert.Zero(t, second.calls.Load(), "analyze is not repeated on retry")
+	assert.Zero(t, second.calls.Load(), "neither analyze nor the review is paid again on retry")
 	got, _ = e.store.GetJob(ctx, job.ID)
 	assert.Equal(t, store.StatusCompleted, got.Status)
 }
 
 type countingAnalyzer struct {
 	analyzer.Analyzer
-	calls atomic.Int32
+	calls        atomic.Int32 // every model call
+	analyzeCalls atomic.Int32 // the (video) analyze step only
 }
 
 func (c *countingAnalyzer) Generate(ctx context.Context, r *analyzer.Request) (*analyzer.Response, error) {
 	c.calls.Add(1)
+	if r.Step == analyzer.StepAnalyze {
+		c.analyzeCalls.Add(1)
+	}
 	return c.Analyzer.Generate(ctx, r)
 }
 

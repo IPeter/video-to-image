@@ -125,6 +125,10 @@ type fakeStore struct {
 	usageCalls []usageCall
 	usageErr   error
 
+	jobUsage      map[string][]store.UsageByStep
+	jobUsageCalls []string
+	jobUsageErr   error
+
 	created     []store.NewJob
 	enqueueTx   pgx.Tx
 	expired     []string
@@ -147,6 +151,8 @@ func newFakeStore(now func() time.Time) *fakeStore {
 		jobs:   map[string]*store.Job{},
 		steps:  map[string][]store.Step{},
 		images: map[string][]store.SelectedImage{},
+
+		jobUsage: map[string][]store.UsageByStep{},
 	}
 }
 
@@ -260,6 +266,23 @@ func (f *fakeStore) UsageReport(ctx context.Context, from, to time.Time, domainK
 		return nil, f.usageErr
 	}
 	return append([]store.UsageRow(nil), f.usageRows...), nil
+}
+
+func (f *fakeStore) JobUsage(ctx context.Context, jobID string) ([]store.UsageByStep, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.jobUsageCalls = append(f.jobUsageCalls, jobID)
+	if f.jobUsageErr != nil {
+		return nil, f.jobUsageErr
+	}
+	return append([]store.UsageByStep{}, f.jobUsage[jobID]...), nil
+}
+
+// setJobUsage sets the usage rows JobUsage returns for the job.
+func (f *fakeStore) setJobUsage(jobID string, rows ...store.UsageByStep) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.jobUsage[jobID] = rows
 }
 
 // addJob inserts a job row (with pending steps unless steps are given).
@@ -585,6 +608,7 @@ func newEnv(t *testing.T, mutate ...func(e *testEnv, d *Deps)) *testEnv {
 	d.Registry = domain.NewRegistry(e.cars, e.homes)
 	e.deps = d
 	e.srv = New(d)
+	t.Cleanup(e.srv.Close)
 	return e
 }
 

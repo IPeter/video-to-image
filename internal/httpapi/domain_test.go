@@ -115,7 +115,7 @@ func TestPreflightHeaders(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, rec.Code)
 	h := rec.Header()
 	assert.Equal(t, testOrigin, h.Get("Access-Control-Allow-Origin"))
-	assert.Equal(t, "GET, POST, DELETE, OPTIONS", h.Get("Access-Control-Allow-Methods"))
+	assert.Equal(t, "GET, POST, PUT, DELETE, OPTIONS", h.Get("Access-Control-Allow-Methods"))
 	assert.Equal(t, "Content-Type", h.Get("Access-Control-Allow-Headers"))
 	assert.Equal(t, "600", h.Get("Access-Control-Max-Age"))
 	assert.Contains(t, h.Values("Vary"), "Origin")
@@ -215,4 +215,9 @@ func TestClassify(t *testing.T) {
 	assert.Equal(t, classOther, classify("GET", ""))
 	assert.Equal(t, classOther, classify("DELETE", "jobs/job_x"))
 	assert.Equal(t, classOther, classify("POST", "jobs/job_x"))
+	assert.Equal(t, classUpload, classify("POST", "uploads"))
+	assert.Equal(t, classChunk, classify("PUT", "uploads/upl_x/chunks/3"))
+	assert.Equal(t, classChunk, classify("POST", "uploads/upl_x/complete"))
+	assert.Equal(t, classChunk, classify("DELETE", "uploads/upl_x"))
+	assert.Equal(t, classOther, classify("GET", "uploads"))
 }

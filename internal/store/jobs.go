@@ -221,7 +221,9 @@ func (s *Store) saveAnalysis(ctx context.Context, id string, a AnalysisResult) e
 // shots and zip path. Not processing → ErrConflict (nothing written).
 //
 // Every other candidate of the job is marked not selected. Images are stored under id
-// (an image whose JobID names another job is rejected); Idx must be ≥ 1.
+// (an image whose JobID names another job is rejected); Idx must be ≥ 1, Rotation one
+// of 0, 90, 180, 270 and Crop nil (stored as NULL) or a non-empty rectangle inside
+// [0,1].
 func (s *Store) CompleteJob(ctx context.Context, id string, c Completion) error {
 	if err := s.completeJob(ctx, id, c); err != nil {
 		return fmt.Errorf("store: complete job %s: %w", id, err)

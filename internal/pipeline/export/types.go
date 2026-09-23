@@ -1,5 +1,6 @@
 // Package export is pipeline step 6: store the selected full-resolution frames as-is
-// (already -qscale:v 2 from step 3; re-encoding would only lose quality), the 640 px
+// (already -qscale:v 2 from step 3; re-encoding would only lose quality) or, when the
+// review asked for it, rotated upright and cropped (re-encoded once), the 640 px
 // thumbnails, manifest.json, and a streamed ZIP of all images + manifest.
 package export
 
@@ -26,6 +27,24 @@ type Image struct {
 	SmallPath    string // local 640 px JPG
 	Reason       string
 	Scores       Scores
+	// Edit, when non-nil and not a no-op, is applied to the full-resolution frame
+	// (rotate, then crop) and the thumbnail is re-made from the result. nil → the frame
+	// is copied byte for byte, as before.
+	Edit *Edit
+}
+
+// Edit reframes one image. Rotation is applied first; Crop is in the UPRIGHT image.
+type Edit struct {
+	RotateCW int    // 0, 90, 180 or 270 degrees clockwise
+	Crop     *NRect // normalised crop of the upright image; nil = no crop
+}
+
+// NRect is a rectangle in normalised [0,1] coordinates (X0 < X1, Y0 < Y1).
+type NRect struct {
+	X0 float64 `json:"x0"`
+	Y0 float64 `json:"y0"`
+	X1 float64 `json:"x1"`
+	Y1 float64 `json:"y1"`
 }
 
 type MissingShot struct {
@@ -49,9 +68,11 @@ type Exported struct {
 	FileName string // <domainKey>_<jobShortId>_<index>_<shotId>_<mm-ss>.jpg
 	ImageKey string // storage key of the full image
 	ThumbKey string // storage key of the thumbnail
-	Width    int    // decoded from the JPEG header
+	Width    int    // of the exported (edited) image
 	Height   int
 	Bytes    int64 // size of the full image
+	Rotation int   // applied rotation (0 when none)
+	Cropped  bool  // a crop was applied
 }
 
 type Output struct {
@@ -83,4 +104,6 @@ type ManifestImage struct {
 	Height         int     `json:"height"`
 	Reason         string  `json:"reason"`
 	Scores         Scores  `json:"scores"`
+	Rotation       int     `json:"rotation"`       // degrees clockwise applied to the source frame
+	Crop           *NRect  `json:"crop,omitempty"` // normalised crop of the upright frame
 }

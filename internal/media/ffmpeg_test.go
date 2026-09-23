@@ -419,22 +419,28 @@ func TestBuildPreview(t *testing.T) {
 		"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv444p")
 	portrait := portraitVideo(t)
 
+	// withAudio and odd have one keyframe (x264's default GOP is longer than the clip),
+	// so non-reference frames are skipped at the requested 2 fps; small and portrait
+	// have a keyframe every second, so only keyframes are decoded, at 1 fps.
 	tests := []struct {
 		name  string
 		src   string
 		wantW int
 		wantH int
+		want  PreviewInfo
 	}{
-		{"downscales 720p to 480p", withAudio, 854, 480},
-		{"never upscales", small, 640, 360},
-		{"odd source height rounds down to even", odd, 640, 360},
-		{"portrait is display-oriented", portrait, 270, 480},
+		{"downscales 720p to 480p", withAudio, 854, 480, PreviewInfo{FPS: 2}},
+		{"never upscales", small, 640, 360, PreviewInfo{FPS: 1, KeyframesOnly: true}},
+		{"odd source height rounds down to even", odd, 640, 360, PreviewInfo{FPS: 2}},
+		{"portrait is display-oriented", portrait, 270, 480, PreviewInfo{FPS: 1, KeyframesOnly: true}},
 	}
 	f := New("", "", nil)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			out := filepath.Join(t.TempDir(), "nested", "preview.mp4")
-			require.NoError(t, f.BuildPreview(context.Background(), tt.src, out, 480, 2, 0))
+			got, err := f.BuildPreview(context.Background(), tt.src, out, 480, 2, 0)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 
 			streams := probeStreams(t, out)
 			require.Len(t, streams, 1, "video only: no audio, subtitle or data streams")
@@ -442,7 +448,7 @@ func TestBuildPreview(t *testing.T) {
 			assert.Equal(t, "video", s.CodecType)
 			assert.Equal(t, "h264", s.CodecName)
 			assert.Equal(t, "yuv420p", s.PixFmt)
-			assert.Equal(t, "2/1", s.AvgFrameRate)
+			assert.Equal(t, fmt.Sprintf("%v/1", got.FPS), s.AvgFrameRate, "the reported fps is the real one")
 			assert.Equal(t, tt.wantW, s.Width)
 			assert.Equal(t, tt.wantH, s.Height)
 			assert.LessOrEqual(t, s.Height, 480)
@@ -471,19 +477,30 @@ func TestBuildPreviewFailure(t *testing.T) {
 	garbage := filepath.Join(dir, "garbage.mp4")
 	require.NoError(t, os.WriteFile(garbage, []byte("definitely not a video"), 0o644))
 	out := filepath.Join(dir, "out", "preview.mp4")
-	err := New("", "", nil).BuildPreview(context.Background(), garbage, out, 480, 2, 0)
+	info, err := New("", "", nil).BuildPreview(context.Background(), garbage, out, 480, 2, 0)
+	assert.Zero(t, info)
 	var ee *ExecError
 	require.ErrorAs(t, err, &ee)
 	assert.NotEmpty(t, ee.StderrTail)
+	assert.Contains(t, ee.Cmd, "ffmpeg", "the keyframe probe failing falls through to the encode")
 	assert.NoFileExists(t, out)
 	entries, err := os.ReadDir(filepath.Dir(out))
 	require.NoError(t, err)
 	assert.Empty(t, entries, "partial output removed")
 
 	f := New("", "", nil)
-	assert.Error(t, f.BuildPreview(context.Background(), garbage, out, 0, 2, 0))
-	assert.Error(t, f.BuildPreview(context.Background(), garbage, out, 480, 0, 0))
-	assert.Error(t, f.BuildPreview(context.Background(), garbage, garbage, 480, 2, 0))
+	for _, args := range []struct {
+		out           string
+		height, fps   int
+		wantErrSubstr string
+	}{
+		{out, 0, 2, "must be positive"},
+		{out, 480, 0, "must be positive"},
+		{garbage, 480, 2, "overwrite the input"},
+	} {
+		_, err := f.BuildPreview(context.Background(), garbage, args.out, args.height, args.fps, 0)
+		assert.ErrorContains(t, err, args.wantErrSubstr)
+	}
 }
 
 type streamInfo struct {

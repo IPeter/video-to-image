@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/jackc/pgx/v5"
 
@@ -18,7 +20,11 @@ func (s *Store) ListSelectedImages(ctx context.Context, jobID string) ([]Selecte
 	}
 	out := make([]SelectedImage, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, imageFromRow(r))
+		im, err := imageFromRow(r)
+		if err != nil {
+			return nil, fmt.Errorf("store: list selected images %s: %w", jobID, err)
+		}
+		out = append(out, im)
 	}
 	return out, nil
 }
@@ -32,11 +38,18 @@ func (s *Store) GetSelectedImage(ctx context.Context, jobID, imageID string) (*S
 	if err != nil {
 		return nil, fmt.Errorf("store: get selected image %s/%s: %w", jobID, imageID, err)
 	}
-	im := imageFromRow(r)
+	im, err := imageFromRow(r)
+	if err != nil {
+		return nil, fmt.Errorf("store: get selected image %s/%s: %w", jobID, imageID, err)
+	}
 	return &im, nil
 }
 
-func imageFromRow(r sqlcdb.SelectedImage) SelectedImage {
+func imageFromRow(r sqlcdb.SelectedImage) (SelectedImage, error) {
+	crop, err := decodeCrop(r.Crop)
+	if err != nil {
+		return SelectedImage{}, fmt.Errorf("image %s: crop: %w", r.ID, err)
+	}
 	return SelectedImage{
 		ID:           r.ID,
 		JobID:        r.JobID,
@@ -51,7 +64,47 @@ func imageFromRow(r sqlcdb.SelectedImage) SelectedImage {
 		ImagePath:    textOrEmpty(r.ImagePath),
 		ThumbPath:    textOrEmpty(r.ThumbPath),
 		Bytes:        int64(r.Bytes),
+		Rotation:     int(r.Rotation),
+		Crop:         crop,
+	}, nil
+}
+
+// decodeCrop decodes selected_images.crop; NULL (and JSON null) → nil.
+func decodeCrop(b []byte) (*NRect, error) {
+	if len(b) == 0 {
+		return nil, nil
 	}
+	var r *NRect
+	if err := json.Unmarshal(b, &r); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// encodeCrop encodes a crop for the jsonb column; nil → NULL. The rectangle must be
+// normalised: finite, inside [0,1] and with X0 < X1 and Y0 < Y1.
+func encodeCrop(r *NRect) ([]byte, error) {
+	if r == nil {
+		return nil, nil
+	}
+	for _, v := range []float64{r.X0, r.Y0, r.X1, r.Y1} {
+		if math.IsNaN(v) || v < 0 || v > 1 {
+			return nil, fmt.Errorf("crop %+v is not normalised to [0,1]", *r)
+		}
+	}
+	if r.X0 >= r.X1 || r.Y0 >= r.Y1 {
+		return nil, fmt.Errorf("crop %+v is empty", *r)
+	}
+	return jsonb(r)
+}
+
+// validRotation reports whether deg is a quarter turn clockwise (0, 90, 180, 270).
+func validRotation(deg int) bool {
+	switch deg {
+	case 0, 90, 180, 270:
+		return true
+	}
+	return false
 }
 
 // imageParams validates im for insertion under jobID.
@@ -81,6 +134,13 @@ func imageParams(jobID string, im SelectedImage) (sqlcdb.InsertSelectedImagesPar
 	if err != nil {
 		return p, fmt.Errorf("image %s: %w", im.ID, err)
 	}
+	if !validRotation(im.Rotation) {
+		return p, fmt.Errorf("image %s: rotation %d is not 0, 90, 180 or 270", im.ID, im.Rotation)
+	}
+	crop, err := encodeCrop(im.Crop)
+	if err != nil {
+		return p, fmt.Errorf("image %s: %w", im.ID, err)
+	}
 	return sqlcdb.InsertSelectedImagesParams{
 		ID:           im.ID,
 		JobID:        jobID,
@@ -95,5 +155,7 @@ func imageParams(jobID string, im SelectedImage) (sqlcdb.InsertSelectedImagesPar
 		ImagePath:    nullText(im.ImagePath),
 		ThumbPath:    nullText(im.ThumbPath),
 		Bytes:        size,
+		Rotation:     int32(im.Rotation),
+		Crop:         crop,
 	}, nil
 }

@@ -130,7 +130,10 @@ export function UploadForm({ limits }: UploadFormProps) {
   const startUpload = () => {
     if (!selection || hasBlockingIssue(selection.issues) || uploadRef.current || waiting) return;
     setRetryWait(null);
-    setPhase({ kind: "uploading", progress: { loaded: 0, total: selection.file.size, percent: 0 } });
+    setPhase({
+      kind: "uploading",
+      progress: { loaded: 0, total: selection.file.size, percent: 0, retrying: false, completing: false },
+    });
     const handle = uploadVideo({
       apiUrl,
       domainKey,
@@ -194,6 +197,8 @@ export function UploadForm({ limits }: UploadFormProps) {
           percent={phase.progress.percent}
           loaded={phase.progress.loaded}
           total={phase.progress.total}
+          retrying={phase.progress.retrying}
+          completing={phase.progress.completing}
           onCancel={cancelUpload}
         />
       )}
