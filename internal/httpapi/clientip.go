@@ -60,12 +60,20 @@ func ParseTrustedProxies(list []string) ([]netip.Prefix, error) {
 //     every entry is a trusted proxy the leftmost one is used, and an unparsable entry
 //     stops the walk at the last trusted hop (what lies left of it is unknowable).
 //   - X-Real-IP is used only when there is no X-Forwarded-For at all.
+//   - Deps.ClientIPHeader (e.g. Cloudflare's CF-Connecting-IP), when configured and
+//     parsable, takes precedence over both: behind a CDN the proxy chain in front of
+//     the trusted ingress is the CDN's, and it states the visitor address directly.
 //
 // ok is false when RemoteAddr itself is not an IP (e.g. a unix socket).
 func (s *Server) clientAddr(r *http.Request) (netip.Addr, bool) {
 	peer, ok := parseAddr(r.RemoteAddr)
 	if !ok || !s.trustedProxy(peer) {
 		return peer, ok
+	}
+	if s.d.ClientIPHeader != "" {
+		if a, ok := parseAddr(r.Header.Get(s.d.ClientIPHeader)); ok {
+			return a, true
+		}
 	}
 	if a, found := s.forwardedClient(r.Header.Values("X-Forwarded-For"), peer); found {
 		return a, true

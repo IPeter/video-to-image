@@ -100,6 +100,9 @@ func Open(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, erro
 		return nil, err
 	}
 	log.Info("domains loaded", "keys", reg.Keys(), "dir", cfg.DomainsDir)
+	if lowered := reg.CapUploadBytes(cfg.MaxUploadBytes); len(lowered) > 0 {
+		log.Info("upload size capped for this deployment", "max_upload_bytes", cfg.MaxUploadBytes, "domains", lowered)
+	}
 
 	for _, bin := range []string{cfg.FFmpegPath, cfg.FFprobePath} {
 		if _, err := exec.LookPath(bin); err != nil {

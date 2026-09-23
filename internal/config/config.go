@@ -55,8 +55,14 @@ type Config struct {
 	// TrustedProxies lists CIDRs of reverse proxies (e.g. the Traefik pods / node
 	// network). Forwarding headers are honoured only when the peer is inside one of
 	// them, walking X-Forwarded-For from the right. Empty → use the TCP peer address.
-	TrustedProxies      []string `env:"V2I_TRUSTED_PROXIES" envSeparator:","`
-	StatusRatePerMinute int      `env:"V2I_STATUS_RATE_PER_MINUTE"  envDefault:"120"`
+	TrustedProxies []string `env:"V2I_TRUSTED_PROXIES" envSeparator:","`
+	// ClientIPHeader is set by a CDN in front of the trusted proxies with the visitor
+	// address (Cloudflare: CF-Connecting-IP). Honoured only from a trusted peer.
+	ClientIPHeader string `env:"V2I_CLIENT_IP_HEADER"`
+	// MaxUploadBytes caps every domain's limits.maxUploadBytes for this deployment
+	// (e.g. 95 MiB behind Cloudflare, which rejects bodies over 100 MB). 0 = no cap.
+	MaxUploadBytes      int64 `env:"V2I_MAX_UPLOAD_BYTES"`
+	StatusRatePerMinute int   `env:"V2I_STATUS_RATE_PER_MINUTE"  envDefault:"120"`
 	// Upload concurrency caps: each upload spools up to maxUploadBytes to scratch.
 	MaxConcurrentUploads int `env:"V2I_MAX_CONCURRENT_UPLOADS"  envDefault:"4"`
 	MaxUploadsPerClient  int `env:"V2I_MAX_UPLOADS_PER_CLIENT"  envDefault:"2"`

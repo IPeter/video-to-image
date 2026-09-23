@@ -1,0 +1,13 @@
+# Object storage for originals, exports and thumbnails (V2I_STORAGE=local). On a
+# single-node cluster api and worker share this ReadWriteOnce volume (RWO allows
+# several pods on the same node). For multiple nodes, switch to V2I_STORAGE=s3
+# (MinIO or any S3) — no code change.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: v2i-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 50Gi

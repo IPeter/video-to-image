@@ -2,7 +2,7 @@ key: cars
 name: Car Listing Photos
 allowedOrigins:
   - http://localhost:3000
-  - https://cars.home.example        # k3s ingress host, change to the real domain later
+  - https://cardealer.peterilles.com # home k3s (Cloudflare → Traefik)
 
 limits:
   maxUploadBytes: 524288000          # 500 MB
@@ -104,5 +104,6 @@ retentionHours: 24
 
 copy:
   uploadTitle: Upload a walkaround video of the car
-  uploadHint: 30–120 seconds. Walk slowly around the outside, then film the interior. MP4 or MOV, up to 500 MB.
+  # The page adds the accepted formats and the effective size limit.
+  uploadHint: 30–120 seconds. Walk slowly around the outside, then film the interior.
   rejectedTitle: This doesn't look like a car video

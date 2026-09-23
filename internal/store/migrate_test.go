@@ -20,3 +20,16 @@ func TestMigrateCreatesSchemaAndIsIdempotent(t *testing.T) {
 	}
 	require.NoError(t, store.Migrate(ctx, pool, nil))
 }
+
+// The api and worker init containers may migrate at the same moment.
+func TestMigrateConcurrentCallersAreSerialised(t *testing.T) {
+	pool := pgtest.New(t)
+	ctx := context.Background()
+	errs := make(chan error, 4)
+	for range 4 {
+		go func() { errs <- store.Migrate(ctx, pool, nil) }()
+	}
+	for range 4 {
+		require.NoError(t, <-errs)
+	}
+}

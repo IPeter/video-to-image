@@ -1,0 +1,71 @@
+# The cars frontend. Another domain = a copy of this file with DOMAIN_KEY and name
+# changed (decision 13: one Deployment per domain, same image).
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-cars
+  labels:
+    app.kubernetes.io/name: web-cars
+spec:
+  selector:
+    app.kubernetes.io/name: web-cars
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-cars
+  labels:
+    app.kubernetes.io/name: web-cars
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-cars
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-cars
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: web
+          image: v2i-web
+          ports:
+            - { name: http, containerPort: 3000 }
+          env:
+            - { name: DOMAIN_KEY, value: cars }
+            - { name: API_URL, value: "http://localhost:4000" } # browser-facing; set by the overlay
+            - { name: API_INTERNAL_URL, value: "http://v2i-api:4000" } # server-side fetches
+            - { name: HOSTNAME, value: "0.0.0.0" } # the runtime sets HOSTNAME to the pod name
+            - { name: PORT, value: "3000" }
+            - { name: NEXT_TELEMETRY_DISABLED, value: "1" }
+          livenessProbe:
+            httpGet: { path: /api/healthz, port: http }
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /api/readyz, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: next-cache, mountPath: /app/.next/cache }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: next-cache
+          emptyDir: { sizeLimit: 256Mi }
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }

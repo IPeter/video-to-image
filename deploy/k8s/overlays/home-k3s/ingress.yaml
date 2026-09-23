@@ -1,0 +1,20 @@
+# One host for web and API: same origin, so no CORS and the browser sends the
+# basic-auth credentials with every request (XHR upload, <img>, downloads).
+# TLS terminates at Cloudflare (like home.peterilles.com); Traefik serves HTTP.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardealer
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: v2i-basic-auth@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: cardealer.peterilles.com
+      http:
+        paths:
+          - { path: /v1, pathType: Prefix, backend: { service: { name: v2i-api, port: { name: http } } } }
+          - { path: /openapi.json, pathType: Exact, backend: { service: { name: v2i-api, port: { name: http } } } }
+          - { path: /docs, pathType: Prefix, backend: { service: { name: v2i-api, port: { name: http } } } }
+          - { path: /schemas, pathType: Prefix, backend: { service: { name: v2i-api, port: { name: http } } } }
+          - { path: /, pathType: Prefix, backend: { service: { name: web-cars, port: { name: http } } } }

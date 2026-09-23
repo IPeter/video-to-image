@@ -72,7 +72,11 @@ type Deps struct {
 	// TrustedProxies are the reverse proxies whose X-Forwarded-For / X-Real-IP headers
 	// are believed (see clientAddr; build it with ParseTrustedProxies). Empty → the TCP
 	// peer is the client.
-	TrustedProxies      []netip.Prefix
+	TrustedProxies []netip.Prefix
+	// ClientIPHeader names a header carrying the visitor address set by the CDN in
+	// front of the trusted proxies (e.g. "CF-Connecting-IP"). Honoured only from a
+	// trusted peer; "" disables it.
+	ClientIPHeader      string
 	StatusRatePerMinute int // per client per domain for GET job / file routes
 	// MaxConcurrentUploads caps uploads being received at once, across all clients
 	// (each spools up to maxUploadBytes to ScratchDir). Beyond it: 503 SERVER_BUSY.

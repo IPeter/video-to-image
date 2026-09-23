@@ -1,0 +1,17 @@
+# Postgres only accepts connections from v2i's own pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-from-v2i-only
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - { key: app.kubernetes.io/name, operator: In, values: [v2i-api, v2i-worker] }
+      ports:
+        - { port: 5432, protocol: TCP }

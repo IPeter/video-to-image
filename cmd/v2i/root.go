@@ -126,6 +126,7 @@ func newServeCmd() *cobra.Command {
 				InternalToken:        cfg.InternalToken,
 				IPHashSalt:           cfg.IPHashSalt,
 				TrustedProxies:       trusted,
+				ClientIPHeader:       cfg.ClientIPHeader,
 				StatusRatePerMinute:  cfg.StatusRatePerMinute,
 				MaxConcurrentUploads: cfg.MaxConcurrentUploads,
 				MaxUploadsPerClient:  cfg.MaxUploadsPerClient,

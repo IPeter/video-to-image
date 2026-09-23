@@ -1,0 +1,27 @@
+# Base manifests for v2i (plan/10-deployment-k3s.md). Environment-specific settings
+# (hosts, secrets, image tags, limits) live in overlays/.
+#
+# The domain configs are read from ../../../configs/domains (the repo's source of
+# truth), so render with:
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/<env>
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: v2i
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: v2i
+    includeSelectors: false
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - storage.yaml
+  - api.yaml
+  - worker.yaml
+  - web-cars.yaml
+  - networkpolicy.yaml
+configMapGenerator:
+  # One key per domain file; mounted at /etc/v2i/domains in api and worker. The
+  # content hash in the name rolls both Deployments when a prompt changes.
+  - name: v2i-domains
+    files:
+      - ../../../configs/domains/cars.yaml

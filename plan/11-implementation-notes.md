@@ -118,6 +118,28 @@ The public subset also exposes `minShortSidePx`, `maxPixels` and `retentionHours
 - Extra states: deletion confirmation, expired-while-open, 429/503 with a countdown from
   `Retry-After`, screen-reader announcements on terminal states.
 
+## Deployment (Phase 3, first cut — 2026-09-23)
+
+Live at `https://cardealer.peterilles.com` on the home k3s node; details and runbook in
+`deploy/k8s/README.md`. Differences from plan/10:
+
+- One host for web and API (path routing: `/v1`, `/openapi.json`, `/docs` → API, `/` →
+  web): same origin, no CORS, and Traefik **basic auth** (a requirement added at deploy
+  time) covers everything.
+- TLS terminates at Cloudflare; traffic arrives through the locally managed Cloudflare
+  Tunnel on the node (`/etc/cloudflared/config.yml`, rule added for the new host), like
+  the other `*.peterilles.com` apps; no cert-manager, no open router ports. Cloudflare caps request bodies at 100 MB on Free/Pro, so
+  `V2I_MAX_UPLOAD_BYTES` caps uploads at 95 MiB for this deployment. Client IPs come from
+  `CF-Connecting-IP` (`V2I_CLIENT_IP_HEADER`), trusted only from the Traefik pod network.
+- Storage is a `local-path` PVC shared by api and worker (`V2I_STORAGE=local`) instead of
+  MinIO: single node, fewer moving parts. `V2I_STORAGE=s3` switches without code changes.
+- No registry: `deploy.sh` streams images into the node's containerd via
+  `kubectl debug node`. Migrations run as init containers (serialised by an advisory
+  lock) instead of a separate Job. Secrets are git-ignored env files rendered by
+  kustomize's secretGenerator (SealedSecrets/SOPS later).
+- Direct-to-storage upload (decision 9) is not done; with Cloudflare in front it would not
+  lift the 100 MB cap anyway unless the upload host is DNS-only.
+
 ## Operations
 
 - Local compose uses host ports 55432 (Postgres) and 59000/59001 (MinIO). MinIO images

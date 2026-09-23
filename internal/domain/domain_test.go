@@ -121,3 +121,14 @@ func TestShotLabel(t *testing.T) {
 	assert.Equal(t, "Other", cars.ShotLabel(OtherShotID))
 	assert.Equal(t, "mystery", cars.ShotLabel("mystery"))
 }
+
+func TestCapUploadBytes(t *testing.T) {
+	reg, err := LoadDir(filepath.Join("..", "..", "configs", "domains"))
+	require.NoError(t, err)
+	assert.Nil(t, reg.CapUploadBytes(0), "0 disables the cap")
+	assert.Equal(t, []string{"cars"}, reg.CapUploadBytes(95<<20))
+	cars, _ := reg.Get("cars")
+	assert.Equal(t, int64(95<<20), cars.Limits.MaxUploadBytes)
+	assert.Equal(t, int64(95<<20), cars.Public().Limits.MaxUploadBytes, "the frontend sees the effective limit")
+	assert.Empty(t, reg.CapUploadBytes(1<<40), "never raises a limit")
+}

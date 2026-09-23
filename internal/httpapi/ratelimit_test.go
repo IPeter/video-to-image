@@ -427,6 +427,34 @@ func TestClientIP(t *testing.T) {
 	}
 }
 
+// Behind Cloudflare → Traefik the CDN states the visitor in CF-Connecting-IP; it is
+// honoured only from a trusted peer, so a direct client cannot pick its own bucket.
+func TestClientIPHeader(t *testing.T) {
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.42.0.0/16")}
+	cases := []struct {
+		name, remote, cf, xff, want string
+	}{
+		{name: "trusted peer: header wins over xff", remote: "10.42.0.139:1", cf: "198.51.100.7", xff: "162.158.1.1", want: "198.51.100.7"},
+		{name: "trusted peer: v6 header", remote: "10.42.0.139:1", cf: "2001:db8::5", want: "2001:db8::5"},
+		{name: "trusted peer: garbage header falls back to xff", remote: "10.42.0.139:1", cf: "nope", xff: "162.158.1.1", want: "162.158.1.1"},
+		{name: "untrusted peer: header ignored", remote: "192.0.2.1:1", cf: "198.51.100.7", want: "192.0.2.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{d: Deps{TrustedProxies: trusted, ClientIPHeader: "CF-Connecting-IP"}, ipKey: []byte(testSalt)}
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = tc.remote
+			if tc.cf != "" {
+				r.Header.Set("CF-Connecting-IP", tc.cf)
+			}
+			if tc.xff != "" {
+				r.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			assert.Equal(t, tc.want, s.clientIP(r))
+		})
+	}
+}
+
 func TestParseTrustedProxies(t *testing.T) {
 	got, err := ParseTrustedProxies([]string{" 10.42.0.0/16 ", "", "192.168.1.7", "fd00::/8", "2001:db8::1", "::ffff:172.16.0.0/108", "10.1.2.3/8"})
 	require.NoError(t, err)

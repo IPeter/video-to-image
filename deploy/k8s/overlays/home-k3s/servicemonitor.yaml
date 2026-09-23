@@ -1,0 +1,15 @@
+# Scraped by the existing kube-prometheus-stack (selects release=kube-prometheus-stack).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: v2i
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchExpressions:
+      - { key: app.kubernetes.io/name, operator: In, values: [v2i-api, v2i-worker] }
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: 30s

@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: v2i-worker
+  labels:
+    app.kubernetes.io/name: v2i-worker
+spec:
+  selector:
+    app.kubernetes.io/name: v2i-worker
+  ports:
+    - name: admin
+      port: 4001
+      targetPort: admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: v2i-worker
+  labels:
+    app.kubernetes.io/name: v2i-worker
+spec:
+  replicas: 1 # CPU-bound; pipeline concurrency is V2I_PIPELINE_WORKERS
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: v2i-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: v2i-worker
+    spec:
+      automountServiceAccountToken: false
+      # Graceful stop waits for running jobs up to V2I_SHUTDOWN_TIMEOUT (30 s) + hard stop.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        - name: migrate
+          image: v2i
+          args: ["migrate"]
+          envFrom:
+            - configMapRef: { name: v2i-env }
+            - secretRef: { name: v2i-secrets }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: worker
+          image: v2i
+          args: ["work"]
+          ports:
+            - { name: admin, containerPort: 4001 }
+          envFrom:
+            - configMapRef: { name: v2i-env }
+            - secretRef: { name: v2i-secrets }
+            - secretRef: { name: v2i-gemini } # only the worker talks to the model
+          livenessProbe:
+            httpGet: { path: /livez, port: admin }
+            periodSeconds: 20
+          resources: # FFmpeg is the hog (plan/10); FFMPEG_THREADS bounds it per process
+            requests: { cpu: "1", memory: 1Gi }
+            limits: { cpu: "4", memory: 4Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: domains, mountPath: /etc/v2i/domains, readOnly: true }
+            - { name: data, mountPath: /data }
+            - { name: scratch, mountPath: /scratch }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: domains
+          configMap: { name: v2i-domains }
+        - name: data
+          persistentVolumeClaim: { claimName: v2i-data }
+        - name: scratch # per-job frames + preview; deleted per job
+          emptyDir: { sizeLimit: 10Gi }
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }

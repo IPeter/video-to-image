@@ -85,6 +85,12 @@ e2e: ## Playwright e2e (next dev) against a running `make dev-fake`
 e2e-prod: ## Playwright e2e against the production standalone build
 	cd web && $(PNPM) test:e2e:prod
 
+## ---- deploy ----
+
+.PHONY: deploy-home
+deploy-home: ## Build, load and apply to the home k3s cluster (deploy/k8s/README.md)
+	./deploy/k8s/deploy.sh
+
 ## ---- build ----
 
 .PHONY: build image image-v2i image-web

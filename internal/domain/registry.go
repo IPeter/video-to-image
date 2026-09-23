@@ -37,6 +37,24 @@ func (r *Registry) Get(key string) (*Config, bool) {
 	return c, ok
 }
 
+// CapUploadBytes lowers every domain's limits.maxUploadBytes to max (when max > 0 and
+// the domain allows more). It is a deployment constraint, not domain behaviour: e.g.
+// Cloudflare's proxy rejects request bodies above 100 MB on Free/Pro plans. Call it
+// once at startup, before the registry is shared. Returns the keys that were lowered.
+func (r *Registry) CapUploadBytes(max int64) []string {
+	if max <= 0 {
+		return nil
+	}
+	var lowered []string
+	for _, k := range r.keys {
+		if c := r.byKey[k]; c.Limits.MaxUploadBytes > max {
+			c.Limits.MaxUploadBytes = max
+			lowered = append(lowered, k)
+		}
+	}
+	return lowered
+}
+
 // Keys returns all domain keys, sorted.
 func (r *Registry) Keys() []string { return append([]string(nil), r.keys...) }
 
