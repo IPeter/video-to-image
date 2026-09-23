@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+# One image for `v2i serve`, `v2i work` and `v2i migrate` (the Kubernetes Deployment
+# picks the subcommand via args). Build context: repository root.
+#   docker build -f deploy/docker/Dockerfile.v2i --build-arg VERSION=$(git rev-parse --short HEAD) -t v2i .
+
+FROM golang:1.27-trixie AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+COPY migrations ./migrations
+ARG VERSION=dev
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/v2i ./cmd/v2i
+
+FROM debian:trixie-slim
+# FFmpeg is pinned to the 7.1 series shipped by Debian trixie; bump deliberately and
+# re-run the media tests (rotation handling and seek accuracy depend on it).
+# Note: Debian's ffmpeg pulls in mesa/SDL/PulseAudio via libavdevice (~550 MB image).
+# A pinned static ffmpeg build would shrink it to ~150 MB; revisit in Phase 3.
+ARG FFMPEG_VERSION=7:7.1.*
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends "ffmpeg=${FFMPEG_VERSION}" ca-certificates tini \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin v2i \
+ && mkdir -p /scratch /data && chown v2i:v2i /scratch /data
+COPY --from=build /out/v2i /usr/local/bin/v2i
+# Baked-in domain configs; on Kubernetes a ConfigMap is mounted over this directory.
+COPY configs/domains /etc/v2i/domains
+# Local-disk storage is for single-node/smoke runs; Kubernetes uses V2I_STORAGE=s3.
+ENV V2I_DOMAINS_DIR=/etc/v2i/domains \
+    V2I_SCRATCH_DIR=/scratch \
+    V2I_STORAGE_DIR=/data/storage \
+    V2I_LOG_FORMAT=json
+WORKDIR /data
+USER 10001:10001
+EXPOSE 4000 4001
+ENTRYPOINT ["/usr/bin/tini", "--", "v2i"]
+CMD ["serve"]

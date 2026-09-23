@@ -1,0 +1,108 @@
+key: cars
+name: Car Listing Photos
+allowedOrigins:
+  - http://localhost:3000
+  - https://cars.home.example        # k3s ingress host, change to the real domain later
+
+limits:
+  maxUploadBytes: 524288000          # 500 MB
+  maxDurationSec: 180
+  minDurationSec: 5
+  minShortSidePx: 480
+  maxCandidateFrames: 300
+  ratePerIpPerHour: 10
+  maxPixels: 8912896                 # 4096x2176; rejects decode bombs (RESOLUTION_TOO_HIGH)
+  maxFps: 120
+
+model:
+  name: gemini-3.5-flash-lite
+  temperature: 0.2
+  # No reasoning for the cheap call. gemini-3.5-flash-lite rejects thinkingBudget: 0;
+  # when switching to gemini-3.8-flash use `thinkingBudget: 0` instead (it rejects minimal).
+  thinkingLevel: minimal
+  previewHeight: 480
+  previewFps: 2
+  maxOutputTokens: 4096
+
+gate:
+  subject: >-
+    a single passenger vehicle (car, SUV, van or pickup) being shown or walked around,
+    as for a sales listing
+  minConfidence: 0.6
+  instructions: |
+    Pass if the main subject throughout most of the video is one vehicle, filmed from
+    outside and/or inside, stationary or slowly moving, in a lot, garage, street or studio.
+    Fail if: the video is mainly people, scenery, a house or room, a motorcycle or bicycle,
+    a racing or driving clip where the car is not the subject being presented, a screen
+    recording, or if multiple different vehicles are shown with no clear single subject.
+
+shots:
+  - id: front_three_quarter
+    label: Front 3/4
+    required: true
+    description: Front and one side visible at roughly 45°, whole car in frame; this is the hero shot
+  - id: side_profile
+    label: Side profile
+    required: true
+    description: Full side of the car, perpendicular, wheels and roofline fully visible
+  - id: rear_three_quarter
+    label: Rear 3/4
+    required: true
+    description: Rear and one side at roughly 45°, whole car in frame
+  - id: interior_dashboard
+    label: Dashboard
+    required: true
+    description: Driver's seat view of dashboard, steering wheel and center console
+  - id: front
+    label: Front
+    description: Straight-on front showing grille, headlights and badge
+  - id: rear
+    label: Rear
+    description: Straight-on rear showing tail lights, badge and bumper
+  - id: interior_front_seats
+    label: Front seats
+    description: Front seats and upholstery from an open door
+  - id: interior_rear_seats
+    label: Rear seats
+    description: Rear bench and legroom
+  - id: odometer
+    label: Odometer
+    description: Instrument cluster with mileage readable, screen lit
+  - id: wheel
+    label: Wheel & tyre
+    description: Close-up of one wheel showing rim and tyre condition
+  - id: engine_bay
+    label: Engine bay
+    description: Open hood showing the engine
+  - id: trunk
+    label: Trunk / boot
+    description: Open trunk showing cargo space
+  - id: detail
+    label: Detail
+    description: Badges, headlights, infotainment screen or other notable detail
+
+selection:
+  imageCount: 8
+  maxScenes: 20
+  sampleFps: 4
+  modelRerank: false
+  dedupeMaxHamming: 6
+  weights:
+    relevance: 0.5
+    sharpness: 0.4
+    exposure: 0.1
+  instructions: |
+    You are selecting moments for a used-car sales listing. Prefer moments where the whole
+    car (or the whole interior area) is in frame, the camera is steady, nothing blocks the
+    view (no people, hands, or door frames cutting the car), and lighting shows the paint
+    and condition honestly. Avoid moments with heavy motion blur, strong glare on windows or
+    paint, and moments where the car is cut off by the frame edge. If the video has both
+    exterior and interior footage, include both. Only fill shots you can actually see; do
+    not guess.
+
+retentionHours: 24
+
+copy:
+  uploadTitle: Upload a walkaround video of the car
+  uploadHint: 30–120 seconds. Walk slowly around the outside, then film the interior. MP4 or MOV, up to 500 MB.
+  rejectedTitle: This doesn't look like a car video

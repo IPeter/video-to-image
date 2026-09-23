@@ -1,0 +1,1485 @@
+{
+  "components": {
+    "schemas": {
+      "APIError": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "Copy": {
+        "additionalProperties": false,
+        "properties": {
+          "rejectedTitle": {
+            "type": "string"
+          },
+          "uploadHint": {
+            "type": "string"
+          },
+          "uploadTitle": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "uploadTitle",
+          "uploadHint",
+          "rejectedTitle"
+        ],
+        "type": "object"
+      },
+      "CreateJobResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "jobId": {
+            "examples": [
+              "job_01J8ZK3M2Q7K2M9QXA4B5C6D7E"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "description": "Job status.",
+            "enum": [
+              "queued",
+              "processing",
+              "completed",
+              "rejected",
+              "failed",
+              "expired"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "jobId",
+          "status"
+        ],
+        "type": "object"
+      },
+      "ErrorDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "description": "Stable machine-readable error code.",
+            "enum": [
+              "DOMAIN_NOT_FOUND",
+              "ORIGIN_NOT_ALLOWED",
+              "UNAUTHORIZED",
+              "INVALID_REQUEST",
+              "UPLOAD_TOO_LARGE",
+              "UNSUPPORTED_FORMAT",
+              "CANNOT_DECODE",
+              "TOO_LONG",
+              "TOO_SHORT",
+              "RESOLUTION_TOO_LOW",
+              "RESOLUTION_TOO_HIGH",
+              "SERVER_BUSY",
+              "RATE_LIMITED",
+              "JOB_NOT_FOUND",
+              "IMAGE_NOT_FOUND",
+              "NOT_READY",
+              "EXPIRED",
+              "MODEL_UNAVAILABLE",
+              "MODEL_BAD_OUTPUT",
+              "PROCESSING_ERROR",
+              "NOT_FOUND",
+              "INTERNAL_ERROR"
+            ],
+            "type": "string"
+          },
+          "details": {},
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "Job": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "domainKey": {
+            "type": "string"
+          },
+          "error": {
+            "$ref": "#/components/schemas/JobError"
+          },
+          "expiresAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "jobId": {
+            "type": "string"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/Progress"
+          },
+          "rejection": {
+            "$ref": "#/components/schemas/Rejection"
+          },
+          "result": {
+            "$ref": "#/components/schemas/JobResult"
+          },
+          "status": {
+            "description": "Job status.",
+            "enum": [
+              "queued",
+              "processing",
+              "completed",
+              "rejected",
+              "failed",
+              "expired"
+            ],
+            "type": "string"
+          },
+          "video": {
+            "$ref": "#/components/schemas/VideoInfo"
+          }
+        },
+        "required": [
+          "jobId",
+          "domainKey",
+          "status",
+          "createdAt",
+          "expiresAt",
+          "video",
+          "progress",
+          "result",
+          "rejection",
+          "error"
+        ],
+        "type": "object"
+      },
+      "JobError": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "description": "Why a job failed.",
+            "enum": [
+              "MODEL_UNAVAILABLE",
+              "MODEL_BAD_OUTPUT",
+              "PROCESSING_ERROR"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "JobResult": {
+        "additionalProperties": false,
+        "properties": {
+          "explanation": {
+            "type": "string"
+          },
+          "images": {
+            "items": {
+              "$ref": "#/components/schemas/ResultImage"
+            },
+            "type": "array"
+          },
+          "missingShots": {
+            "description": "Required shots that were not found.",
+            "items": {
+              "$ref": "#/components/schemas/ShotRef"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "zipUrl": {
+            "description": "All images + manifest.json; null when there are no images.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "summary",
+          "images",
+          "missingShots",
+          "explanation",
+          "zipUrl"
+        ],
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "Progress": {
+        "additionalProperties": false,
+        "properties": {
+          "percent": {
+            "format": "int64",
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "step": {
+            "description": "The step currently running, null when none is.",
+            "enum": [
+              "preview",
+              "analyze",
+              "extract",
+              "score",
+              "select",
+              "export"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/ProgressStep"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "step",
+          "percent",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "ProgressStep": {
+        "additionalProperties": false,
+        "properties": {
+          "ms": {
+            "description": "Duration in milliseconds, set once the step finished.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "description": "Pipeline step.",
+            "enum": [
+              "preview",
+              "analyze",
+              "extract",
+              "score",
+              "select",
+              "export"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "description": "Step status.",
+            "enum": [
+              "pending",
+              "running",
+              "done",
+              "failed",
+              "skipped"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status"
+        ],
+        "type": "object"
+      },
+      "PublicDomain": {
+        "additionalProperties": false,
+        "properties": {
+          "copy": {
+            "$ref": "#/components/schemas/Copy"
+          },
+          "imageCount": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/PublicLimits"
+          },
+          "name": {
+            "type": "string"
+          },
+          "retentionHours": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "shots": {
+            "items": {
+              "$ref": "#/components/schemas/PublicShot"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "name",
+          "limits",
+          "shots",
+          "imageCount",
+          "retentionHours",
+          "copy"
+        ],
+        "type": "object"
+      },
+      "PublicLimits": {
+        "additionalProperties": false,
+        "properties": {
+          "maxDurationSec": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "maxPixels": {
+            "description": "Maximum width × height of an accepted video.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "maxUploadBytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "minDurationSec": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "minShortSidePx": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "maxUploadBytes",
+          "maxDurationSec",
+          "minDurationSec",
+          "minShortSidePx",
+          "maxPixels"
+        ],
+        "type": "object"
+      },
+      "PublicShot": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "required"
+        ],
+        "type": "object"
+      },
+      "Rejection": {
+        "additionalProperties": false,
+        "properties": {
+          "detectedSubject": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "detectedSubject"
+        ],
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "ResultImage": {
+        "additionalProperties": false,
+        "properties": {
+          "downloadUrl": {
+            "description": "Same as url with ?download=1 (Content-Disposition: attachment).",
+            "type": "string"
+          },
+          "fileName": {
+            "examples": [
+              "cars_7K2M9QXA_1_front_three_quarter_00-06.jpg"
+            ],
+            "type": "string"
+          },
+          "height": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "index": {
+            "description": "1-based display order (shot-list order).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "shotId": {
+            "type": "string"
+          },
+          "shotLabel": {
+            "type": "string"
+          },
+          "thumbnailUrl": {
+            "description": "640 px wide JPG, relative to the API base URL.",
+            "type": "string"
+          },
+          "timestampLabel": {
+            "examples": [
+              "00:06"
+            ],
+            "type": "string"
+          },
+          "timestampSec": {
+            "format": "double",
+            "type": "number"
+          },
+          "url": {
+            "description": "Full-resolution JPG, relative to the API base URL.",
+            "type": "string"
+          },
+          "width": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "index",
+          "shotId",
+          "shotLabel",
+          "timestampSec",
+          "timestampLabel",
+          "width",
+          "height",
+          "reason",
+          "fileName",
+          "url",
+          "downloadUrl",
+          "thumbnailUrl"
+        ],
+        "type": "object"
+      },
+      "ShotRef": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "type": "object"
+      },
+      "UsageReport": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "description": "00:00 UTC of the first day (inclusive).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/UsageRow"
+            },
+            "type": "array"
+          },
+          "to": {
+            "description": "00:00 UTC of the last day (inclusive).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "totalCostUsd": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "rows",
+          "totalCostUsd"
+        ],
+        "type": "object"
+      },
+      "UsageRow": {
+        "additionalProperties": false,
+        "properties": {
+          "calls": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "costUsd": {
+            "format": "double",
+            "type": "number"
+          },
+          "day": {
+            "examples": [
+              "2026-09-23"
+            ],
+            "type": "string"
+          },
+          "domainKey": {
+            "type": "string"
+          },
+          "inputTokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "jobs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "outputTokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "thinkingTokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "videoSeconds": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "day",
+          "domainKey",
+          "jobs",
+          "calls",
+          "inputTokens",
+          "outputTokens",
+          "thinkingTokens",
+          "videoSeconds",
+          "costUsd"
+        ],
+        "type": "object"
+      },
+      "VideoInfo": {
+        "additionalProperties": false,
+        "properties": {
+          "durationSec": {
+            "format": "double",
+            "type": "number"
+          },
+          "fps": {
+            "format": "double",
+            "type": "number"
+          },
+          "height": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "width": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "durationSec",
+          "width",
+          "height",
+          "fps"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Video-to-image backend. One API, many domain frontends. See plan/05-api.md.",
+    "title": "v2i API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/internal/usage": {
+      "get": {
+        "operationId": "getUsage",
+        "parameters": [
+          {
+            "description": "Internal token (V2I_INTERNAL_TOKEN).",
+            "in": "header",
+            "name": "X-Internal-Token",
+            "schema": {
+              "description": "Internal token (V2I_INTERNAL_TOKEN).",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Start day (YYYY-MM-DD, UTC, inclusive). Default: 7 days ago.",
+            "explode": false,
+            "in": "query",
+            "name": "from",
+            "schema": {
+              "description": "Start day (YYYY-MM-DD, UTC, inclusive). Default: 7 days ago.",
+              "type": "string"
+            }
+          },
+          {
+            "description": "End day (YYYY-MM-DD, UTC, inclusive). Default: today.",
+            "explode": false,
+            "in": "query",
+            "name": "to",
+            "schema": {
+              "description": "End day (YYYY-MM-DD, UTC, inclusive). Default: today.",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Restrict to one domain.",
+            "explode": false,
+            "in": "query",
+            "name": "domainKey",
+            "schema": {
+              "description": "Restrict to one domain.",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageReport"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Token and cost totals per domain per day",
+        "tags": [
+          "internal"
+        ]
+      }
+    },
+    "/v1/domains/{domainKey}": {
+      "get": {
+        "description": "Limits, shot list, image count and copy for the frontend. Cached for 5 minutes.",
+        "operationId": "getDomain",
+        "parameters": [
+          {
+            "description": "Domain key, e.g. cars.",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "description": "Domain key, e.g. cars.",
+              "examples": [
+                "cars"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicDomain"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Public domain config",
+        "tags": [
+          "domains"
+        ]
+      }
+    },
+    "/v1/domains/{domainKey}/jobs": {
+      "post": {
+        "description": "multipart/form-data with one field `video`. Streams to storage, validates with ffprobe, enqueues.",
+        "operationId": "createJob",
+        "parameters": [
+          {
+            "example": "cars",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "video": {
+                    "contentMediaType": "application/octet-stream",
+                    "format": "binary",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "video"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateJobResponse"
+                }
+              }
+            },
+            "description": "Accepted"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "UNSUPPORTED_FORMAT | CANNOT_DECODE | TOO_LONG | TOO_SHORT | RESOLUTION_TOO_LOW | RESOLUTION_TOO_HIGH | INVALID_REQUEST"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "ORIGIN_NOT_ALLOWED"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "DOMAIN_NOT_FOUND"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "UPLOAD_TOO_LARGE"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "RATE_LIMITED"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "INTERNAL_ERROR"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "SERVER_BUSY"
+          }
+        },
+        "summary": "Upload a video and start a job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/domains/{domainKey}/jobs/{jobId}": {
+      "delete": {
+        "description": "User-initiated early deletion. Removes files and sets status expired.",
+        "operationId": "deleteJob",
+        "parameters": [
+          {
+            "description": "Domain key, e.g. cars.",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "description": "Domain key, e.g. cars.",
+              "examples": [
+                "cars"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Job ID (job_ + ULID).",
+            "in": "path",
+            "name": "jobId",
+            "required": true,
+            "schema": {
+              "description": "Job ID (job_ + ULID).",
+              "examples": [
+                "job_01J8ZK3M2Q7K2M9QXA4B5C6D7E"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Delete a job's files now",
+        "tags": [
+          "jobs"
+        ]
+      },
+      "get": {
+        "description": "Poll every 1.5 s while queued/processing. 410 EXPIRED once files are cleaned up.",
+        "operationId": "getJob",
+        "parameters": [
+          {
+            "description": "Domain key, e.g. cars.",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "description": "Domain key, e.g. cars.",
+              "examples": [
+                "cars"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Job ID (job_ + ULID).",
+            "in": "path",
+            "name": "jobId",
+            "required": true,
+            "schema": {
+              "description": "Job ID (job_ + ULID).",
+              "examples": [
+                "job_01J8ZK3M2Q7K2M9QXA4B5C6D7E"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Gone"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Job status and result",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/domains/{domainKey}/jobs/{jobId}/download.zip": {
+      "get": {
+        "operationId": "downloadZip",
+        "parameters": [
+          {
+            "example": "cars",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "jobId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/zip": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "ZIP archive"
+          },
+          "302": {
+            "description": "Redirect to a presigned storage URL (S3 deployments)."
+          },
+          "304": {
+            "description": "Not modified (If-None-Match matched the ETag)."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "ORIGIN_NOT_ALLOWED"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "DOMAIN_NOT_FOUND | JOB_NOT_FOUND | NOT_FOUND"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "NOT_READY"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "EXPIRED"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "RATE_LIMITED"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "INTERNAL_ERROR"
+          }
+        },
+        "summary": "All images + manifest.json as a ZIP",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}": {
+      "get": {
+        "operationId": "getImage",
+        "parameters": [
+          {
+            "example": "cars",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "jobId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "imageId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1 → Content-Disposition: attachment with the listing file name.",
+            "in": "query",
+            "name": "download",
+            "schema": {
+              "enum": [
+                "1"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/jpeg": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "JPEG image"
+          },
+          "302": {
+            "description": "Redirect to a presigned storage URL (S3 deployments)."
+          },
+          "304": {
+            "description": "Not modified (If-None-Match matched the ETag)."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "ORIGIN_NOT_ALLOWED"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "DOMAIN_NOT_FOUND | JOB_NOT_FOUND | IMAGE_NOT_FOUND"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "EXPIRED"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "RATE_LIMITED"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "INTERNAL_ERROR"
+          }
+        },
+        "summary": "Full-resolution JPG",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}/thumb": {
+      "get": {
+        "operationId": "getThumbnail",
+        "parameters": [
+          {
+            "example": "cars",
+            "in": "path",
+            "name": "domainKey",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "jobId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "imageId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1 → Content-Disposition: attachment with the listing file name.",
+            "in": "query",
+            "name": "download",
+            "schema": {
+              "enum": [
+                "1"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/jpeg": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "JPEG image"
+          },
+          "302": {
+            "description": "Redirect to a presigned storage URL (S3 deployments)."
+          },
+          "304": {
+            "description": "Not modified (If-None-Match matched the ETag)."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "ORIGIN_NOT_ALLOWED"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "DOMAIN_NOT_FOUND | JOB_NOT_FOUND | IMAGE_NOT_FOUND"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "EXPIRED"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "RATE_LIMITED"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIError"
+                }
+              }
+            },
+            "description": "INTERNAL_ERROR"
+          }
+        },
+        "summary": "640 px thumbnail JPG",
+        "tags": [
+          "files"
+        ]
+      }
+    }
+  }
+}

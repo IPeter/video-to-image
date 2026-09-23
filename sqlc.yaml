@@ -1,0 +1,23 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema: migrations
+    queries: internal/store/queries
+    gen:
+      go:
+        package: sqlcdb
+        out: internal/store/sqlcdb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_empty_slices: true
+        emit_pointers_for_null_types: true
+        overrides:
+          # Timestamps are never ±infinity in this schema, so plain time.Time is enough.
+          - db_type: "timestamptz"
+            go_type: "time.Time"
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              import: "time"
+              type: "Time"
+              pointer: true

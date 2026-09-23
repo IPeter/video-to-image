@@ -1,0 +1,31 @@
+# Go
+/bin/
+/dist/
+*.test
+coverage.out
+
+# Local runtime data
+/data/
+/report/
+.env
+
+# Test fixtures that are generated (scripts/gen-fixtures.sh)
+/testdata/videos/*.mp4
+/testdata/videos/*.mov
+
+# Frontend
+/web/node_modules/
+/web/.next/
+/web/out/
+/web/test-results/
+/web/playwright-report/
+/web/.env*.local
+/web/next-env.d.ts
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+/testdata/videos/*.txt
+/web/tsconfig.tsbuildinfo
+.playwright-mcp/

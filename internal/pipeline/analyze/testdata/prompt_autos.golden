@@ -1,0 +1,18 @@
+Step 1 — Gate. Decide whether this video primarily shows: a single car, shown for a sales listing.
+Pass if one car is the main subject.
+Fail if it is mainly people or scenery.
+
+Several different cars also fail.
+If it does not, set gate.passed=false, explain briefly in gate.reason, and return an empty scenes array.
+In every case, give a brief explanation of the verdict in gate.reason, set gate.confidence to how sure you are of the verdict (0–1), set gate.detectedSubject to a short noun phrase naming what the video mainly shows, and set videoSummary to one sentence describing the whole video.
+
+Step 2 — Scenes. Only if the gate passed.
+Prefer moments where the whole car is in frame.
+Avoid motion blur.
+
+Shot list (find the best moment for each, if present):
+- front_three_quarter: Front and one side at roughly 45°, whole car in frame
+- side_profile: Full side of the car, perpendicular
+- interior_dashboard: Dashboard, steering wheel and center console
+
+Return up to 5 scenes. For each: start and end time as "MM:SS", the shotId it best fulfils (or "other"), a one-sentence reason, and a relevance score 0–1. Prefer moments where the camera is steady and the subject fills the frame. Avoid near-duplicate moments.

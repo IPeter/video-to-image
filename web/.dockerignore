@@ -1,0 +1,26 @@
+# Build context for deploy/docker/Dockerfile.web is web/. Keep it to the app sources.
+node_modules
+.next
+out
+coverage
+test-results
+playwright-report
+blob-report
+*.tsbuildinfo
+next-env.d.ts
+.env*
+!.env.example
+.DS_Store
+
+# Tests are not part of the image (next build type-checks only what is in the context).
+e2e
+test
+**/*.test.ts
+**/*.test.tsx
+playwright.config.ts
+vitest.config.mts
+
+# Docs and tooling metadata.
+README.md
+AGENTS.md
+CLAUDE.md

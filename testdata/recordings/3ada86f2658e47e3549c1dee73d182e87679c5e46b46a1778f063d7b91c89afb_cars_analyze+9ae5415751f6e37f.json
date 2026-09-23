@@ -1,0 +1,15 @@
+{
+  "cacheKey": "3ada86f2658e47e3549c1dee73d182e87679c5e46b46a1778f063d7b91c89afb:cars:analyze",
+  "step": "analyze",
+  "model": "gemini-3.5-flash-lite",
+  "text": "{\n  \"gate\": {\n    \"passed\": false,\n    \"confidence\": 1.0,\n    \"reason\": \"The video shows an animated simulation of a box-like object moving across color bars, not a real passenger vehicle.\",\n    \"detectedSubject\": \"animated simulation of a vehicle\"\n  },\n  \"videoSummary\": \"The video displays an abstract animated scene with a moving vehicle shape over colorful background bars.\",\n  \"scenes\": []\n}",
+  "usage": {
+    "model": "gemini-3.5-flash-lite",
+    "inputTokens": 4619,
+    "outputTokens": 102,
+    "thinkingTokens": 0,
+    "latencyMs": 1810
+  },
+  "promptSha256": "16521dee2125bea534a05d86325f9dd561cb41b43038710caf792ede2b7bf2d7",
+  "recordedAt": "2026-09-23T11:53:59.895343Z"
+}

@@ -1,0 +1,14 @@
+.git
+.github
+.idea
+.vscode
+.env
+bin
+data
+report
+docs
+plan
+web
+testdata
+api
+**/*_test.go

@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.7
+# Next.js frontend. ONE image serves every domain: DOMAIN_KEY, API_URL and the optional
+# API_INTERNAL_URL are read from the environment at request time (decision 13), so
+# nothing domain-specific is baked in. Build context: web/.
+#   docker build -f deploy/docker/Dockerfile.web -t v2i-web web
+#   docker run --rm -p 3000:3000 -e DOMAIN_KEY=cars -e API_URL=http://localhost:4000 v2i-web
+
+ARG NODE_VERSION=24-alpine
+
+FROM node:${NODE_VERSION} AS deps
+WORKDIR /app
+# Keep in sync with "packageManager" in web/package.json.
+ARG PNPM_VERSION=12.5.1
+RUN npm install -g "pnpm@${PNPM_VERSION}"
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN --mount=type=cache,id=v2i-web-pnpm,target=/pnpm-store \
+    pnpm install --frozen-lockfile --store-dir /pnpm-store
+
+FROM deps AS build
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY . .
+# lib/api.d.ts is committed, so the build does not need the Go OpenAPI spec.
+# check-dynamic fails the image build if any page was prerendered with the build's env.
+RUN pnpm build && node scripts/check-dynamic.mjs
+
+FROM node:${NODE_VERSION} AS runtime
+WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    HOSTNAME=0.0.0.0 \
+    PORT=3000
+# The standalone server contains only the traced runtime files; static assets and
+# public/ are served by it once copied next to it. The runtime user must own .next so the
+# fetch cache (domain config, revalidated every 300 s) can be written at runtime.
+# 1000:1000 is the image's "node" user. It is numeric so Kubernetes can verify
+# `runAsNonRoot: true` (a named USER fails that check).
+COPY --from=build --chown=1000:1000 /app/.next/standalone ./
+COPY --from=build --chown=1000:1000 /app/.next/static ./.next/static
+COPY --from=build --chown=1000:1000 /app/public ./public
+USER 1000:1000
+EXPOSE 3000
+# /api/readyz: 503 while DOMAIN_KEY / API_URL are missing or invalid (it never calls the
+# API). Kubernetes probes: livenessProbe /api/healthz, readinessProbe /api/readyz.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+  CMD wget -q -O /dev/null "http://127.0.0.1:${PORT}/api/readyz" || exit 1
+CMD ["node", "server.js"]

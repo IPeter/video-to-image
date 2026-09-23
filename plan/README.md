@@ -23,6 +23,7 @@ a multi-domain architecture and an implementation plan. The first domain is a **
 | [08-roadmap.md](08-roadmap.md) | Phased milestones, MVP definition, evaluation plan, cost controls |
 | [09-decisions.md](09-decisions.md) | The 13 decisions taken on 2026-09-23, with the alternatives that were rejected |
 | [10-deployment-k3s.md](10-deployment-k3s.md) | Kubernetes layout for the home k3s cluster: workloads, ingress, storage, secrets, image build |
+| [11-implementation-notes.md](11-implementation-notes.md) | What Phase 0 + 1 implemented differently or in addition, and what is still open |
 
 ## Decisions made (see `09-decisions.md` for the full list)
 
