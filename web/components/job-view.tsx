@@ -23,22 +23,32 @@ import { useDeadlinePassed } from "@/hooks/use-deadline";
 import { useNow } from "@/hooks/use-now";
 import { ApiError, isTerminalStatus, isTransientError, type Job } from "@/lib/api";
 import { elapsedSeconds, pluralize } from "@/lib/format";
+import { isStudioInProgress } from "@/lib/studio";
 
 /** Poll interval while a job is queued or processing (plan/07-frontend.md). */
 export const POLL_INTERVAL_MS = 1500;
+/**
+ * A completed job whose studio backgrounds are still being made is polled this many
+ * times slower: they take several seconds per photo, and the originals are already shown.
+ */
+export const STUDIO_POLL_SLOWDOWN = 2;
 const MAX_RETRY_DELAY_MS = 15_000;
 
 export function jobQueryKey(domainKey: string, jobId: string) {
   return ["job", domainKey, jobId] as const;
 }
 
-/** refetchInterval: poll until the job is terminal or the API gave a final answer. */
+/**
+ * refetchInterval: poll until the job is terminal or the API gave a final answer; a
+ * completed job keeps being polled (more slowly) while its studio backgrounds are made.
+ */
 export function jobRefetchInterval(
   data: Job | undefined,
   error: unknown,
   intervalMs: number = POLL_INTERVAL_MS,
 ): number | false {
   if (error && !isTransientError(error)) return false;
+  if (data?.status === "completed" && isStudioInProgress(data.studio)) return intervalMs * STUDIO_POLL_SLOWDOWN;
   if (data && isTerminalStatus(data.status)) return false;
   return intervalMs;
 }
@@ -195,6 +205,7 @@ export function JobView({ jobId, pollIntervalMs = POLL_INTERVAL_MS }: JobViewPro
               expiresAt={job.expiresAt}
               apiBaseUrl={api.baseUrl}
               usage={job.usage}
+              studio={job.studio}
               onDeleteNow={() => deletion.mutate()}
               deleting={deletion.isPending}
               notice={

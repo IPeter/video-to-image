@@ -25,10 +25,15 @@ func (q *Queries) DeleteSelectedImages(ctx context.Context, jobID string) (int64
 
 const expireSelectedImages = `-- name: ExpireSelectedImages :execrows
 UPDATE selected_images
-SET image_path = NULL, thumb_path = NULL
-WHERE job_id = $1 AND (image_path IS NOT NULL OR thumb_path IS NOT NULL)
+SET image_path = NULL,
+    thumb_path = NULL,
+    studio     = CASE WHEN studio IS NULL THEN NULL ELSE studio - 'styles' END
+WHERE job_id = $1
+  AND (image_path IS NOT NULL OR thumb_path IS NOT NULL OR studio -> 'styles' IS NOT NULL)
 `
 
+// The studio outcome keeps its status, reason and diagnostics; its variants (storage
+// keys) go with the files.
 func (q *Queries) ExpireSelectedImages(ctx context.Context, jobID string) (int64, error) {
 	result, err := q.db.Exec(ctx, expireSelectedImages, jobID)
 	if err != nil {
@@ -37,8 +42,28 @@ func (q *Queries) ExpireSelectedImages(ctx context.Context, jobID string) (int64
 	return result.RowsAffected(), nil
 }
 
+const fillImageStudios = `-- name: FillImageStudios :execrows
+UPDATE selected_images
+SET studio = $1
+WHERE job_id = $2 AND studio IS NULL
+`
+
+type FillImageStudiosParams struct {
+	Studio []byte
+	JobID  string
+}
+
+// Gives every image the studio step has not decided about yet (studio NULL) @studio.
+func (q *Queries) FillImageStudios(ctx context.Context, arg FillImageStudiosParams) (int64, error) {
+	result, err := q.db.Exec(ctx, fillImageStudios, arg.Studio, arg.JobID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getSelectedImage = `-- name: GetSelectedImage :one
-SELECT id, job_id, candidate_id, idx, shot_id, timestamp_sec, width, height, reason, file_name, image_path, thumb_path, bytes, rotation, crop FROM selected_images WHERE job_id = $1 AND id = $2
+SELECT id, job_id, candidate_id, idx, shot_id, timestamp_sec, width, height, reason, file_name, image_path, thumb_path, bytes, rotation, crop, subject_box, studio FROM selected_images WHERE job_id = $1 AND id = $2
 `
 
 type GetSelectedImageParams struct {
@@ -65,6 +90,8 @@ func (q *Queries) GetSelectedImage(ctx context.Context, arg GetSelectedImagePara
 		&i.Bytes,
 		&i.Rotation,
 		&i.Crop,
+		&i.SubjectBox,
+		&i.Studio,
 	)
 	return i, err
 }
@@ -85,10 +112,12 @@ type InsertSelectedImagesParams struct {
 	Bytes        int32
 	Rotation     int32
 	Crop         []byte
+	SubjectBox   []byte
+	Studio       []byte
 }
 
 const listSelectedImages = `-- name: ListSelectedImages :many
-SELECT id, job_id, candidate_id, idx, shot_id, timestamp_sec, width, height, reason, file_name, image_path, thumb_path, bytes, rotation, crop FROM selected_images WHERE job_id = $1 ORDER BY idx
+SELECT id, job_id, candidate_id, idx, shot_id, timestamp_sec, width, height, reason, file_name, image_path, thumb_path, bytes, rotation, crop, subject_box, studio FROM selected_images WHERE job_id = $1 ORDER BY idx
 `
 
 func (q *Queries) ListSelectedImages(ctx context.Context, jobID string) ([]SelectedImage, error) {
@@ -116,6 +145,8 @@ func (q *Queries) ListSelectedImages(ctx context.Context, jobID string) ([]Selec
 			&i.Bytes,
 			&i.Rotation,
 			&i.Crop,
+			&i.SubjectBox,
+			&i.Studio,
 		); err != nil {
 			return nil, err
 		}
@@ -125,4 +156,27 @@ func (q *Queries) ListSelectedImages(ctx context.Context, jobID string) ([]Selec
 		return nil, err
 	}
 	return items, nil
+}
+
+const setImageStudio = `-- name: SetImageStudio :execrows
+UPDATE selected_images AS si
+SET studio = $1
+FROM jobs AS j
+WHERE si.job_id = $2 AND si.id = $3
+  AND j.id = si.job_id AND j.status = 'completed' AND j.studio_status = 'running'
+`
+
+type SetImageStudioParams struct {
+	Studio []byte
+	JobID  string
+	ID     string
+}
+
+// Only while the job is completed and its studio work is running.
+func (q *Queries) SetImageStudio(ctx context.Context, arg SetImageStudioParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setImageStudio, arg.Studio, arg.JobID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

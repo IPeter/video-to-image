@@ -19,6 +19,7 @@ import (
 // Worker defaults (plan/06-data-model.md, plan/03-pipeline.md).
 const (
 	DefaultPipelineWorkers   = 2
+	DefaultStudioWorkers     = 1 // the sidecar serves one request at a time
 	DefaultRetentionInterval = 10 * time.Minute
 	DefaultReconcileInterval = 10 * time.Minute
 	// DefaultOrphanGrace: a job is only treated as orphaned once its row has not been
@@ -47,6 +48,12 @@ type WorkerConfig struct {
 	Sweeper analyzer.Sweeper
 	// PipelineWorkers is the pipeline queue's MaxWorkers in this process.
 	PipelineWorkers int
+	// StudioRunner, when set, makes this process work the studio queue (studio
+	// backgrounds; only processes with a segmentation sidecar). nil: the queue is not
+	// registered here.
+	StudioRunner StudioRunner
+	// StudioWorkers is the studio queue's MaxWorkers (0 → DefaultStudioWorkers).
+	StudioWorkers int
 	// DailyCostCeilingUSD > 0 enables the cost guard and the per-job ceiling check.
 	DailyCostCeilingUSD float64
 	Logger              *slog.Logger
@@ -78,7 +85,8 @@ type Worker struct {
 
 // NewWorker builds the worker client. The River tables must exist (store.Migrate).
 //
-// Queues: pipeline (MaxWorkers = PipelineWorkers) and maintenance (MaxWorkers = 1).
+// Queues: pipeline (MaxWorkers = PipelineWorkers), maintenance (MaxWorkers = 1) and,
+// with a StudioRunner, studio (MaxWorkers = StudioWorkers).
 // Periodic jobs, each also run on start (River keeps periodic schedules only in memory,
 // so a job that only ran after a full interval would never run on a worker restarted
 // more often than that): retention, orphan reconciler, cost guard, stats and, when
@@ -123,6 +131,17 @@ func NewWorker(pool *pgxpool.Pool, cfg WorkerConfig) (*Worker, error) {
 	); err != nil {
 		return nil, fmt.Errorf("queue: worker: register workers: %w", err)
 	}
+	queues := map[string]river.QueueConfig{
+		QueuePipeline:    {MaxWorkers: cfg.PipelineWorkers},
+		QueueMaintenance: {MaxWorkers: 1},
+	}
+	if cfg.StudioRunner != nil {
+		studioW := &StudioWorker{Runner: cfg.StudioRunner, Store: cfg.Store, Logger: log.With("worker", StudioArgs{}.Kind())}
+		if err := river.AddWorkerSafely(workers, studioW); err != nil {
+			return nil, fmt.Errorf("queue: worker: register studio worker: %w", err)
+		}
+		queues[QueueStudio] = river.QueueConfig{MaxWorkers: cfg.StudioWorkers}
+	}
 
 	periodic := []*river.PeriodicJob{
 		periodicJob(cfg.RetentionInterval, RetentionArgs{}, true),
@@ -136,11 +155,8 @@ func NewWorker(pool *pgxpool.Pool, cfg WorkerConfig) (*Worker, error) {
 	}
 
 	rcfg := &river.Config{
-		Logger: riverLogger(log),
-		Queues: map[string]river.QueueConfig{
-			QueuePipeline:    {MaxWorkers: cfg.PipelineWorkers},
-			QueueMaintenance: {MaxWorkers: 1},
-		},
+		Logger:               riverLogger(log),
+		Queues:               queues,
 		Workers:              workers,
 		PeriodicJobs:         periodic,
 		RescueStuckJobsAfter: rescueStuckJobsAfter,
@@ -173,9 +189,14 @@ func (c *WorkerConfig) withDefaults() error {
 		return errors.New("queue: worker: Storage is required")
 	case c.PipelineWorkers < 0:
 		return fmt.Errorf("queue: worker: PipelineWorkers must not be negative (got %d)", c.PipelineWorkers)
+	case c.StudioWorkers < 0:
+		return fmt.Errorf("queue: worker: StudioWorkers must not be negative (got %d)", c.StudioWorkers)
 	}
 	if c.PipelineWorkers == 0 {
 		c.PipelineWorkers = DefaultPipelineWorkers
+	}
+	if c.StudioWorkers == 0 {
+		c.StudioWorkers = DefaultStudioWorkers
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()

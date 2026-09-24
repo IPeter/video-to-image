@@ -51,6 +51,36 @@ func (c *Client) EnqueuePipelineTx(ctx context.Context, tx pgx.Tx, jobID string)
 	return nil
 }
 
+// EnqueueStudioTx inserts the studio job for jobID inside tx (the transaction that
+// completes the job, see store.Completion.Enqueue). StudioArgs is unique by args: when a
+// studio job for jobID is already queued or running, the insert is skipped and nil is
+// returned.
+func (c *Client) EnqueueStudioTx(ctx context.Context, tx pgx.Tx, jobID string) error {
+	if jobID == "" {
+		return errors.New("queue: enqueue studio: empty job id")
+	}
+	if tx == nil {
+		return fmt.Errorf("queue: enqueue studio %s: nil transaction", jobID)
+	}
+	if _, err := c.river.InsertTx(ctx, tx, StudioArgs{JobID: jobID}, nil); err != nil {
+		return fmt.Errorf("queue: enqueue studio %s: %w", jobID, err)
+	}
+	return nil
+}
+
+// EnqueueStudio inserts the studio job for jobID in its own transaction (tools, a
+// manual re-run after the job's studio status was reset to pending). Same uniqueness
+// as EnqueueStudioTx.
+func (c *Client) EnqueueStudio(ctx context.Context, jobID string) error {
+	if jobID == "" {
+		return errors.New("queue: enqueue studio: empty job id")
+	}
+	if _, err := c.river.Insert(ctx, StudioArgs{JobID: jobID}, nil); err != nil {
+		return fmt.Errorf("queue: enqueue studio %s: %w", jobID, err)
+	}
+	return nil
+}
+
 // River exposes the underlying River client (queue inspection, tests).
 func (c *Client) River() *river.Client[pgx.Tx] { return c.river }
 

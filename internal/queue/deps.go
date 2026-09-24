@@ -30,6 +30,9 @@ type Store interface {
 	CostSince(ctx context.Context, since time.Time) (float64, error)
 	TableRowEstimates(ctx context.Context) (map[string]int64, error)
 	CountJobsByStatus(ctx context.Context) (map[store.JobStatus]int64, error)
+	AppendInternalLog(ctx context.Context, id, text string) error
+	FailStudio(ctx context.Context, jobID, reason string) error
+	ListOrphanedStudioJobs(ctx context.Context, idleSince time.Time, limit int) ([]store.JobRef, error)
 }
 
 var _ Store = (*store.Store)(nil)

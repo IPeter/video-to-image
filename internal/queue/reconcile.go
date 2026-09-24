@@ -57,8 +57,10 @@ func (w *ReconcileWorker) Work(ctx context.Context, _ *river.Job[ReconcileArgs])
 // Reconcile fails up to ReconcileBatchSize orphaned jobs, oldest first: FailJob
 // (PROCESSING_ERROR, the user-safe message), then SkipRemainingSteps and DeletePrefix of
 // the job's files. A job that became terminal in the meantime (ErrConflict) is skipped.
-// A failing job does not stop the others; the returned error joins the per-job
-// failures. It returns the number of jobs marked failed.
+// Then it fails up to ReconcileBatchSize orphaned studio work items (FailStudio; the job
+// and its original photos are kept). A failing job does not stop the others; the
+// returned error joins the per-job failures. It returns the number of jobs marked
+// failed (pipeline and studio).
 func (w *ReconcileWorker) Reconcile(ctx context.Context) (int, error) {
 	log := logger(w.Logger)
 	grace := w.Grace
@@ -92,6 +94,9 @@ func (w *ReconcileWorker) Reconcile(ctx context.Context) (int, error) {
 	if len(refs) >= ReconcileBatchSize {
 		log.Warn("reconcile: batch full; remaining orphaned jobs are failed on the next run", "batch_size", ReconcileBatchSize)
 	}
+	studioFailed, studioErrs := w.reconcileStudio(ctx, log, idleSince)
+	failed += studioFailed
+	errs = append(errs, studioErrs...)
 	if failed > 0 || len(errs) > 0 {
 		log.Info("reconcile done", "orphans", len(refs), "marked_failed", failed, "errors", len(errs))
 	}
@@ -99,6 +104,43 @@ func (w *ReconcileWorker) Reconcile(ctx context.Context) (int, error) {
 		return failed, nil
 	}
 	return failed, fmt.Errorf("queue: reconcile: %d marked failed, %d errors: %w", failed, len(errs), joinCapped(errs))
+}
+
+// reconcileStudio fails studio work left pending or running without an active River
+// studio job (a worker killed on the final attempt, or a final FailStudio that could not
+// be written). It returns the number marked failed and the per-job errors.
+func (w *ReconcileWorker) reconcileStudio(ctx context.Context, log *slog.Logger, idleSince time.Time) (int, []error) {
+	if err := ctx.Err(); err != nil {
+		return 0, []error{err}
+	}
+	refs, err := w.Store.ListOrphanedStudioJobs(ctx, idleSince, ReconcileBatchSize)
+	if err != nil {
+		return 0, []error{fmt.Errorf("list orphaned studio jobs: %w", err)}
+	}
+	var errs []error
+	failed := 0
+	for _, ref := range refs {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		err := w.Store.FailStudio(ctx, ref.ID, StudioFailReason)
+		switch {
+		case err == nil:
+			failed++
+			log.Warn("reconcile: River gave up on the studio job; studio work marked failed",
+				"job_id", ref.ID, "domain", ref.DomainKey, "previous_studio_status", ref.StudioStatus)
+		case errors.Is(err, store.ErrConflict), errors.Is(err, store.ErrNotFound):
+			log.Info("reconcile: studio work no longer active; skipping", "job_id", ref.ID, "err", err)
+		default:
+			log.Warn("reconcile: orphaned studio work", "job_id", ref.ID, "domain", ref.DomainKey, "err", err)
+			errs = append(errs, fmt.Errorf("fail studio %s: %w", ref.ID, err))
+		}
+	}
+	if len(refs) >= ReconcileBatchSize {
+		log.Warn("reconcile: studio batch full; the rest is failed on the next run", "batch_size", ReconcileBatchSize)
+	}
+	return failed, errs
 }
 
 // failOrphan fails one orphaned job and releases it. marked reports whether this call

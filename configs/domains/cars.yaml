@@ -136,6 +136,18 @@ crop:
   # 720p: 720x540), but not below 480 px.
   minShortSidePx: 1080
 
+# Studio backgrounds for exterior photos (internal/studio): the car is cut out and put on
+# a studio backdrop; car pixels stay the original pixels (no retouching), and the original
+# photo always stays available. Runs after the job completed, only on a worker with the
+# segmentation sidecar (V2I_STUDIO_URL).
+studio:
+  enabled: true
+  # trunk is left out: open tailgate and see-through glass cut out badly.
+  views: [front_three_quarter, side_profile, rear_three_quarter, front, rear]
+  styles: [grey, light, dark]        # display order; dark is never the default (black cars merge)
+  defaultStyle: grey
+  qa: true                           # model check: any missing car part withholds the studio version
+
 retentionHours: 24
 
 copy:

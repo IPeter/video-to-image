@@ -12,6 +12,9 @@ import (
 const (
 	QueuePipeline    = "pipeline"    // MaxWorkers = V2I_PIPELINE_WORKERS (2)
 	QueueMaintenance = "maintenance" // MaxWorkers = 1
+	// QueueStudio runs the studio backgrounds after a job completed (MaxWorkers =
+	// V2I_STUDIO_WORKERS, 1). Only workers with a segmentation sidecar work it.
+	QueueStudio = "studio"
 )
 
 // PipelineMaxAttempts: River retries the whole job only on infrastructure errors
@@ -39,6 +42,30 @@ func (PipelineArgs) InsertOpts() river.InsertOpts {
 	}
 }
 
+// StudioMaxAttempts: River retries a studio job when the segmentation sidecar is
+// unreachable (or on database/storage errors); per-photo failures are recorded on the
+// photo and do not fail the job. Retries resume after the photos already done.
+const StudioMaxAttempts = 3
+
+// StudioTimeout bounds one studio run (about 8 photos at the 45 s per-photo limit).
+const StudioTimeout = 10 * time.Minute
+
+// StudioArgs makes the studio backgrounds of one completed job. The pipeline inserts it
+// in the transaction that completes the job (jobs.studio_status = pending).
+type StudioArgs struct {
+	JobID string `json:"jobId"`
+}
+
+func (StudioArgs) Kind() string { return "studio" }
+
+func (StudioArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		Queue:       QueueStudio,
+		MaxAttempts: StudioMaxAttempts,
+		UniqueOpts:  river.UniqueOpts{ByArgs: true},
+	}
+}
+
 // RetentionArgs: periodic (every 10 min) deletion of expired jobs' files.
 type RetentionArgs struct{}
 
@@ -49,7 +76,8 @@ func (RetentionArgs) InsertOpts() river.InsertOpts {
 
 // ReconcileArgs: periodic (every 10 min) failing of queued/processing jobs whose River
 // pipeline job is gone (discarded, cancelled or deleted without Work marking the job
-// failed, e.g. a worker killed on the final attempt).
+// failed, e.g. a worker killed on the final attempt), and of studio work left pending or
+// running without a River studio job.
 type ReconcileArgs struct{}
 
 func (ReconcileArgs) Kind() string { return "reconcile_orphans" }
@@ -69,7 +97,8 @@ func (FilesSweepArgs) InsertOpts() river.InsertOpts {
 }
 
 // CostGuardArgs: periodic (every 5 min) check of today's model spend against
-// DAILY_COST_CEILING_USD; pauses the pipeline queue above it, resumes below it.
+// DAILY_COST_CEILING_USD; pauses the pipeline and studio queues above it, resumes them
+// below it.
 type CostGuardArgs struct{}
 
 func (CostGuardArgs) Kind() string { return "cost_guard" }

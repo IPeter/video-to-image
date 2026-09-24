@@ -114,8 +114,9 @@ func Parse(raw []byte) (*Config, error) {
 }
 
 // Validate runs tag validation plus the cross-field rules from the plan: unique shot
-// IDs, weights summing to 1 ± 0.01, at least one required shot and an imageCount the
-// shot list can fill under maxPerShot.
+// IDs, weights summing to 1 ± 0.01, at least one required shot, an imageCount the shot
+// list can fill under maxPerShot, and a studio block that fits the domain (see
+// validateStudio).
 func Validate(c *Config) error {
 	if err := validate.Struct(c); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
@@ -163,6 +164,7 @@ func Validate(c *Config) error {
 			errs = append(errs, fmt.Errorf("crop.aspect: %w", err))
 		}
 	}
+	errs = append(errs, validateStudio(c.Studio, c.Review.Enabled, ids)...)
 	if c.Model.ThinkingBudget != nil && c.Model.ThinkingLevel != "" {
 		errs = append(errs, errors.New("model: set thinkingBudget or thinkingLevel, not both"))
 	}
@@ -175,6 +177,40 @@ func Validate(c *Config) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// validateStudio checks the studio block: it needs the review (the subject box prompts
+// the segmentation), views must be shot IDs of the domain, and styles must be unique and
+// contain the default style.
+func validateStudio(st Studio, reviewEnabled bool, shotIDs map[string]bool) []error {
+	var errs []error
+	if st.Enabled && !reviewEnabled {
+		errs = append(errs, errors.New("studio.enabled needs review.enabled (the subject box comes from the review)"))
+	}
+	if st.Enabled && len(st.Views) == 0 { // the tag lets an empty list through
+		errs = append(errs, errors.New("studio.views must list at least one shot id when studio.enabled"))
+	}
+	seen := map[string]bool{}
+	for _, v := range st.Views {
+		switch {
+		case !shotIDs[v]:
+			errs = append(errs, fmt.Errorf("studio.views: %q is not a shot id of this domain", v))
+		case seen[v]:
+			errs = append(errs, fmt.Errorf("studio.views: duplicate %q", v))
+		}
+		seen[v] = true
+	}
+	seen = map[string]bool{}
+	for _, s := range st.Styles {
+		if seen[s] {
+			errs = append(errs, fmt.Errorf("studio.styles: duplicate %q", s))
+		}
+		seen[s] = true
+	}
+	if len(st.Styles) > 0 && !seen[st.EffectiveDefaultStyle()] {
+		errs = append(errs, fmt.Errorf("studio.defaultStyle %q is not one of studio.styles", st.EffectiveDefaultStyle()))
+	}
+	return errs
 }
 
 // ParseAspect parses "W:H" (e.g. "4:3", "16:9", "1:1") into W/H.

@@ -4,8 +4,12 @@
 package store
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"video-to-image/internal/media"
 )
@@ -89,6 +93,8 @@ type Job struct {
 	ErrorMessage      string
 	InternalLog       string
 	CostUSD           float64
+	StudioStatus      StudioStatus // studio backgrounds, see internal/studio
+	StudioZipPath     string       // storage key of studio.zip; "" until built
 }
 
 // NewJob is the input of CreateJob. Status starts as queued.
@@ -107,6 +113,8 @@ type JobRef struct {
 	ID        string
 	DomainKey string
 	Status    JobStatus
+	// StudioStatus is set by ListExpiredJobs and ListOrphanedStudioJobs ("" elsewhere).
+	StudioStatus StudioStatus
 }
 
 // Step is a job_steps row.
@@ -170,6 +178,58 @@ type SelectedImage struct {
 	Bytes        int64
 	Rotation     int    // degrees clockwise applied to the source frame
 	Crop         *NRect // normalised crop of the upright frame; nil = uncropped
+	// SubjectBox is the reviewed subject box in the EXPORTED image (after rotation and
+	// crop); nil without a review verdict. The studio step prompts segmentation with it.
+	SubjectBox *NRect
+	Studio     *ImageStudio // nil = not processed by the studio step
+}
+
+// StudioStatus is a job's studio-background progress (jobs.studio_status).
+type StudioStatus string
+
+const (
+	StudioNone    StudioStatus = "none"    // not requested (feature off, or no eligible image)
+	StudioPending StudioStatus = "pending" // enqueued after the pipeline completed
+	StudioRunning StudioStatus = "running"
+	StudioDone    StudioStatus = "done"    // every eligible image has a final ImageStudio
+	StudioFailed  StudioStatus = "failed"  // gave up (sidecar down, budget); originals unaffected
+	StudioSkipped StudioStatus = "skipped" // daily cost ceiling, or the job was deleted first
+)
+
+// Active reports whether studio work is still to come for the job (pending or running).
+func (s StudioStatus) Active() bool { return s == StudioPending || s == StudioRunning }
+
+// ImageStudio.Status values. Every one is final: the studio step never revisits an image
+// that has one.
+const (
+	ImageStudioReady    = "ready"    // variants exist (ImageStudio.Styles)
+	ImageStudioWithheld = "withheld" // a gate or the QA check refused the cut-out
+	ImageStudioSkipped  = "skipped"  // not eligible, or not attempted (daily cost ceiling)
+	ImageStudioFailed   = "failed"   // an error; only the original is offered
+)
+
+// ImageStudio is one image's studio outcome (selected_images.studio, jsonb).
+type ImageStudio struct {
+	// Status: "ready" (variants exist), "withheld" (a gate or the QA check refused the
+	// cut-out; Reason says why), "skipped" (not eligible: view, not fully visible, no
+	// box), "failed" (an error; Reason is internal and short).
+	Status string                  `json:"status"`
+	Reason string                  `json:"reason,omitempty"`
+	Styles map[Style]StudioVariant `json:"styles,omitempty"`
+	// Diagnostics: mask stats, gate values, QA verdict, timings (opaque JSON for ops).
+	Diagnostics json.RawMessage `json:"diagnostics,omitempty"`
+}
+
+// Style is a studio backdrop name (studio.Style values: grey, light, dark).
+type Style string
+
+// StudioVariant is one stored studio rendering of an image.
+type StudioVariant struct {
+	Key      string `json:"key"`      // storage key of the full-size JPEG
+	ThumbKey string `json:"thumbKey"` // storage key of the 640 px thumbnail
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	Bytes    int64  `json:"bytes"`
 }
 
 // NRect is a normalised rectangle, stored as jsonb {x0,y0,x1,y1}.
@@ -211,6 +271,22 @@ type Completion struct {
 	MissingShots []string // shot IDs
 	ZipPath      string   // "" when there are no images
 	Images       []SelectedImage
+	// Studio is the job's studio_status after completion: "" or StudioNone (no studio
+	// backgrounds), or StudioPending with Enqueue scheduling the studio job.
+	Studio StudioStatus
+	// Enqueue, when set, runs inside the completion's transaction after the job row and
+	// images are written (River InsertTx of the studio job): an error rolls back the
+	// whole completion, so a job is never pending studio work without a studio job.
+	Enqueue func(ctx context.Context, tx pgx.Tx) error
+}
+
+// StudioFinish is the input of FinishStudio.
+type StudioFinish struct {
+	Status  StudioStatus // StudioDone, StudioFailed or StudioSkipped
+	ZipPath string       // storage key of studio.zip; "" when none was built
+	// Unprocessed, when set, is stored for every image still without a studio outcome
+	// (e.g. skipped: the daily cost ceiling was reached before they were done).
+	Unprocessed *ImageStudio
 }
 
 // UsageEvent is a usage_events row.

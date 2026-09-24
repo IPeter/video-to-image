@@ -31,11 +31,13 @@ SET gate          = @gate,
 WHERE id = @id AND status = 'processing';
 
 -- name: CompleteJob :execrows
+-- @studio_status is 'none' or 'pending' (the studio job is enqueued in the same transaction).
 UPDATE jobs
 SET status             = 'completed',
     result_explanation = @result_explanation,
     missing_shots      = @missing_shots,
     zip_path           = sqlc.narg(zip_path),
+    studio_status      = @studio_status,
     updated_at         = now()
 WHERE id = @id AND status = 'processing';
 
@@ -68,11 +70,14 @@ SET status        = 'failed',
 WHERE id = @id AND status IN ('queued', 'processing');
 
 -- name: ExpireJob :execrows
+-- Studio work still pending or running ends as skipped: nothing is made for a deleted job.
 UPDATE jobs
-SET status     = 'expired',
-    video_path = NULL,
-    zip_path   = NULL,
-    updated_at = now()
+SET status          = 'expired',
+    video_path      = NULL,
+    zip_path        = NULL,
+    studio_zip_path = NULL,
+    studio_status   = CASE WHEN studio_status IN ('pending', 'running') THEN 'skipped' ELSE studio_status END,
+    updated_at      = now()
 WHERE id = @id AND status <> 'expired';
 
 -- name: AppendInternalLog :execrows
@@ -93,8 +98,33 @@ SET cost_usd = cost_usd + @delta::numeric, updated_at = now()
 WHERE id = @id;
 
 -- name: ListExpiredJobs :many
-SELECT id, domain_key, status
+SELECT id, domain_key, status, studio_status
 FROM jobs
 WHERE expires_at < @now AND status <> 'expired'
 ORDER BY expires_at, id
 LIMIT @max_rows;
+
+-- name: StartStudio :execrows
+-- Studio backgrounds (internal/pipeline/studiojob): pending → running; already running
+-- is a no-op (River re-delivery). Start and finish need a completed job, so a job the
+-- user deleted (expired) in the meantime stops the studio work.
+UPDATE jobs
+SET studio_status = 'running', updated_at = now()
+WHERE id = @id AND status = 'completed' AND studio_status IN ('pending', 'running');
+
+-- name: FinishStudio :execrows
+-- running → done | failed | skipped, with the studio.zip key (NULL when none was built).
+UPDATE jobs
+SET studio_status   = @studio_status,
+    studio_zip_path = sqlc.narg(studio_zip_path),
+    updated_at      = now()
+WHERE id = @id AND status = 'completed' AND studio_status = 'running';
+
+-- name: FailStudio :execrows
+-- pending | running → failed, whatever the job's status (River gave up on the studio job).
+UPDATE jobs
+SET studio_status = 'failed', updated_at = now()
+WHERE id = @id AND studio_status IN ('pending', 'running');
+
+-- name: GetStudioState :one
+SELECT status, studio_status FROM jobs WHERE id = @id;

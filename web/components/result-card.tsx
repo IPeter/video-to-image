@@ -2,8 +2,10 @@
 
 import { Clock, Download, Maximize2 } from "lucide-react";
 
+import { StudioStatusLine, StudioToggle } from "@/components/studio";
 import { Badge } from "@/components/ui/badge";
 import { resolveApiUrl, type ResultImage } from "@/lib/api";
+import { originalVersion, type ShownVersion } from "@/lib/studio";
 
 export interface ResultCardProps {
   image: ResultImage;
@@ -11,11 +13,22 @@ export interface ResultCardProps {
   apiBaseUrl: string;
   /** Opens the lightbox for this image. */
   onOpen: () => void;
+  /** The version on screen (studio background or original); default: the original. */
+  shown?: ShownVersion;
+  /** Flips this image between its studio version and the original ("Show original"). */
+  onToggleOriginal?: () => void;
 }
 
-/** Alt text for a selected frame: what it shows and where it came from in the video. */
-export function imageAltText(image: Pick<ResultImage, "shotLabel" | "timestampLabel" | "reason">): string {
-  return `${image.shotLabel}, frame at ${image.timestampLabel}. ${image.reason}`.trim();
+/**
+ * Alt text for a selected frame: what it shows, where it came from in the video and, for
+ * a studio version, that the background is a studio one while the car is unchanged.
+ */
+export function imageAltText(
+  image: Pick<ResultImage, "shotLabel" | "timestampLabel" | "reason">,
+  studio: boolean = false,
+): string {
+  const backdrop = studio ? " on a studio background (the car itself is unchanged)" : "";
+  return `${image.shotLabel}, frame at ${image.timestampLabel}${backdrop}. ${image.reason}`.trim();
 }
 
 /** How the export reframed a video frame: the badge text and its explanation. */
@@ -59,37 +72,46 @@ export function ReframeBadge({ image }: { image: Pick<ResultImage, "rotation" | 
   );
 }
 
-/** One selected image: thumbnail (opens the lightbox), shot label, timestamp, reason, download. */
-export function ResultCard({ image, apiBaseUrl, onOpen }: ResultCardProps) {
+/**
+ * One selected image: thumbnail (opens the lightbox), shot label, timestamp, reason,
+ * download of the version on screen and, for exterior photos, the studio line with the
+ * "Show original" toggle over the photo's top-left corner.
+ */
+export function ResultCard({ image, apiBaseUrl, onOpen, shown: shownProp, onToggleOriginal }: ResultCardProps) {
+  const shown = shownProp ?? originalVersion(image);
+  const studio = shown.variant !== null;
   return (
     <article
       className="group/result flex w-full flex-col overflow-hidden rounded-xl bg-card text-card-foreground ring-1 ring-foreground/10"
       data-image-id={image.id}
+      data-version={studio ? "studio" : "original"}
       aria-labelledby={`${image.id}-label`}
     >
-      <button
-        type="button"
-        onClick={onOpen}
-        className="relative block w-full overflow-hidden bg-muted outline-none focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:ring-inset"
-        // One frame shape for every card, so a row lines up even when photos differ
-        // (straightened portrait frames, 4:3 crops, 16:9 originals): the image is
-        // letterboxed inside the 4:3 listing shape.
-        style={{ aspectRatio: "4 / 3" }}
-        aria-label={`View ${image.shotLabel} at ${image.timestampLabel} in full size`}
-      >
-        <img
-          src={resolveApiUrl(apiBaseUrl, image.thumbnailUrl)}
-          alt={imageAltText(image)}
-          width={image.width}
-          height={image.height}
-          loading="lazy"
-          decoding="async"
-          className="size-full object-contain transition-transform duration-200 motion-safe:group-hover/result:scale-[1.02]"
-        />
-        <span className="absolute top-2 right-2 flex size-7 items-center justify-center rounded-md bg-background/80 text-foreground opacity-0 transition-opacity group-hover/result:opacity-100 group-focus-within/result:opacity-100">
-          <Maximize2 aria-hidden="true" className="size-4" />
-        </span>
-      </button>
+      {/* One frame shape for every card, so a row lines up even when photos differ
+          (straightened portrait frames, 4:3 crops, 16:9 originals): the image is
+          letterboxed inside the 4:3 listing shape. */}
+      <div className="relative w-full" style={{ aspectRatio: "4 / 3" }}>
+        <button
+          type="button"
+          onClick={onOpen}
+          className="relative block size-full overflow-hidden bg-muted outline-none focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:ring-inset"
+          aria-label={`View ${image.shotLabel} at ${image.timestampLabel}${studio ? " (studio background)" : ""} in full size`}
+        >
+          <img
+            src={resolveApiUrl(apiBaseUrl, shown.thumbnailUrl)}
+            alt={imageAltText(image, studio)}
+            width={shown.width}
+            height={shown.height}
+            loading="lazy"
+            decoding="async"
+            className="size-full object-contain transition-transform duration-200 motion-safe:group-hover/result:scale-[1.02]"
+          />
+          <span className="absolute top-2 right-2 flex size-7 items-center justify-center rounded-md bg-background/80 text-foreground opacity-0 transition-opacity group-hover/result:opacity-100 group-focus-within/result:opacity-100">
+            <Maximize2 aria-hidden="true" className="size-4" />
+          </span>
+        </button>
+        {onToggleOriginal && <StudioToggle shown={shown} onToggle={onToggleOriginal} className="absolute top-2 left-2" />}
+      </div>
       <div className="flex flex-1 flex-col gap-2 p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Badge id={`${image.id}-label`} variant="secondary" data-testid="shot-label">
@@ -109,15 +131,16 @@ export function ResultCard({ image, apiBaseUrl, onOpen }: ResultCardProps) {
             {image.reason}
           </p>
           <a
-            href={resolveApiUrl(apiBaseUrl, image.downloadUrl)}
-            download={image.fileName}
+            href={resolveApiUrl(apiBaseUrl, shown.downloadUrl)}
+            download={shown.fileName}
             className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-foreground outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
-            aria-label={`Download ${image.shotLabel} (${image.fileName})`}
-            title="Download image"
+            aria-label={`Download ${image.shotLabel}${studio ? " with studio background" : ""} (${shown.fileName})`}
+            title={studio ? "Download studio image" : "Download image"}
           >
             <Download aria-hidden="true" className="size-4" />
           </a>
         </div>
+        <StudioStatusLine image={image} shown={shown} className="-mt-1" />
       </div>
     </article>
   );

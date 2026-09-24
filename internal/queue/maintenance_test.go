@@ -231,7 +231,8 @@ func TestCostGuardWithFakeQueues(t *testing.T) {
 			metrics.QueuePaused.WithLabelValues(QueuePipeline).Set(-1)
 			q := tt.q
 			fs := &fakeStore{cost: tt.cost}
-			w := &CostGuardWorker{Store: fs, Queues: &q, DailyCostCeilingUSD: tt.ceiling, Logger: discardLogger(), Now: now}
+			// No studio worker registered the studio queue: it is left alone.
+			w := &CostGuardWorker{Store: fs, Queues: fakeQueueSet{QueuePipeline: &q}, DailyCostCeilingUSD: tt.ceiling, Logger: discardLogger(), Now: now}
 
 			err := w.Work(context.Background(), nil)
 
@@ -252,9 +253,39 @@ func TestCostGuardWithFakeQueues(t *testing.T) {
 	}
 }
 
+func TestCostGuardPausesAndResumesStudioQueue(t *testing.T) {
+	pipeline, studio := &fakeQueues{}, &fakeQueues{}
+	fs := &fakeStore{cost: 12}
+	w := &CostGuardWorker{Store: fs, Queues: fakeQueueSet{QueuePipeline: pipeline, QueueStudio: studio}, DailyCostCeilingUSD: 10, Logger: discardLogger()}
+
+	require.NoError(t, w.Check(context.Background()))
+	assert.True(t, pipeline.paused)
+	assert.True(t, studio.paused, "studio QA calls count against the same ceiling")
+	assert.Equal(t, 1.0, metricValue(t, metrics.QueuePaused.WithLabelValues(QueueStudio)))
+
+	fs.setCost(2)
+	require.NoError(t, w.Check(context.Background()))
+	assert.False(t, pipeline.paused)
+	assert.False(t, studio.paused)
+	assert.Equal(t, 1, studio.resumes)
+	assert.Equal(t, 0.0, metricValue(t, metrics.QueuePaused.WithLabelValues(QueueStudio)))
+
+	// A studio lookup error is reported, but the pipeline queue is still handled.
+	fs.setCost(20)
+	studio.getErr = errInfra
+	err := w.Check(context.Background())
+	require.ErrorIs(t, err, errInfra)
+	assert.True(t, pipeline.paused)
+
+	// A pipeline error does not keep the studio queue running either.
+	pipeline.paused, pipeline.getErr, studio.getErr = false, errInfra, nil
+	require.ErrorIs(t, w.Check(context.Background()), errInfra)
+	assert.True(t, studio.paused)
+}
+
 func TestCostGuardCostError(t *testing.T) {
 	q := &fakeQueues{paused: true}
-	w := &CostGuardWorker{Store: &fakeStore{costErr: errInfra}, Queues: q, DailyCostCeilingUSD: 1, Logger: discardLogger()}
+	w := &CostGuardWorker{Store: &fakeStore{costErr: errInfra}, Queues: fakeQueueSet{QueuePipeline: q}, DailyCostCeilingUSD: 1, Logger: discardLogger()}
 
 	require.ErrorIs(t, w.Work(context.Background(), nil), errInfra)
 	assert.True(t, q.paused, "the queue state is left alone when the cost is unknown")

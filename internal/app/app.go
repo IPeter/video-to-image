@@ -1,12 +1,13 @@
 // Package app wires configuration into the shared dependencies (logger, Postgres
-// pool, storage, ffmpeg, domain registry, analyzer, runner, River worker) used by the
-// serve, work and migrate subcommands.
+// pool, storage, ffmpeg, domain registry, analyzer, runner, studio segmenter, River
+// worker) used by the serve, work and migrate subcommands.
 package app
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,9 +24,11 @@ import (
 	"video-to-image/internal/ids"
 	"video-to-image/internal/media"
 	"video-to-image/internal/pipeline"
+	"video-to-image/internal/pipeline/studiojob"
 	"video-to-image/internal/queue"
 	"video-to-image/internal/storage"
 	"video-to-image/internal/store"
+	"video-to-image/internal/studio"
 )
 
 // NewLogger returns a JSON (or text) slog logger writing to stdout.
@@ -215,19 +218,84 @@ func (a *App) Runner(an analyzer.Analyzer) *pipeline.Runner {
 	}
 }
 
-// NewWorker builds (but does not start) the River worker.
+// NewWorker builds (but does not start) the River worker. With a segmenter
+// (V2I_STUDIO_URL) it also works the studio queue, and the pipeline schedules studio
+// backgrounds for completed jobs of domains that have them.
 func (a *App) NewWorker(an analyzer.Analyzer) (*queue.Worker, error) {
 	var sweeper analyzer.Sweeper
 	if s, ok := an.(analyzer.Sweeper); ok {
 		sweeper = s
 	}
+	runner := a.Runner(an)
+	seg, err := NewSegmenter(a.Cfg)
+	if err != nil {
+		return nil, err
+	}
+	var studioRunner queue.StudioRunner
+	if seg != nil {
+		// The pipeline inserts the studio job in the transaction that completes the job.
+		ins, err := queue.NewInsertClient(a.Pool, a.Log)
+		if err != nil {
+			return nil, err
+		}
+		runner.Studio = ins
+		studioRunner = &studiojob.Runner{
+			Store:               a.Store,
+			Storage:             a.Storage,
+			Segmenter:           seg,
+			Analyzer:            an,
+			Registry:            a.Registry,
+			Logger:              a.Log,
+			ScratchDir:          a.Cfg.ScratchDir,
+			PhotoTimeout:        a.Cfg.StudioTimeout,
+			DailyCostCeilingUSD: a.Cfg.DailyCostCeilingUSD,
+		}
+	}
+	a.logStudio(studioRunner != nil)
 	return queue.NewWorker(a.Pool, queue.WorkerConfig{
-		Runner:              a.Runner(an),
+		Runner:              runner,
 		Store:               a.Store,
 		Storage:             a.Storage,
 		Sweeper:             sweeper,
 		PipelineWorkers:     a.Cfg.PipelineWorkers,
+		StudioRunner:        studioRunner,
+		StudioWorkers:       a.Cfg.StudioWorkers,
 		DailyCostCeilingUSD: a.Cfg.DailyCostCeilingUSD,
 		Logger:              a.Log,
 	})
+}
+
+// NewSegmenter builds the studio-background segmenter from V2I_STUDIO_URL: nil when it
+// is empty (studio backgrounds off in this process), studio.FakeSegmenter for
+// config.StudioFake, else the sidecar client with V2I_STUDIO_TIMEOUT per photo.
+func NewSegmenter(cfg *config.Config) (studio.Segmenter, error) {
+	seg, err := studio.NewSegmenter(cfg.StudioURL, cfg.StudioTimeout, nil)
+	if err != nil {
+		return nil, fmt.Errorf("app: V2I_STUDIO_URL: %w", err)
+	}
+	return seg, nil
+}
+
+// logStudio says at start whether this worker makes studio backgrounds, and for which
+// domains.
+func (a *App) logStudio(on bool) {
+	var domains []string
+	for _, k := range a.Registry.Keys() {
+		if d, _ := a.Registry.Get(k); d.Studio.Enabled {
+			domains = append(domains, k)
+		}
+	}
+	if !on {
+		a.Log.Info("studio backgrounds off in this worker (V2I_STUDIO_URL is empty)", "domains_with_studio", domains)
+		return
+	}
+	sidecar := a.Cfg.StudioURL
+	if u, err := url.Parse(sidecar); err == nil && sidecar != config.StudioFake {
+		sidecar = u.Redacted()
+	}
+	a.Log.Info("studio backgrounds on", "sidecar", sidecar, "photo_timeout", a.Cfg.StudioTimeout,
+		"studio_workers", a.Cfg.StudioWorkers, "domains", domains)
+	if len(domains) == 0 {
+		a.Log.Warn("studio backgrounds: no domain has studio.enabled; nothing will be made")
+	}
 }

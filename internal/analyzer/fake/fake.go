@@ -3,10 +3,13 @@
 // returns either a canned JSON file verbatim or synthetic scenes spread evenly over the
 // video, one per shot ID; for the review step it approves every frame it was shown
 // (upright, the proposed view, fully visible, quality 4, a centred subject box); for the
-// legacy re-rank step it returns no picks.
+// studio QA check it finds nothing missing and no background kept; for the legacy
+// re-rank step it returns no picks.
 //
 // A request whose SourceName contains "reject" (case-insensitive) fails the domain gate,
-// so tests and demos can exercise the rejection path deterministically.
+// so tests and demos can exercise the rejection path deterministically; one containing
+// "missingpart" makes the studio QA report a missing part (the studio version is then
+// withheld).
 package fake
 
 import (
@@ -144,6 +147,14 @@ func (a *Analyzer) Generate(ctx context.Context, req *analyzer.Request) (*analyz
 		usage.OutputTokens = ReviewOutputTokensPerImage * len(resp.Images)
 	case analyzer.StepRerank:
 		text = `{"picks":[]}`
+	case analyzer.StepStudio:
+		b, err := json.Marshal(synthesizeStudioQA(req))
+		if err != nil {
+			return nil, fmt.Errorf("fake: encode studio QA response: %w", err)
+		}
+		text = string(b)
+		usage.InputTokens = StudioQAInputTokens
+		usage.OutputTokens = StudioQAOutputTokens
 	default:
 		return nil, fmt.Errorf("fake: unknown step %q", req.Step)
 	}
@@ -324,6 +335,36 @@ func reviewIDs(s *analyzer.Schema) []string {
 		return nil
 	}
 	return id.Enum
+}
+
+// Synthetic studio QA usage: two ~1024 px images plus the prompt, and a short answer
+// (the fake is still priced at $0).
+const (
+	StudioQAInputTokens  = 2*ReviewTokensPerImage + 450
+	StudioQAOutputTokens = 20
+)
+
+// StudioMissingPart is what the fake's studio QA reports as missing when the source
+// name asks for it (see synthesizeStudioQA).
+const StudioMissingPart = "roof antenna"
+
+// studioQAResponse mirrors the JSON shape internal/studio.ParseQA reads.
+type studioQAResponse struct {
+	MissingParts   []string `json:"missingParts"`
+	BackgroundKept []string `json:"backgroundKept"`
+	Notes          string   `json:"notes"`
+}
+
+// synthesizeStudioQA answers the studio QA check: nothing missing, nothing kept. A
+// request whose SourceName contains "missingpart" (case-insensitive) reports
+// StudioMissingPart instead, so tests can exercise the withheld path.
+func synthesizeStudioQA(req *analyzer.Request) studioQAResponse {
+	resp := studioQAResponse{MissingParts: []string{}, BackgroundKept: []string{}}
+	if strings.Contains(strings.ToLower(req.SourceName), "missingpart") {
+		resp.MissingParts = []string{StudioMissingPart}
+		resp.Notes = `Fake analyzer: a part is reported missing because the file name contains "missingpart".`
+	}
+	return resp
 }
 
 // orientIDs returns the ids of an orientation request (its answer schema has an

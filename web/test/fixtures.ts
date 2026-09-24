@@ -1,4 +1,14 @@
-import type { Job, JobResult, JobUsage, PublicDomain, ResultImage, UsageStep } from "@/lib/api";
+import type {
+  ImageStudio,
+  Job,
+  JobResult,
+  JobStudio,
+  JobUsage,
+  PublicDomain,
+  ResultImage,
+  StudioStyle,
+  UsageStep,
+} from "@/lib/api";
 
 // Test data shaped exactly like the API contract (lib/api.d.ts).
 
@@ -49,6 +59,44 @@ export function makeImage(index: number, overrides: Partial<ResultImage> = {}): 
     thumbnailUrl: `${base}/thumb`,
     rotation: 0,
     cropped: false,
+    studio: null,
+    ...overrides,
+  };
+}
+
+/** A ready studio outcome for `image` with one variant per style (default first). */
+export function readyStudio(image: Pick<ResultImage, "id" | "fileName">, styles: StudioStyle[] = ["grey", "light", "dark"]): ImageStudio {
+  const base = `/v1/domains/cars/jobs/${JOB_ID}/images/${image.id}/studio`;
+  return {
+    status: "ready",
+    reason: "",
+    variants: styles.map((style) => ({
+      style,
+      url: `${base}/${style}`,
+      downloadUrl: `${base}/${style}?download=1`,
+      thumbnailUrl: `${base}/${style}/thumb`,
+      fileName: image.fileName.replace(/\.jpg$/, `_studio-${style}.jpg`),
+      width: 1920,
+      height: 1080,
+    })),
+  };
+}
+
+/** An exterior image with a ready studio version. */
+export function makeStudioImage(index: number, overrides: Partial<ResultImage> = {}, styles?: StudioStyle[]): ResultImage {
+  const image = makeImage(index, overrides);
+  return { ...image, studio: overrides.studio ?? readyStudio(image, styles) };
+}
+
+/** A job without studio backgrounds (feature off, or nothing eligible). */
+export const NO_STUDIO: JobStudio = { status: "none", styles: [], defaultStyle: "", zipUrl: null };
+
+export function makeJobStudio(overrides: Partial<JobStudio> = {}): JobStudio {
+  return {
+    status: "done",
+    styles: ["grey", "light", "dark"],
+    defaultStyle: "grey",
+    zipUrl: `/v1/domains/cars/jobs/${JOB_ID}/studio.zip`,
     ...overrides,
   };
 }
@@ -134,6 +182,7 @@ export function makeJob(overrides: Partial<Job> = {}): Job {
       ],
     },
     usage: NO_USAGE,
+    studio: NO_STUDIO,
     result: null,
     rejection: null,
     error: null,

@@ -4,7 +4,17 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, type Api, type Job } from "@/lib/api";
-import { API_BASE, JOB_ID, makeJob, makeResult, makeUsage, makeUsageStep } from "@/test/fixtures";
+import {
+  API_BASE,
+  JOB_ID,
+  makeImage,
+  makeJob,
+  makeJobStudio,
+  makeResult,
+  makeStudioImage,
+  makeUsage,
+  makeUsageStep,
+} from "@/test/fixtures";
 import { renderWithProviders } from "@/test/render";
 
 import {
@@ -14,6 +24,7 @@ import {
   JobView,
   POLL_INTERVAL_MS,
   shouldRetryJobQuery,
+  STUDIO_POLL_SLOWDOWN,
 } from "./job-view";
 
 type Step = Job | Error;
@@ -71,6 +82,21 @@ describe("polling policy", () => {
     }
   });
 
+  it("keeps polling a completed job, more slowly, while its studio backgrounds are made", () => {
+    expect(STUDIO_POLL_SLOWDOWN).toBe(2);
+    for (const status of ["pending", "running"] as const) {
+      expect(jobRefetchInterval(makeJob({ status: "completed", studio: makeJobStudio({ status }) }), null)).toBe(3000);
+      expect(jobRefetchInterval(makeJob({ status: "completed", studio: makeJobStudio({ status }) }), null, 20)).toBe(40);
+    }
+    for (const status of ["none", "done", "failed", "skipped"] as const) {
+      expect(jobRefetchInterval(makeJob({ status: "completed", studio: makeJobStudio({ status }) }), null)).toBe(false);
+    }
+    // Only a completed job has studio work; a final error still stops polling.
+    expect(jobRefetchInterval(makeJob({ status: "expired", studio: makeJobStudio({ status: "running" }) }), null)).toBe(false);
+    const running = makeJob({ status: "completed", studio: makeJobStudio({ status: "running" }) });
+    expect(jobRefetchInterval(running, new ApiError("http", 410, "EXPIRED"))).toBe(false);
+  });
+
   it("keeps polling through transient errors and stops on final ones", () => {
     const job = makeJob();
     expect(jobRefetchInterval(job, ApiError.network(new TypeError("offline")))).toBe(1500);
@@ -113,6 +139,41 @@ describe("<JobView>", () => {
     expect(getJob).toHaveBeenCalledWith("cars", JOB_ID, expect.any(AbortSignal));
     const calls = getJob.mock.calls.length;
     await new Promise((r) => setTimeout(r, 120));
+    expect(getJob.mock.calls.length).toBe(calls);
+  });
+
+  it("shows the originals first, then the studio versions, then stops polling", async () => {
+    const pending = { status: "pending" as const, reason: "", variants: [] };
+    const first = makeImage(1, { studio: pending });
+    const interior = makeImage(2, { shotId: "interior_dashboard", shotLabel: "Dashboard" });
+    const originals = makeJob({
+      status: "completed",
+      progress: { step: null, percent: 100, steps: [] },
+      usage: makeUsage(),
+      studio: makeJobStudio({ status: "running", zipUrl: null }),
+      result: makeResult({ images: [first, interior] }),
+    });
+    const withStudio = makeJob({
+      ...originals,
+      studio: makeJobStudio({ status: "done" }),
+      result: makeResult({ images: [makeStudioImage(1), interior] }),
+    });
+    const { api, getJob } = fakeApi([originals, originals, withStudio]);
+    renderJob(api);
+
+    const grid = await screen.findByRole("list", { name: "Selected images" });
+    expect(within(grid).getByTestId("studio-pending")).toBeInTheDocument();
+    expect(screen.getByTestId("studio-preparing")).toBeInTheDocument();
+
+    expect(await screen.findByTestId("background-switch")).toBeInTheDocument();
+    expect(within(grid).getByTestId("studio-badge")).toBeInTheDocument();
+    expect(within(grid).getAllByRole("article")[0]).toHaveAttribute("data-version", "studio");
+    expect(screen.getByRole("link", { name: "Download studio photos (ZIP)" })).toBeInTheDocument();
+    // The results heading keeps focus and nothing is re-announced as a new page state.
+    expect(screen.getByTestId("job-announcer")).toBeEmptyDOMElement();
+
+    const calls = getJob.mock.calls.length;
+    await new Promise((r) => setTimeout(r, 150));
     expect(getJob.mock.calls.length).toBe(calls);
   });
 

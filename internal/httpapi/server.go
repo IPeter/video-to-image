@@ -334,6 +334,9 @@ func (s *Server) registerRawRoutes(r chi.Router) {
 	r.Get("/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}", s.getImage)
 	r.Get("/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}/thumb", s.getThumbnail)
 	r.Get("/v1/domains/{domainKey}/jobs/{jobId}/download.zip", s.downloadZip)
+	r.Get("/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}/studio/{style}", s.getStudioImage)
+	r.Get("/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}/studio/{style}/thumb", s.getStudioThumbnail)
+	r.Get("/v1/domains/{domainKey}/jobs/{jobId}/studio.zip", s.downloadStudioZip)
 	// Probes stay on the API listener (plan/05). /metrics does not: it is served on
 	// the admin listener (V2I_ADMIN_ADDR), which no Ingress exposes.
 	r.Get("/healthz", s.healthz)
@@ -453,6 +456,61 @@ func (s *Server) documentRawOperations() {
 		Summary:     "All images + manifest.json as a ZIP",
 		Tags:        []string{"files"},
 		Parameters:  []*huma.Param{domainParam, jobParam},
+		Responses: map[string]*huma.Response{
+			"200": {Description: "ZIP archive", Content: map[string]*huma.MediaType{
+				"application/zip": {Schema: &huma.Schema{Type: huma.TypeString, Format: "binary"}},
+			}},
+			"302": redirect,
+			"304": notModified,
+			"403": errResp("ORIGIN_NOT_ALLOWED"),
+			"404": errResp("DOMAIN_NOT_FOUND | JOB_NOT_FOUND | NOT_FOUND"),
+			"409": errResp("NOT_READY"),
+			"410": errResp("EXPIRED"),
+			"429": errResp("RATE_LIMITED"),
+			"500": errResp("INTERNAL_ERROR"),
+		},
+	})
+
+	styleParam := &huma.Param{Name: "style", In: "path", Required: true,
+		Schema:      &huma.Schema{Type: huma.TypeString, Enum: []any{"grey", "light", "dark"}},
+		Description: "Studio backdrop; one of the image's studio.variants."}
+	for _, op := range []struct{ id, path, summary string }{
+		{"getStudioImage", "/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}/studio/{style}", "Studio-background version, full resolution"},
+		{"getStudioThumbnail", "/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}/studio/{style}/thumb", "Studio-background version, 640 px thumbnail"},
+	} {
+		oapi.AddOperation(&huma.Operation{
+			OperationID: op.id,
+			Method:      http.MethodGet,
+			Path:        op.path,
+			Summary:     op.summary,
+			Description: "The image on a studio backdrop; the car pixels are the original photo's. Served only for a variant the job lists " +
+				"(result.images[].studio.variants): anything else is 404 IMAGE_NOT_FOUND (unknown style, image not eligible, " +
+				"studio version withheld or failed), and 409 NOT_READY while the studio version is still being made.",
+			Tags:       []string{"files"},
+			Parameters: []*huma.Param{domainParam, jobParam, imageParam, styleParam, downloadParam},
+			Responses: map[string]*huma.Response{
+				"200": jpeg("JPEG image"),
+				"302": redirect,
+				"304": notModified,
+				"403": errResp("ORIGIN_NOT_ALLOWED"),
+				"404": errResp("DOMAIN_NOT_FOUND | JOB_NOT_FOUND | IMAGE_NOT_FOUND"),
+				"409": errResp("NOT_READY"),
+				"410": errResp("EXPIRED"),
+				"429": errResp("RATE_LIMITED"),
+				"500": errResp("INTERNAL_ERROR"),
+			},
+		})
+	}
+
+	oapi.AddOperation(&huma.Operation{
+		OperationID: "downloadStudioZip",
+		Method:      http.MethodGet,
+		Path:        "/v1/domains/{domainKey}/jobs/{jobId}/studio.zip",
+		Summary:     "All studio-background versions + manifest.json as a ZIP",
+		Description: "Offered as studio.zipUrl once the job's studio run is done. 409 NOT_READY before the job completed or while the " +
+			"studio versions are being made; 404 NOT_FOUND when there are none.",
+		Tags:       []string{"files"},
+		Parameters: []*huma.Param{domainParam, jobParam},
 		Responses: map[string]*huma.Response{
 			"200": {Description: "ZIP archive", Content: map[string]*huma.MediaType{
 				"application/zip": {Schema: &huma.Schema{Type: huma.TypeString, Format: "binary"}},

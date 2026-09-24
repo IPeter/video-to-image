@@ -1,0 +1,7 @@
+line-length = 130
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W", "B", "UP", "N", "A"]
+# H, W, B, S … are the image/mask names of the maths (height, width, BiRefNet, SAM).
+ignore = ["N806", "N803"]

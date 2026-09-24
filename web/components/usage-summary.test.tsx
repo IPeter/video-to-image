@@ -61,6 +61,28 @@ describe("<UsageSummary>", () => {
     expect(panel).toHaveTextContent("estimated from the model's list prices");
   });
 
+  it("labels the studio-background QA step", () => {
+    render(
+      <UsageSummary
+        usage={makeUsage({
+          calls: 3,
+          steps: [
+            makeUsageStep(),
+            makeUsageStep({ step: "review" }),
+            makeUsageStep({ step: "studio", model: "gemini-3.8-flash", calls: 1 }),
+          ],
+        })}
+      />,
+    );
+    const table = screen.getByRole("table", { name: "AI usage per step" });
+    expect(within(table).getAllByRole("rowheader").map((h) => h.firstChild?.textContent)).toEqual([
+      "Understanding the video",
+      "Checking the photos",
+      "Studio check",
+      "Total",
+    ]);
+  });
+
   it("keeps unknown step names, shows a dash for a missing model and omits the total for one step", () => {
     render(
       <UsageSummary

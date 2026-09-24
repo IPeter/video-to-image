@@ -96,6 +96,8 @@ func jobFromRow(r sqlcdb.Job) (*Job, error) {
 		ErrorCode:         textOrEmpty(r.ErrorCode),
 		ErrorMessage:      textOrEmpty(r.ErrorMessage),
 		InternalLog:       r.InternalLog,
+		StudioStatus:      StudioStatus(r.StudioStatus),
+		StudioZipPath:     textOrEmpty(r.StudioZipPath),
 	}
 	if err := json.Unmarshal(r.VideoInfo, &j.VideoInfo); err != nil {
 		return nil, fmt.Errorf("video_info: %w", err)
@@ -218,12 +220,15 @@ func (s *Store) saveAnalysis(ctx context.Context, id string, a AnalysisResult) e
 
 // CompleteJob atomically replaces selected_images with c.Images, marks their
 // candidates selected, and moves processing → completed with explanation, missing
-// shots and zip path. Not processing → ErrConflict (nothing written).
+// shots, zip path and studio status (c.Studio), then runs c.Enqueue in the same
+// transaction. Not processing → ErrConflict (nothing written); an Enqueue error rolls
+// everything back.
 //
 // Every other candidate of the job is marked not selected. Images are stored under id
 // (an image whose JobID names another job is rejected); Idx must be ≥ 1, Rotation one
-// of 0, 90, 180, 270 and Crop nil (stored as NULL) or a non-empty rectangle inside
-// [0,1].
+// of 0, 90, 180, 270, Crop and SubjectBox nil (stored as NULL) or a non-empty rectangle
+// inside [0,1], and Studio nil or an outcome with a known status. c.Studio must be ""
+// (none), StudioNone or StudioPending.
 func (s *Store) CompleteJob(ctx context.Context, id string, c Completion) error {
 	if err := s.completeJob(ctx, id, c); err != nil {
 		return fmt.Errorf("store: complete job %s: %w", id, err)
@@ -235,6 +240,14 @@ func (s *Store) completeJob(ctx context.Context, id string, c Completion) error 
 	missing, err := encodeStrings(c.MissingShots)
 	if err != nil {
 		return fmt.Errorf("missing shots: %w", err)
+	}
+	studio := c.Studio
+	switch studio {
+	case "":
+		studio = StudioNone
+	case StudioNone, StudioPending:
+	default:
+		return fmt.Errorf("studio status %q is not none or pending", studio)
 	}
 	images := make([]sqlcdb.InsertSelectedImagesParams, 0, len(c.Images))
 	selected := make([]string, 0, len(c.Images))
@@ -248,13 +261,14 @@ func (s *Store) completeJob(ctx context.Context, id string, c Completion) error 
 			selected = append(selected, im.CandidateID)
 		}
 	}
-	return s.inTx(ctx, func(_ pgx.Tx, q *sqlcdb.Queries) error {
+	return s.inTx(ctx, func(tx pgx.Tx, q *sqlcdb.Queries) error {
 		// The status update comes first: it locks the job row and fails fast.
 		n, err := q.CompleteJob(ctx, sqlcdb.CompleteJobParams{
 			ID:                id,
 			ResultExplanation: pgText(c.Explanation),
 			MissingShots:      missing,
 			ZipPath:           nullText(c.ZipPath),
+			StudioStatus:      string(studio),
 		})
 		if err != nil {
 			return err
@@ -271,6 +285,11 @@ func (s *Store) completeJob(ctx context.Context, id string, c Completion) error 
 		if len(images) > 0 {
 			if _, err := q.InsertSelectedImages(ctx, images); err != nil {
 				return fmt.Errorf("insert images: %w", err)
+			}
+		}
+		if c.Enqueue != nil {
+			if err := c.Enqueue(ctx, tx); err != nil {
+				return fmt.Errorf("enqueue: %w", err)
 			}
 		}
 		return nil
@@ -314,8 +333,10 @@ func (s *Store) FailJob(ctx context.Context, id, code, message, internalLog stri
 	return nil
 }
 
-// ExpireJob moves any non-expired status → expired and NULLs video_path, zip_path and
-// every selected_images image_path/thumb_path of the job. Already expired is a no-op.
+// ExpireJob moves any non-expired status → expired and NULLs video_path, zip_path,
+// studio_zip_path and every selected_images image_path/thumb_path of the job, and drops
+// the stored studio variants (ImageStudio.Styles; status, reason and diagnostics stay).
+// Studio work still pending or running becomes skipped. Already expired is a no-op.
 // Missing → ErrNotFound. Metadata and scoring rows are kept (decision 11).
 func (s *Store) ExpireJob(ctx context.Context, id string) error {
 	err := s.inTx(ctx, func(_ pgx.Tx, q *sqlcdb.Queries) error {
@@ -373,7 +394,7 @@ func logLine(text string) string {
 }
 
 // ListExpiredJobs returns up to limit jobs with expires_at < now and status <> expired,
-// oldest expiry first. limit <= 0 returns an empty list.
+// oldest expiry first, with their studio status. limit <= 0 returns an empty list.
 func (s *Store) ListExpiredJobs(ctx context.Context, now time.Time, limit int) ([]JobRef, error) {
 	if limit <= 0 {
 		return []JobRef{}, nil
@@ -384,7 +405,9 @@ func (s *Store) ListExpiredJobs(ctx context.Context, now time.Time, limit int) (
 	}
 	out := make([]JobRef, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, JobRef{ID: r.ID, DomainKey: r.DomainKey, Status: JobStatus(r.Status)})
+		out = append(out, JobRef{
+			ID: r.ID, DomainKey: r.DomainKey, Status: JobStatus(r.Status), StudioStatus: StudioStatus(r.StudioStatus),
+		})
 	}
 	return out, nil
 }

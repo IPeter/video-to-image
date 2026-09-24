@@ -30,11 +30,17 @@ patches:
         path: /spec/template/spec/containers/0/env/1/value
         value: https://cardealer.peterilles.com
 # Images are imported straight into the node's containerd (no registry); deploy.sh
-# rewrites the tags. The default pull policy for a non-latest tag is IfNotPresent.
+# rewrites the tags (one per image). The default pull policy for a non-latest tag is
+# IfNotPresent.
 images:
   - name: v2i
     newName: localhost/v2i
-    newTag: c3d6792-20260923175233
+    newTag: faa2635-20260923220202
   - name: v2i-web
     newName: localhost/v2i-web
-    newTag: c3d6792-20260923175233
+    newTag: faa2635-20260923220202
+  # Studio sidecar (services/studio). Its tag only changes when the image changed, and
+  # "unbuilt" until the first deploy.sh run that builds it.
+  - name: v2i-studio
+    newName: localhost/v2i-studio
+    newTag: faa2635-20260923220202

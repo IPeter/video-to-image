@@ -64,22 +64,26 @@ SET status             = 'completed',
     result_explanation = $1,
     missing_shots      = $2,
     zip_path           = $3,
+    studio_status      = $4,
     updated_at         = now()
-WHERE id = $4 AND status = 'processing'
+WHERE id = $5 AND status = 'processing'
 `
 
 type CompleteJobParams struct {
 	ResultExplanation string
 	MissingShots      []byte
 	ZipPath           *string
+	StudioStatus      string
 	ID                string
 }
 
+// @studio_status is 'none' or 'pending' (the studio job is enqueued in the same transaction).
 func (q *Queries) CompleteJob(ctx context.Context, arg CompleteJobParams) (int64, error) {
 	result, err := q.db.Exec(ctx, completeJob,
 		arg.ResultExplanation,
 		arg.MissingShots,
 		arg.ZipPath,
+		arg.StudioStatus,
 		arg.ID,
 	)
 	if err != nil {
@@ -90,13 +94,16 @@ func (q *Queries) CompleteJob(ctx context.Context, arg CompleteJobParams) (int64
 
 const expireJob = `-- name: ExpireJob :execrows
 UPDATE jobs
-SET status     = 'expired',
-    video_path = NULL,
-    zip_path   = NULL,
-    updated_at = now()
+SET status          = 'expired',
+    video_path      = NULL,
+    zip_path        = NULL,
+    studio_zip_path = NULL,
+    studio_status   = CASE WHEN studio_status IN ('pending', 'running') THEN 'skipped' ELSE studio_status END,
+    updated_at      = now()
 WHERE id = $1 AND status <> 'expired'
 `
 
+// Studio work still pending or running ends as skipped: nothing is made for a deleted job.
 func (q *Queries) ExpireJob(ctx context.Context, id string) (int64, error) {
 	result, err := q.db.Exec(ctx, expireJob, id)
 	if err != nil {
@@ -147,8 +154,46 @@ func (q *Queries) FailJob(ctx context.Context, arg FailJobParams) (int64, error)
 	return result.RowsAffected(), nil
 }
 
+const failStudio = `-- name: FailStudio :execrows
+UPDATE jobs
+SET studio_status = 'failed', updated_at = now()
+WHERE id = $1 AND studio_status IN ('pending', 'running')
+`
+
+// pending | running → failed, whatever the job's status (River gave up on the studio job).
+func (q *Queries) FailStudio(ctx context.Context, id string) (int64, error) {
+	result, err := q.db.Exec(ctx, failStudio, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const finishStudio = `-- name: FinishStudio :execrows
+UPDATE jobs
+SET studio_status   = $1,
+    studio_zip_path = $2,
+    updated_at      = now()
+WHERE id = $3 AND status = 'completed' AND studio_status = 'running'
+`
+
+type FinishStudioParams struct {
+	StudioStatus  string
+	StudioZipPath *string
+	ID            string
+}
+
+// running → done | failed | skipped, with the studio.zip key (NULL when none was built).
+func (q *Queries) FinishStudio(ctx context.Context, arg FinishStudioParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishStudio, arg.StudioStatus, arg.StudioZipPath, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getJob = `-- name: GetJob :one
-SELECT id, domain_key, status, created_at, updated_at, expires_at, client_ip_hash, video_path, video_info, model_name, gate, video_summary, result_explanation, missing_shots, zip_path, error_code, error_message, internal_log, cost_usd FROM jobs WHERE id = $1
+SELECT id, domain_key, status, created_at, updated_at, expires_at, client_ip_hash, video_path, video_info, model_name, gate, video_summary, result_explanation, missing_shots, zip_path, error_code, error_message, internal_log, cost_usd, studio_status, studio_zip_path FROM jobs WHERE id = $1
 `
 
 func (q *Queries) GetJob(ctx context.Context, id string) (Job, error) {
@@ -174,6 +219,8 @@ func (q *Queries) GetJob(ctx context.Context, id string) (Job, error) {
 		&i.ErrorMessage,
 		&i.InternalLog,
 		&i.CostUsd,
+		&i.StudioStatus,
+		&i.StudioZipPath,
 	)
 	return i, err
 }
@@ -187,6 +234,22 @@ func (q *Queries) GetJobStatus(ctx context.Context, id string) (JobStatus, error
 	var status JobStatus
 	err := row.Scan(&status)
 	return status, err
+}
+
+const getStudioState = `-- name: GetStudioState :one
+SELECT status, studio_status FROM jobs WHERE id = $1
+`
+
+type GetStudioStateRow struct {
+	Status       JobStatus
+	StudioStatus string
+}
+
+func (q *Queries) GetStudioState(ctx context.Context, id string) (GetStudioStateRow, error) {
+	row := q.db.QueryRow(ctx, getStudioState, id)
+	var i GetStudioStateRow
+	err := row.Scan(&i.Status, &i.StudioStatus)
+	return i, err
 }
 
 const insertJob = `-- name: InsertJob :exec
@@ -226,7 +289,7 @@ func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) error {
 }
 
 const listExpiredJobs = `-- name: ListExpiredJobs :many
-SELECT id, domain_key, status
+SELECT id, domain_key, status, studio_status
 FROM jobs
 WHERE expires_at < $1 AND status <> 'expired'
 ORDER BY expires_at, id
@@ -239,9 +302,10 @@ type ListExpiredJobsParams struct {
 }
 
 type ListExpiredJobsRow struct {
-	ID        string
-	DomainKey string
-	Status    JobStatus
+	ID           string
+	DomainKey    string
+	Status       JobStatus
+	StudioStatus string
 }
 
 func (q *Queries) ListExpiredJobs(ctx context.Context, arg ListExpiredJobsParams) ([]ListExpiredJobsRow, error) {
@@ -253,7 +317,12 @@ func (q *Queries) ListExpiredJobs(ctx context.Context, arg ListExpiredJobsParams
 	items := []ListExpiredJobsRow{}
 	for rows.Next() {
 		var i ListExpiredJobsRow
-		if err := rows.Scan(&i.ID, &i.DomainKey, &i.Status); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.DomainKey,
+			&i.Status,
+			&i.StudioStatus,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -326,6 +395,23 @@ WHERE id = $1 AND status = 'queued'
 
 func (q *Queries) StartProcessing(ctx context.Context, id string) (int64, error) {
 	result, err := q.db.Exec(ctx, startProcessing, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const startStudio = `-- name: StartStudio :execrows
+UPDATE jobs
+SET studio_status = 'running', updated_at = now()
+WHERE id = $1 AND status = 'completed' AND studio_status IN ('pending', 'running')
+`
+
+// Studio backgrounds (internal/pipeline/studiojob): pending → running; already running
+// is a no-op (River re-delivery). Start and finish need a completed job, so a job the
+// user deleted (expired) in the meantime stops the studio work.
+func (q *Queries) StartStudio(ctx context.Context, id string) (int64, error) {
+	result, err := q.db.Exec(ctx, startStudio, id)
 	if err != nil {
 		return 0, err
 	}

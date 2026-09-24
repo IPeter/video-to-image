@@ -1,5 +1,6 @@
 # Local development dependencies: Postgres (jobs + River queue) and MinIO (S3-compatible
-# storage). The Go binary and the Next.js app run on the host (see README.md).
+# storage), plus the optional studio sidecar (profile "studio", `make studio-up`). The Go
+# binary and the Next.js app run on the host (see README.md).
 # MinIO images come from quay.io (Docker Hub minio/* images are no longer published).
 # Host ports are offset (55432, 59000/59001) to avoid clashing with a local Postgres/MinIO.
 name: v2i
@@ -52,6 +53,37 @@ services:
       mc ilm rule add --expire-days 3 local/v2i || true
       "
     restart: "no"
+
+  # Segmentation sidecar for studio backgrounds (services/studio). Not started by
+  # `make deps-up`: `make studio-up` (profile "studio"), then run the Go worker with
+  # V2I_STUDIO_URL=http://127.0.0.1:4100. The models (~0.6 GB, not in git) come from
+  # `make studio-models`; they are baked into the image and also mounted read-only over
+  # its copy (with the models.sha256 they are verified against), so a changed model
+  # needs a restart, not a rebuild.
+  studio:
+    profiles: ["studio"]
+    build:
+      context: services/studio
+    image: v2i-studio:dev
+    environment:
+      STUDIO_HOST: 0.0.0.0 # inside the container; published on the host's loopback only
+      STUDIO_PORT: "4100"
+      STUDIO_THREADS: "4"
+    ports:
+      - "127.0.0.1:4100:4100"
+    volumes:
+      - ./services/studio/models:/models:ro
+      - ./services/studio/models.sha256:/app/models.sha256:ro
+    cpus: 4
+    mem_limit: 4g
+    restart: unless-stopped
+    healthcheck: # /readyz: 200 once the models are loaded and warmed up (same check as k8s)
+      test: ["CMD", "python3", "-S", "-c", "import socket,sys;s=socket.create_connection(('127.0.0.1',4100),4);s.sendall(b'GET /readyz HTTP/1.0\\r\\n\\r\\n');sys.exit(s.makefile('rb').readline().split()[1:2]!=[b'200'])"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 600s # warm-up takes ~20 s, minutes on a busy laptop
+      start_interval: 2s
 
 volumes:
   pgdata:

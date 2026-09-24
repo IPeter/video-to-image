@@ -3,6 +3,8 @@
 .idea
 .vscode
 .env
+.playwright-mcp
+**/.DS_Store
 bin
 data
 report
@@ -10,5 +12,10 @@ docs
 plan
 web
 testdata
+test-video
 api
 **/*_test.go
+# The studio sidecar (and its ~0.6 GB of models) is built from its own context
+# (services/studio); overlay secrets never enter an image build context.
+services
+deploy/k8s

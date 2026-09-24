@@ -7,6 +7,9 @@ metadata:
 spec:
   selector:
     app.kubernetes.io/name: v2i-worker
+  # Metrics only: keep scraping while the studio sidecar (which the pod's readiness
+  # waits for) is still loading its models or restarting.
+  publishNotReadyAddresses: true
   ports:
     - name: admin
       port: 4001
@@ -20,6 +23,11 @@ metadata:
     app.kubernetes.io/name: v2i-worker
 spec:
   replicas: 1 # CPU-bound; pipeline concurrency is V2I_PIPELINE_WORKERS
+  # The old pod stops before the new one starts: a surge pod would double the pod's
+  # 7.5 GiB of limits (worker + studio sidecar) on the 15 GiB node, and a sidecar that
+  # never gets ready would keep both pods running.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: v2i-worker
@@ -27,6 +35,8 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: v2i-worker
+      annotations:
+        kubectl.kubernetes.io/default-container: worker # `kubectl logs/exec` without -c
     spec:
       automountServiceAccountToken: false
       # Graceful stop waits for running jobs up to V2I_SHUTDOWN_TIMEOUT (30 s) + hard stop.
@@ -77,6 +87,77 @@ spec:
             - { name: data, mountPath: /data }
             - { name: scratch, mountPath: /scratch }
             - { name: tmp, mountPath: /tmp }
+        # Segmentation sidecar for studio backgrounds (services/studio: BiRefNet-lite + SAM
+        # 2.1, models baked into the image). The worker calls it at V2I_STUDIO_URL
+        # (http://127.0.0.1:4100); it listens on localhost only, so no photo leaves the
+        # pod. A plain container rather than an init/native sidecar: the worker starts and
+        # runs without it, and the studio job retries while it loads or restarts.
+        - name: studio
+          image: v2i-studio
+          env:
+            - { name: STUDIO_HOST, value: 127.0.0.1 }
+            - { name: STUDIO_PORT, value: "4100" }
+            - { name: STUDIO_THREADS, value: "4" } # = the CPU limit
+            # Measured on the node (i5-12450H, 4 CPU / 4 GiB, 2026-09-24): the two models one
+            # after the other with 4 threads each, no ORT spin-waiting and the int8 SAM encoder
+            # take 7.3 s per photo (2.9 GB peak); running them concurrently was slower (8-25 s)
+            # and 2+2 fp32 ran out of memory at 4 GiB. int8 vs fp32 final masks: IoU ≥ 0.99998.
+            - { name: STUDIO_PARALLEL, value: "false" }
+            - { name: STUDIO_SAM_ENCODER, value: int8 }
+            - { name: STUDIO_SPINNING, value: "false" }
+          # The kubelet's httpGet dials the pod IP, which a localhost listener does not
+          # answer, so the probes GET inside the container: a bare socket under `python3 -S`
+          # (45 ms CPU; urllib costs 8x that), because a probe shares the container's CPU
+          # quota with a running inference. The sidecar answers /healthz as soon as it
+          # listens and /readyz once the models are loaded and warmed up; a failed model load
+          # ends the process (restart with back-off).
+          startupProbe: # up to 10 min to load + warm up (~20 s normally; 6 min seen under contention)
+            exec: { command: [python3, -S, -c, "import socket,sys;s=socket.create_connection(('127.0.0.1',4100),4);s.sendall(b'GET /readyz HTTP/1.0\\r\\n\\r\\n');sys.exit(s.makefile('rb').readline().split()[1:2]!=[b'200'])"] }
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            exec: { command: [python3, -S, -c, "import socket,sys;s=socket.create_connection(('127.0.0.1',4100),4);s.sendall(b'GET /readyz HTTP/1.0\\r\\n\\r\\n');sys.exit(s.makefile('rb').readline().split()[1:2]!=[b'200'])"] }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          # Generous: a mask run keeps all 4 CPUs busy for ~10 s, so answers can be slow.
+          # (The startupProbe already holds it back during model loading.)
+          livenessProbe:
+            exec: { command: [python3, -S, -c, "import socket,sys;s=socket.create_connection(('127.0.0.1',4100),8);s.sendall(b'GET /healthz HTTP/1.0\\r\\n\\r\\n');sys.exit(s.makefile('rb').readline().split()[1:2]!=[b'200'])"] }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 4
+          # On pod stop, keep serving while the worker drains (it finishes the running
+          # photo within V2I_SHUTDOWN_TIMEOUT); stops as soon as its admin port closes.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - python3
+                  - -S
+                  - -c
+                  - |
+                    import socket, time
+                    end = time.monotonic() + 35
+                    while time.monotonic() < end:
+                        try:
+                            socket.create_connection(("127.0.0.1", 4001), 1).close()
+                        except OSError:
+                            break
+                        time.sleep(1)
+          # Working set ~2.7 GB with both models at once (local run: OOM under a 2.6 GB
+          # limit, fine under 3.0 GB); the spike saw 2.5-2.9 GB on 2-8 MP frames with the
+          # models one after the other. Node: 12 CPUs / 15 GiB.
+          resources:
+            requests: { cpu: 500m, memory: 1536Mi }
+            limits: { cpu: "4", memory: 3584Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: studio-tmp, mountPath: /tmp }
       volumes:
         - name: domains
           configMap: { name: v2i-domains }
@@ -86,3 +167,5 @@ spec:
           emptyDir: { sizeLimit: 10Gi }
         - name: tmp
           emptyDir: { sizeLimit: 256Mi }
+        - name: studio-tmp
+          emptyDir: { sizeLimit: 128Mi }

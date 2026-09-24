@@ -5,6 +5,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,7 +85,25 @@ type Config struct {
 	// 0 = auto: GOMAXPROCS / (FFMPEG_THREADS × V2I_PIPELINE_WORKERS), at least 1 (see
 	// pipeline.ExtractConcurrency). Each 4K HEVC process holds about 450 MiB at 2 threads.
 	ExtractConcurrency int `env:"V2I_EXTRACT_CONCURRENCY" envDefault:"0"`
+
+	// StudioURL is the base URL of the studio-background segmentation sidecar (e.g.
+	// http://127.0.0.1:4100, in the worker pod). "" turns studio backgrounds off in this
+	// process; StudioFake uses the built-in fake segmenter (tests, e2e).
+	StudioURL string `env:"V2I_STUDIO_URL"`
+	// StudioTimeout bounds the segmentation of one photo (the sidecar call, including
+	// its busy retries).
+	StudioTimeout time.Duration `env:"V2I_STUDIO_TIMEOUT" envDefault:"45s"`
+	// StudioWorkers is the studio queue's MaxWorkers in this process. The sidecar runs
+	// one request at a time, so more than 1 only queues requests there.
+	StudioWorkers int `env:"V2I_STUDIO_WORKERS" envDefault:"1"`
 }
+
+// StudioFake is the V2I_STUDIO_URL value that selects the fake segmenter.
+const StudioFake = "fake"
+
+// StudioEnabled reports whether this process makes studio backgrounds (a sidecar URL or
+// the fake segmenter is configured).
+func (c *Config) StudioEnabled() bool { return c.StudioURL != "" }
 
 type StorageConfig struct {
 	Backend          string `env:"V2I_STORAGE"           envDefault:"local"` // local | s3
@@ -152,6 +171,30 @@ func (c *Config) RequireSafeDefaults() error {
 	}
 	if c.InternalToken != "" && (len(c.InternalToken) < MinInternalTokenLen || c.InternalToken == "dev-internal-token") {
 		return fmt.Errorf("config: V2I_INTERNAL_TOKEN must be a random value of at least %d characters with analyzer %q (e.g. `openssl rand -hex 24`)", MinInternalTokenLen, c.Analyzer)
+	}
+	if c.StudioURL == StudioFake {
+		// The fake segmenter cuts an ellipse out of the photo: real listings would get
+		// studio versions with parts of the car missing.
+		return fmt.Errorf("config: V2I_STUDIO_URL=%s is for tests only and must not be used with analyzer %q", StudioFake, c.Analyzer)
+	}
+	return nil
+}
+
+// RequireStudio validates the studio-background settings of a worker process:
+// V2I_STUDIO_URL empty, StudioFake or an absolute http(s) URL, a positive timeout and at
+// least one worker.
+func (c *Config) RequireStudio() error {
+	if c.StudioURL != "" && c.StudioURL != StudioFake {
+		u, err := url.Parse(c.StudioURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("config: V2I_STUDIO_URL %q is not an http(s) URL (or %q, or empty to turn studio backgrounds off)", c.StudioURL, StudioFake)
+		}
+	}
+	if c.StudioTimeout <= 0 {
+		return fmt.Errorf("config: V2I_STUDIO_TIMEOUT must be positive (got %s)", c.StudioTimeout)
+	}
+	if c.StudioWorkers < 1 {
+		return fmt.Errorf("config: V2I_STUDIO_WORKERS must be at least 1 (got %d)", c.StudioWorkers)
 	}
 	return nil
 }

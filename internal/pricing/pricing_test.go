@@ -34,3 +34,12 @@ func TestLookupVariants(t *testing.T) {
 	assert.False(t, ok)
 	assert.Zero(t, c)
 }
+
+// The studio QA check (gemini-3.8-flash, two ≤1024 px images, a short JSON answer)
+// costs about $0.002-0.005 per photo (research spike); its usage counts against the
+// daily ceiling, so the model must have a price.
+func TestStudioQAModelIsPriced(t *testing.T) {
+	c, ok := Cost("gemini-3.8-flash", 2_300, 80, 0)
+	assert.True(t, ok)
+	assert.InDelta(t, 0.002, c, 0.0005)
+}

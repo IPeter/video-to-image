@@ -32,7 +32,7 @@ func TestOpenAPISpec(t *testing.T) {
 	}
 	sort.Strings(opIDs)
 	assert.Equal(t, []string{
-		"abortUpload", "completeUpload", "createJob", "createUpload", "deleteJob", "downloadZip",
-		"getDomain", "getImage", "getJob", "getThumbnail", "getUsage", "putUploadChunk",
+		"abortUpload", "completeUpload", "createJob", "createUpload", "deleteJob", "downloadStudioZip", "downloadZip",
+		"getDomain", "getImage", "getJob", "getStudioImage", "getStudioThumbnail", "getThumbnail", "getUsage", "putUploadChunk",
 	}, opIDs)
 }

@@ -136,6 +136,7 @@ func (w *RetentionWorker) ExpireDue(ctx context.Context) (int, error) {
 // swept a second time after ExpireJob: every upload that preceded a successful
 // CompleteJob happened before ExpireJob, and from ExpireJob on the worker's own
 // CompleteJob (or step check) fails with ErrConflict and it deletes its uploads itself.
+// The same holds for a completed job whose studio work was pending or running.
 // The second sweep is best effort (logged); the bucket lifecycle rule is the last net.
 func (w *RetentionWorker) expire(ctx context.Context, log *slog.Logger, ref store.JobRef) error {
 	if ref.ID == "" || ref.DomainKey == "" {
@@ -149,8 +150,11 @@ func (w *RetentionWorker) expire(ctx context.Context, log *slog.Logger, ref stor
 	if err := w.Store.ExpireJob(ctx, ref.ID); err != nil {
 		return fmt.Errorf("expire job %s: %w", ref.ID, err)
 	}
-	// A job that was already terminal when listed has no worker uploading any more.
-	if !ref.Status.Terminal() {
+	// A job that was already terminal when listed has no worker uploading any more,
+	// unless its studio work was pending or running (studio variants and studio.zip are
+	// uploaded after completion; from ExpireJob on the studio worker's writes fail and it
+	// deletes its own uploads).
+	if !ref.Status.Terminal() || ref.StudioStatus.Active() {
 		if err := w.Storage.DeletePrefix(ctx, prefix); err != nil {
 			log.Warn("retention: second file sweep after expiring failed; leftovers stay until the bucket lifecycle rule",
 				"job_id", ref.ID, "domain", ref.DomainKey, "prefix", prefix, "err", err)
@@ -200,10 +204,10 @@ func (w *FilesSweepWorker) Work(ctx context.Context, _ *river.Job[FilesSweepArgs
 }
 
 // CostGuardWorker compares today's model spend with the daily ceiling and pauses the
-// pipeline queue above it (running jobs finish; nothing new is fetched by any worker
-// process) and resumes it below it. A ceiling <= 0 disables the guard and makes sure
-// the queue is running. The PipelineWorker's own ceiling check covers the gap between
-// two guard runs.
+// pipeline and studio queues above it (running jobs finish; nothing new is fetched by
+// any worker process) and resumes them below it. A ceiling <= 0 disables the guard and
+// makes sure the queues are running. The PipelineWorker's own ceiling check (and the
+// studio runner's, before each paid check) covers the gap between two guard runs.
 type CostGuardWorker struct {
 	river.WorkerDefaults[CostGuardArgs]
 
@@ -222,56 +226,78 @@ func (w *CostGuardWorker) Work(ctx context.Context, _ *river.Job[CostGuardArgs])
 	return w.Check(ctx)
 }
 
-// Check runs one guard pass.
+// guardedQueues are the queues whose jobs spend model money. The pipeline queue is
+// registered by every worker process; the studio queue only by processes with a
+// segmentation sidecar, so it may legitimately be missing from river_queue.
+var guardedQueues = []struct {
+	name     string
+	optional bool // not registered yet → nothing to pause
+}{
+	{QueuePipeline, false},
+	{QueueStudio, true},
+}
+
+// Check runs one guard pass over every guarded queue; a queue that fails does not stop
+// the others (the error joins their failures).
 func (w *CostGuardWorker) Check(ctx context.Context) error {
 	cost, err := w.Store.CostSince(ctx, startOfDayUTC(nowOrDefault(w.Now)))
 	if err != nil {
 		return fmt.Errorf("queue: cost guard: %w", err)
 	}
 	metrics.DailyCostUSD.Set(cost)
-	if w.DailyCostCeilingUSD > 0 && cost >= w.DailyCostCeilingUSD {
-		return w.pause(ctx, cost)
+	over := w.DailyCostCeilingUSD > 0 && cost >= w.DailyCostCeilingUSD
+	var errs []error
+	for _, q := range guardedQueues {
+		if over {
+			errs = append(errs, w.pause(ctx, q.name, q.optional, cost))
+		} else {
+			errs = append(errs, w.resume(ctx, q.name, cost))
+		}
 	}
-	return w.resume(ctx, cost)
+	return errors.Join(errs...)
 }
 
-// pause pauses the pipeline queue. River's QueuePause is idempotent (an already paused
-// queue keeps its paused_at); the only error it reports for a valid name is
-// rivertype.ErrNotFound when no client has registered the queue in river_queue yet.
-func (w *CostGuardWorker) pause(ctx context.Context, cost float64) error {
-	q, err := w.Queues.QueueGet(ctx, QueuePipeline)
+// pause pauses the queue. River's QueuePause is idempotent (an already paused queue
+// keeps its paused_at); the only error it reports for a valid name is
+// rivertype.ErrNotFound when no client has registered the queue in river_queue yet,
+// which is an error unless the queue is optional.
+func (w *CostGuardWorker) pause(ctx context.Context, name string, optional bool, cost float64) error {
+	q, err := w.Queues.QueueGet(ctx, name)
 	if err != nil {
 		if errors.Is(err, rivertype.ErrNotFound) {
-			return fmt.Errorf("queue: cost guard: pause %s: queue not registered yet: %w", QueuePipeline, err)
+			if optional {
+				return nil
+			}
+			return fmt.Errorf("queue: cost guard: pause %s: queue not registered yet: %w", name, err)
 		}
-		return fmt.Errorf("queue: cost guard: get %s: %w", QueuePipeline, err)
+		return fmt.Errorf("queue: cost guard: get %s: %w", name, err)
 	}
 	if q.PausedAt == nil {
-		if err := w.Queues.QueuePause(ctx, QueuePipeline, nil); err != nil {
-			return fmt.Errorf("queue: cost guard: pause %s: %w", QueuePipeline, err)
+		if err := w.Queues.QueuePause(ctx, name, nil); err != nil {
+			return fmt.Errorf("queue: cost guard: pause %s: %w", name, err)
 		}
-		logger(w.Logger).Warn("daily cost ceiling reached; pipeline queue paused",
+		logger(w.Logger).Warn("daily cost ceiling reached; queue paused", "queue", name,
 			"cost_usd", cost, "ceiling_usd", w.DailyCostCeilingUSD)
 	}
-	metrics.QueuePaused.WithLabelValues(QueuePipeline).Set(1)
+	metrics.QueuePaused.WithLabelValues(name).Set(1)
 	return nil
 }
 
-// resume resumes the pipeline queue when it is paused. A queue missing from river_queue
-// is not paused.
-func (w *CostGuardWorker) resume(ctx context.Context, cost float64) error {
-	q, err := w.Queues.QueueGet(ctx, QueuePipeline)
+// resume resumes the queue when it is paused. A queue missing from river_queue is not
+// paused.
+func (w *CostGuardWorker) resume(ctx context.Context, name string, cost float64) error {
+	q, err := w.Queues.QueueGet(ctx, name)
 	switch {
 	case errors.Is(err, rivertype.ErrNotFound):
 	case err != nil:
-		return fmt.Errorf("queue: cost guard: get %s: %w", QueuePipeline, err)
+		return fmt.Errorf("queue: cost guard: get %s: %w", name, err)
 	case q.PausedAt != nil:
-		if err := w.Queues.QueueResume(ctx, QueuePipeline, nil); err != nil && !errors.Is(err, rivertype.ErrNotFound) {
-			return fmt.Errorf("queue: cost guard: resume %s: %w", QueuePipeline, err)
+		if err := w.Queues.QueueResume(ctx, name, nil); err != nil && !errors.Is(err, rivertype.ErrNotFound) {
+			return fmt.Errorf("queue: cost guard: resume %s: %w", name, err)
 		}
-		logger(w.Logger).Info("pipeline queue resumed", "cost_usd", cost, "ceiling_usd", w.DailyCostCeilingUSD)
+		logger(w.Logger).Info("queue resumed", "queue", name, "cost_usd", cost, "ceiling_usd", w.DailyCostCeilingUSD)
 	}
-	metrics.QueuePaused.WithLabelValues(QueuePipeline).Set(0)
+	metrics.QueuePaused.WithLabelValues(name).Set(0)
 	return nil
 }
 
@@ -314,7 +340,7 @@ func (w *StatsWorker) Refresh(ctx context.Context) error {
 	} else {
 		// Every queue × state gets a series (0 when empty) so graphs have no gaps;
 		// the vector is reset first so queues that disappeared drop out.
-		queues := []string{QueuePipeline, QueueMaintenance}
+		queues := []string{QueuePipeline, QueueStudio, QueueMaintenance}
 		for q := range depth {
 			if !slices.Contains(queues, q) {
 				queues = append(queues, q)

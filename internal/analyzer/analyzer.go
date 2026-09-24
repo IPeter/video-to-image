@@ -16,6 +16,7 @@ const (
 	StepAnalyze = "analyze"
 	StepRerank  = "rerank" // legacy, replaced by StepReview
 	StepReview  = "review"
+	StepStudio  = "studio" // the studio-background QA check (internal/studio)
 )
 
 // ErrUnavailable means the provider failed after its own transient-error retries
@@ -27,7 +28,7 @@ var ErrNoRecording = errors.New("analyzer: no recording for request")
 
 // Request is one model call.
 type Request struct {
-	Step      string // StepAnalyze | StepReview
+	Step      string // StepAnalyze | StepReview | StepStudio
 	JobID     string // for logs
 	DomainKey string // for logs
 	// CacheKey identifies the request for recording/replay. It must be stable across

@@ -61,6 +61,17 @@ type fakeStore struct {
 	counts    map[store.JobStatus]int64
 	countErr  error
 	statCalls int
+
+	logs []failCall // AppendInternalLog calls (ID, InternalLog)
+
+	// studio: FailStudio moves a job of studioByID from pending/running to failed and
+	// reports ErrConflict otherwise (ErrNotFound for unknown jobs when studioByID is set).
+	studioByID       map[string]store.StudioStatus
+	studioFails      []failCall // ID, Message (the reason)
+	studioFailErr    error
+	studioOrphans    []store.JobRef
+	studioOrphanErr  error
+	studioOrphanCall []listCall
 }
 
 type failCall struct{ ID, Code, Message, InternalLog string }
@@ -249,6 +260,66 @@ func (f *fakeStore) CountJobsByStatus(context.Context) (map[store.JobStatus]int6
 	return f.counts, f.countErr
 }
 
+func (f *fakeStore) AppendInternalLog(_ context.Context, id, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logs = append(f.logs, failCall{ID: id, InternalLog: text})
+	return nil
+}
+
+func (f *fakeStore) internalLogs() []failCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]failCall(nil), f.logs...)
+}
+
+func (f *fakeStore) FailStudio(_ context.Context, jobID, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.studioFails = append(f.studioFails, failCall{ID: jobID, Message: reason})
+	if f.studioFailErr != nil {
+		return f.studioFailErr
+	}
+	if f.studioByID == nil {
+		return nil
+	}
+	st, ok := f.studioByID[jobID]
+	switch {
+	case !ok:
+		return fmt.Errorf("fake: fail studio %s: %w", jobID, store.ErrNotFound)
+	case !st.Active():
+		return fmt.Errorf("fake: fail studio %s: studio %s: %w", jobID, st, store.ErrConflict)
+	}
+	f.studioByID[jobID] = store.StudioFailed
+	return nil
+}
+
+func (f *fakeStore) studioFailCalls() []failCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]failCall(nil), f.studioFails...)
+}
+
+func (f *fakeStore) ListOrphanedStudioJobs(_ context.Context, idleSince time.Time, limit int) ([]store.JobRef, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.studioOrphanCall = append(f.studioOrphanCall, listCall{idleSince, limit})
+	if f.studioOrphanErr != nil {
+		return nil, f.studioOrphanErr
+	}
+	var out []store.JobRef
+	for _, ref := range f.studioOrphans {
+		if len(out) >= limit {
+			break
+		}
+		if st, ok := f.studioByID[ref.ID]; ok && !st.Active() {
+			continue
+		}
+		out = append(out, ref)
+	}
+	return out, nil
+}
+
 // fakeStorage records DeletePrefix calls; prefixes containing a failOn substring fail.
 // objects is an optional key set that DeletePrefix removes from, and afterDelete (if
 // set) runs after every successful DeletePrefix, outside the lock, with the call's
@@ -414,6 +485,33 @@ func (q *fakeQueues) QueueResume(context.Context, string, *river.QueuePauseOpts)
 	return nil
 }
 
+// fakeQueueSet dispatches to one fakeQueues per queue name; a name without an entry is
+// not registered (rivertype.ErrNotFound).
+type fakeQueueSet map[string]*fakeQueues
+
+var _ QueueController = fakeQueueSet(nil)
+
+func (s fakeQueueSet) QueueGet(ctx context.Context, name string) (*rivertype.Queue, error) {
+	if q := s[name]; q != nil {
+		return q.QueueGet(ctx, name)
+	}
+	return nil, rivertype.ErrNotFound
+}
+
+func (s fakeQueueSet) QueuePause(ctx context.Context, name string, opts *river.QueuePauseOpts) error {
+	if q := s[name]; q != nil {
+		return q.QueuePause(ctx, name, opts)
+	}
+	return rivertype.ErrNotFound
+}
+
+func (s fakeQueueSet) QueueResume(ctx context.Context, name string, opts *river.QueuePauseOpts) error {
+	if q := s[name]; q != nil {
+		return q.QueueResume(ctx, name, opts)
+	}
+	return rivertype.ErrNotFound
+}
+
 type failingQuerier struct{}
 
 func (failingQuerier) Query(context.Context, string, ...any) (pgx.Rows, error) {
@@ -428,6 +526,17 @@ func pipelineJob(jobID string, attempt, maxAttempts int) *river.Job[PipelineArgs
 			Kind: PipelineArgs{}.Kind(), Queue: QueuePipeline,
 		},
 		Args: PipelineArgs{JobID: jobID},
+	}
+}
+
+// studioJob builds the job River hands to StudioWorker.Work.
+func studioJob(jobID string, attempt, maxAttempts int) *river.Job[StudioArgs] {
+	return &river.Job[StudioArgs]{
+		JobRow: &rivertype.JobRow{
+			ID: 43, Attempt: attempt, MaxAttempts: maxAttempts,
+			Kind: StudioArgs{}.Kind(), Queue: QueueStudio,
+		},
+		Args: StudioArgs{JobID: jobID},
 	}
 }
 

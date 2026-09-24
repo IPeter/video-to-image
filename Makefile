@@ -28,14 +28,16 @@ deps-up: ## Start Postgres + MinIO (docker compose)
 	docker compose up -d --wait postgres minio
 	docker compose up minio-init
 
-deps-down: ## Stop Postgres + MinIO
-	docker compose down
+deps-down: ## Stop Postgres + MinIO (and the studio sidecar)
+	docker compose --profile '*' down
 
 .PHONY: migrate dev dev-fake web-dev
 migrate: ## Run River + goose migrations
 	$(GO) run ./cmd/v2i migrate
 
-dev: deps-up migrate ## API + embedded worker on :4000 (analyzer from V2I_ANALYZER)
+# Studio backgrounds: `make studio-up`, then V2I_STUDIO_URL=http://127.0.0.1:4100 in .env
+# (or V2I_STUDIO_URL=fake for the built-in fake segmenter without the sidecar).
+dev: deps-up migrate ## API + embedded worker on :4000 (analyzer from V2I_ANALYZER, studio from V2I_STUDIO_URL)
 	$(GO) run ./cmd/v2i serve --embed-worker
 
 dev-fake: deps-up migrate ## Same as dev but with the free, deterministic fake analyzer
@@ -43,6 +45,32 @@ dev-fake: deps-up migrate ## Same as dev but with the free, deterministic fake a
 
 web-dev: ## Next.js dev server on :3000 for the cars domain
 	cd web && DOMAIN_KEY=cars API_URL=http://localhost:4000 $(PNPM) dev
+
+## ---- studio sidecar (services/studio; optional) ----
+
+.PHONY: studio-models studio-build studio-up studio-down studio-test
+studio-models: ## Fetch + verify the sidecar models into services/studio/models (~0.6 GB, not in git)
+	./services/studio/fetch-models.sh
+
+studio-build: studio-models ## Build the sidecar image (v2i-studio:dev)
+	docker compose --profile studio build studio
+
+studio-up: studio-models ## Sidecar on 127.0.0.1:4100, waits until the models are loaded
+	docker compose --profile studio up -d --build --wait studio
+
+studio-down: ## Stop the sidecar
+	docker compose --profile studio rm -sf studio
+
+# Python 3.12+ venv outside services/studio, so it never lands in the image build context.
+STUDIO_VENV ?= data/studio-venv
+
+$(STUDIO_VENV)/.deps: services/studio/requirements.txt services/studio/requirements-dev.txt
+	python3 -m venv $(STUDIO_VENV)
+	$(STUDIO_VENV)/bin/python -m pip install -q -r services/studio/requirements-dev.txt
+	touch $@
+
+studio-test: $(STUDIO_VENV)/.deps ## Sidecar unit tests (pytest in data/studio-venv; no models needed)
+	cd services/studio && $(abspath $(STUDIO_VENV))/bin/python -m pytest -q
 
 ## ---- code generation ----
 

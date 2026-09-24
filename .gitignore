@@ -38,3 +38,15 @@ coverage.out
 
 # Local test videos (large, personal: phone videos carry GPS metadata)
 /test-video/
+
+# Studio sidecar (services/studio): model files are fetched by fetch-models.sh (~0.6 GB,
+# verified against models.sha256), benchmark outputs and Python caches stay local.
+/services/studio/models/*
+!/services/studio/models/.gitignore
+/services/studio/bench*.json
+/services/studio/bench-*/
+/services/studio/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/

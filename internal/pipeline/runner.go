@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"video-to-image/internal/analyzer"
 	"video-to-image/internal/domain"
 	"video-to-image/internal/ids"
@@ -31,9 +33,11 @@ import (
 	"video-to-image/internal/pipeline/review"
 	"video-to-image/internal/pipeline/score"
 	"video-to-image/internal/pipeline/selectr"
+	"video-to-image/internal/pipeline/studiojob"
 	"video-to-image/internal/pricing"
 	"video-to-image/internal/storage"
 	"video-to-image/internal/store"
+	"video-to-image/internal/studio"
 )
 
 // Job error codes (subset of httpapi.ErrorCode) and their user-safe messages.
@@ -72,6 +76,12 @@ type Store interface {
 	InsertUsage(ctx context.Context, e store.UsageEvent) error
 }
 
+// StudioEnqueuer inserts the studio job of a job inside the given transaction
+// (*queue.Client).
+type StudioEnqueuer interface {
+	EnqueueStudioTx(ctx context.Context, tx pgx.Tx, jobID string) error
+}
+
 // Runner runs the pipeline for one job. It is safe for concurrent use by several
 // River workers (all per-job state lives on the stack and in the job's scratch dir).
 type Runner struct {
@@ -86,6 +96,12 @@ type Runner struct {
 	// (extract.Input.Concurrency; ≤ 0 → extract.DefaultConcurrency). The worker sets it
 	// with the ExtractConcurrency function.
 	ExtractConcurrency int
+	// Studio, when set, schedules studio backgrounds (internal/pipeline/studiojob) for a
+	// job that completes with at least one eligible photo of a domain with studio
+	// enabled: studio_status pending and the studio job inserted in the completion's
+	// transaction. nil: this process has no segmentation sidecar; studio_status stays
+	// none.
+	Studio StudioEnqueuer
 
 	// persistBackoff overrides defaultPersistBackoff (tests).
 	persistBackoff []time.Duration
@@ -634,7 +650,7 @@ func (rn *run) stepExport(ctx context.Context, sel *selectr.Output) error {
 				ID: e.ImageID, JobID: rn.job.ID, CandidateID: e.CandidateID, Idx: e.Index,
 				ShotID: e.ShotID, TimestampSec: e.TimestampSec, Width: e.Width, Height: e.Height,
 				Reason: e.Reason, FileName: e.FileName, ImagePath: e.ImageKey, ThumbPath: e.ThumbKey,
-				Bytes: e.Bytes, Rotation: e.Rotation, Crop: storeCrop(e),
+				Bytes: e.Bytes, Rotation: e.Rotation, Crop: storeCrop(e), SubjectBox: rn.subjectBox(e),
 			})
 		}
 		return map[string]any{"images": len(images), "zipKey": zipKey}, nil
@@ -642,12 +658,14 @@ func (rn *run) stepExport(ctx context.Context, sel *selectr.Output) error {
 	if err != nil {
 		return err
 	}
-	err = rn.Store.CompleteJob(ctx, rn.job.ID, store.Completion{
+	completion := store.Completion{
 		Explanation:  sel.Explanation,
 		MissingShots: shotIDs(sel.MissingShots),
 		ZipPath:      zipKey,
 		Images:       images,
-	})
+	}
+	rn.planStudio(&completion)
+	err = rn.Store.CompleteJob(ctx, rn.job.ID, completion)
 	if errors.Is(err, store.ErrConflict) {
 		return errJobGone
 	}
@@ -655,8 +673,68 @@ func (rn *run) stepExport(ctx context.Context, sel *selectr.Output) error {
 		return fmt.Errorf("pipeline: complete job: %w", err)
 	}
 	metrics.JobsFinished.WithLabelValues(rn.job.DomainKey, string(store.StatusCompleted)).Inc()
-	rn.log.Info("pipeline: completed", "images", len(images), "missing", len(sel.MissingShots))
+	rn.log.Info("pipeline: completed", "images", len(images), "missing", len(sel.MissingShots),
+		"studio", completion.Studio == store.StudioPending)
 	return nil
+}
+
+// subjectBox is the review's subject box of the exported frame, mapped through the
+// applied rotation and crop into the exported image (the prompt of the studio
+// segmentation); nil when the frame has no verdict or no usable box.
+func (rn *run) subjectBox(e export.Exported) *store.NRect {
+	a, ok := rn.assessments[e.CandidateID]
+	if !ok || !a.Box.Valid() {
+		return nil
+	}
+	return exportedBox(a.Box, e)
+}
+
+// exportedBox maps a box of the stored frame into the exported image e. The result is
+// clamped to [0,1] and rounded to 6 decimals like the crop; nil when nothing is left.
+func exportedBox(b review.Box, e export.Exported) *store.NRect {
+	var crop *studio.Box
+	if e.Cropped && e.Edit != nil && e.Edit.Crop != nil {
+		c := e.Edit.Crop
+		crop = &studio.Box{X0: c.X0, Y0: c.Y0, X1: c.X1, Y1: c.Y1}
+	}
+	m, ok := studio.MapBox(studio.Box{X0: b.X0, Y0: b.Y0, X1: b.X1, Y1: b.Y1}, e.Rotation, crop)
+	if !ok {
+		return nil
+	}
+	r6 := func(v float64) float64 { return math.Round(min(max(v, 0), 1)*1e6) / 1e6 }
+	r := &store.NRect{X0: r6(m.X0), Y0: r6(m.Y0), X1: r6(m.X1), Y1: r6(m.Y1)}
+	if math.IsNaN(m.X0+m.Y0+m.X1+m.Y1) || r.X0 >= r.X1 || r.Y0 >= r.Y1 {
+		return nil
+	}
+	return r
+}
+
+// planStudio schedules studio backgrounds with the completion when this process can make
+// them (rn.Studio), the domain has them and at least one photo is eligible
+// (studiojob.Eligible): studio_status pending, the studio job inserted in the same
+// transaction, and every photo that is not eligible recorded as skipped right away, so
+// it is never shown as waiting for a studio version.
+func (rn *run) planStudio(c *store.Completion) {
+	if rn.Studio == nil || !rn.dom.Studio.Enabled {
+		return
+	}
+	eligible := 0
+	for _, im := range c.Images {
+		if ok, _ := studiojob.Eligible(rn.dom, im); ok {
+			eligible++
+		}
+	}
+	if eligible == 0 {
+		return
+	}
+	for i, im := range c.Images {
+		if ok, reason := studiojob.Eligible(rn.dom, im); !ok {
+			c.Images[i].Studio = &store.ImageStudio{Status: store.ImageStudioSkipped, Reason: reason}
+		}
+	}
+	jobID := rn.job.ID
+	c.Studio = store.StudioPending
+	c.Enqueue = func(ctx context.Context, tx pgx.Tx) error { return rn.Studio.EnqueueStudioTx(ctx, tx, jobID) }
 }
 
 // ---- outcomes ----

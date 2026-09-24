@@ -118,6 +118,7 @@ export function hasUsage(usage: JobUsage | null | undefined): usage is JobUsage 
 const STEP_LABELS: ReadonlyMap<string, string> = new Map([
   ["analyze", "Understanding the video"],
   ["review", "Checking the photos"],
+  ["studio", "Studio check"],
 ]);
 
 /** A usage step in plain language; steps this build does not know keep their API name. */

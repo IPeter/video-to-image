@@ -71,7 +71,7 @@ func newServeCmd() *cobra.Command {
 				return err
 			}
 			if embedWorker {
-				if err := errors.Join(cfg.RequireAnalyzer(), cfg.RequireSafeDefaults()); err != nil {
+				if err := errors.Join(cfg.RequireAnalyzer(), cfg.RequireSafeDefaults(), cfg.RequireStudio()); err != nil {
 					return err
 				}
 			}
@@ -107,7 +107,7 @@ func newServeCmd() *cobra.Command {
 				}
 				enqueuer = worker.Client()
 				log.Info("embedded worker started", "analyzer", an.Name(), "pipeline_workers", cfg.PipelineWorkers,
-					"daily_cost_ceiling_usd", cfg.DailyCostCeilingUSD)
+					"studio", cfg.StudioEnabled(), "daily_cost_ceiling_usd", cfg.DailyCostCeilingUSD)
 			} else {
 				c, err := queue.NewInsertClient(a.Pool, log)
 				if err != nil {
@@ -170,7 +170,7 @@ func newWorkCmd() *cobra.Command {
 	var analyzerName string
 	cmd := &cobra.Command{
 		Use:   "work",
-		Short: "Run the River pipeline worker and periodic maintenance jobs",
+		Short: "Run the River pipeline worker (and, with V2I_STUDIO_URL, the studio queue) and periodic maintenance jobs",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, stop := signalContext()
 			defer stop()
@@ -179,7 +179,8 @@ func newWorkCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := errors.Join(cfg.RequireDatabase(), cfg.RequireStorage(), cfg.RequireAnalyzer(), cfg.RequireSafeDefaults()); err != nil {
+			if err := errors.Join(cfg.RequireDatabase(), cfg.RequireStorage(), cfg.RequireAnalyzer(), cfg.RequireSafeDefaults(),
+				cfg.RequireStudio()); err != nil {
 				return err
 			}
 			log := app.NewLogger(cfg).With("component", "worker")
@@ -201,7 +202,7 @@ func newWorkCmd() *cobra.Command {
 				return fmt.Errorf("start worker: %w", err)
 			}
 			log.Info("worker started", "analyzer", an.Name(), "pipeline_workers", cfg.PipelineWorkers,
-				"daily_cost_ceiling_usd", cfg.DailyCostCeilingUSD)
+				"studio", cfg.StudioEnabled(), "daily_cost_ceiling_usd", cfg.DailyCostCeilingUSD)
 
 			// Liveness + metrics for the worker pod (no readiness: it serves no traffic).
 			hs := newAdminServer(cfg.AdminAddr)

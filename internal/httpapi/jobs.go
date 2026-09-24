@@ -98,7 +98,7 @@ func (s *Server) getJob(ctx context.Context, in *JobPathInput) (*GetJobOutput, e
 }
 
 // jobDTO maps a job row (plus its steps, its model usage and, when completed, its
-// images) to the wire.
+// images with their studio versions) to the wire.
 func (s *Server) jobDTO(ctx context.Context, dc *domain.Config, job *store.Job) (Job, error) {
 	steps, err := s.d.Store.ListSteps(ctx, job.ID)
 	if err != nil {
@@ -131,6 +131,7 @@ func (s *Server) jobDTO(ctx context.Context, dc *domain.Config, job *store.Job) 
 	case store.StatusFailed:
 		out.Error = buildJobError(job.ErrorCode, job.ErrorMessage)
 	}
+	out.Studio = buildJobStudio(dc, job, out.Result)
 	return out, nil
 }
 
@@ -258,6 +259,7 @@ func buildResult(dc *domain.Config, job *store.Job, images []store.SelectedImage
 			ThumbnailURL:   u + "/thumb",
 			Rotation:       img.Rotation,
 			Cropped:        img.Crop != nil,
+			Studio:         buildImageStudio(dc, job, &img, u),
 		})
 	}
 	for _, id := range job.MissingShots {

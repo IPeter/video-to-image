@@ -622,9 +622,9 @@ func TestListExpiredJobs(t *testing.T) {
 	refs, err := s.ListExpiredJobs(ctx, now, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []store.JobRef{
-		{ID: oldest, DomainKey: "realestate", Status: store.StatusQueued},
-		{ID: middle, DomainKey: "cars", Status: store.StatusQueued},
-		{ID: newest, DomainKey: "cars", Status: store.StatusProcessing},
+		{ID: oldest, DomainKey: "realestate", Status: store.StatusQueued, StudioStatus: store.StudioNone},
+		{ID: middle, DomainKey: "cars", Status: store.StatusQueued, StudioStatus: store.StudioNone},
+		{ID: newest, DomainKey: "cars", Status: store.StatusProcessing, StudioStatus: store.StudioNone},
 	}, refs)
 
 	refs, err = s.ListExpiredJobs(ctx, now, 2)

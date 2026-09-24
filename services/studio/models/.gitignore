@@ -1,0 +1,4 @@
+# Model files are not in git: services/studio/fetch-models.sh fills this directory
+# (verified against ../models.sha256).
+*
+!.gitignore

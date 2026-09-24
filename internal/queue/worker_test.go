@@ -460,7 +460,8 @@ func TestStatsWorkerSetsGauges(t *testing.T) {
 	assert.Equal(t, 1.0, metricValue(t, metrics.QueueJobs.WithLabelValues(QueueMaintenance, "available")))
 	assert.Equal(t, 1.0, metricValue(t, metrics.QueueJobs.WithLabelValues(QueueMaintenance, "scheduled")))
 	assert.Equal(t, 0.0, metricValue(t, metrics.QueueJobs.WithLabelValues(QueuePipeline, "running")))
-	assert.Equal(t, 2*len(rivertype.JobStates()), seriesCount(metrics.QueueJobs),
+	assert.Equal(t, 0.0, metricValue(t, metrics.QueueJobs.WithLabelValues(QueueStudio, "available")))
+	assert.Equal(t, 3*len(rivertype.JobStates()), seriesCount(metrics.QueueJobs),
 		"every queue × state has a series and stale queues are dropped")
 }
 

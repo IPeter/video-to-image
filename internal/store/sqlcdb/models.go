@@ -139,6 +139,8 @@ type Job struct {
 	ErrorMessage      *string
 	InternalLog       string
 	CostUsd           pgtype.Numeric
+	StudioStatus      string
+	StudioZipPath     *string
 }
 
 type JobStep struct {
@@ -181,6 +183,8 @@ type SelectedImage struct {
 	Bytes        int32
 	Rotation     int32
 	Crop         []byte
+	SubjectBox   []byte
+	Studio       []byte
 }
 
 type UsageEvent struct {

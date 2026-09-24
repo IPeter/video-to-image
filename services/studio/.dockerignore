@@ -1,0 +1,9 @@
+# Only the runtime files go into the image.
+*
+!requirements.txt
+!models.sha256
+!models/
+!v2i_studio/
+**/__pycache__
+**/*.pyc
+**/*.part

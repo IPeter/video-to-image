@@ -1,0 +1,18 @@
+Test fixtures of internal/studio: public Wikimedia Commons photos, downscaled to 800 px
+on the long side (JPEG q88), each with the cut-out mask the studio research spike made
+for it (BiRefNet-general-lite + SAM 2.1 base-plus rescue union, 8-bit PNG, downscaled
+with a box filter to the photo's size). No user photos are kept here.
+
+pub03_chevrolet_sonic_white_rear34.jpg / .png
+  https://commons.wikimedia.org/wiki/File:2019_Chevrolet_Sonic_RS_in_Summit_White,_rear_right,_5-7-2022.jpg
+  Author: Cutlass. Licence: CC0 1.0.
+
+pub04_mazda_silver_rear34_vandalised.jpg / .png
+  https://commons.wikimedia.org/wiki/File:Vandalised_car_at_Bakers_Hill_car_park_02.jpg
+  Author: Philafrenzy. Licence: CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/).
+  Changes: downscaled; the mask is derived from the photo. Both files are shared under
+  the same licence.
+
+pub05_microvan_green_side_rusty.jpg / .png
+  https://commons.wikimedia.org/wiki/File:Moscow,_old_rusty_green_microvan,_Mar_2026_03.jpg
+  Author: Retired electrician. Licence: CC0 1.0.

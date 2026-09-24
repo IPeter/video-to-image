@@ -5,6 +5,7 @@ package domain
 
 import (
 	"net/url"
+	"slices"
 	"strings"
 )
 
@@ -24,6 +25,7 @@ type Config struct {
 	Selection Selection `yaml:"selection"`
 	Review    Review    `yaml:"review"`
 	Crop      Crop      `yaml:"crop"`
+	Studio    Studio    `yaml:"studio"`
 
 	RetentionHours int `yaml:"retentionHours" validate:"required,min=1"`
 
@@ -156,6 +158,89 @@ type Crop struct {
 	// frame, or the reverse) may go lower, to the largest short side the frame allows,
 	// but never below 480 px (crop.ReorientedMinShortSidePx).
 	MinShortSidePx int `yaml:"minShortSidePx" validate:"gte=0"`
+}
+
+// Studio configures studio backgrounds for exterior photos (internal/studio): the car
+// is cut out and put on a studio backdrop; car pixels stay the original pixels. Runs as
+// a separate job after the pipeline, only when the worker has a segmentation sidecar
+// (V2I_STUDIO_URL). Needs review.enabled (the review box prompts the segmentation).
+type Studio struct {
+	Enabled bool `yaml:"enabled"`
+	// Views are the shot IDs that get a studio version (exterior views only).
+	Views []string `yaml:"views" validate:"required_if=Enabled true,dive,required"`
+	// Styles to render, in display order; DefaultStyle is shown first. Values: grey,
+	// light, dark. Empty → [grey, light, dark]; DefaultStyle "" → grey.
+	Styles       []string `yaml:"styles" validate:"dive,oneof=grey light dark"`
+	DefaultStyle string   `yaml:"defaultStyle" validate:"omitempty,oneof=grey light dark"`
+	// QA runs a model check of every cut-out against the original; any missing car part
+	// withholds the studio version. QAModel "" → gemini-3.8-flash.
+	QA      bool   `yaml:"qa"`
+	QAModel string `yaml:"qaModel"`
+	// Gates overrides the default thresholds (internal/studio.GatesFor).
+	Gates StudioGates `yaml:"gates"`
+}
+
+// Studio defaults for zero values.
+const (
+	DefaultStudioStyle   = "grey"
+	DefaultStudioQAModel = "gemini-3.8-flash"
+)
+
+// StudioStyles are the known backdrops in their default display order (Studio.Styles
+// when unset).
+var StudioStyles = []string{"grey", "light", "dark"}
+
+// EffectiveDefaultStyle returns DefaultStyle or DefaultStudioStyle.
+func (s Studio) EffectiveDefaultStyle() string {
+	if s.DefaultStyle != "" {
+		return s.DefaultStyle
+	}
+	return DefaultStudioStyle
+}
+
+// EffectiveStyles returns the styles to render in display order, the default style
+// first: Styles (StudioStyles when empty) with EffectiveDefaultStyle moved to the front.
+// The result is a new slice.
+func (s Studio) EffectiveStyles() []string {
+	styles := s.Styles
+	if len(styles) == 0 {
+		styles = StudioStyles
+	}
+	def := s.EffectiveDefaultStyle()
+	out := make([]string, 0, len(styles)+1)
+	out = append(out, def)
+	for _, st := range styles {
+		if st != def {
+			out = append(out, st)
+		}
+	}
+	return out
+}
+
+// EffectiveQAModel returns QAModel or DefaultStudioQAModel.
+func (s Studio) EffectiveQAModel() string {
+	if s.QAModel != "" {
+		return s.QAModel
+	}
+	return DefaultStudioQAModel
+}
+
+// HasView reports whether photos of shotID get a studio version: studio is enabled and
+// shotID is one of Views.
+func (s Studio) HasView(shotID string) bool {
+	return s.Enabled && slices.Contains(s.Views, shotID)
+}
+
+// StudioGates are the mask checks of internal/studio (0 → the default). Fractions 0..1.
+type StudioGates struct {
+	MinIoU             float64 `yaml:"minIoU"             validate:"gte=0,lte=1"` // BiRefNet/SAM agreement; below → withhold (0.80)
+	MaxEdgeContact     float64 `yaml:"maxEdgeContact"     validate:"gte=0,lte=1"` // left/right/bottom edge share (0.02)
+	MaxTopEdgeContact  float64 `yaml:"maxTopEdgeContact"  validate:"gte=0,lte=1"` // top edge share (0.10)
+	MinBoxFill         float64 `yaml:"minBoxFill"         validate:"gte=0,lte=1"` // (0.45)
+	MaxBoxFill         float64 `yaml:"maxBoxFill"         validate:"gte=0,lte=1"` // (0.90)
+	MaxOutsideBox      float64 `yaml:"maxOutsideBox"      validate:"gte=0,lte=1"` // (0.03)
+	MaxSecondComponent float64 `yaml:"maxSecondComponent" validate:"gte=0,lte=1"` // (0.002)
+	MaxSemiTransparent float64 `yaml:"maxSemiTransparent" validate:"gte=0,lte=1"` // (0.05)
 }
 
 type Weights struct {

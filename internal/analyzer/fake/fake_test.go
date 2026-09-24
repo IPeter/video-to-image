@@ -286,6 +286,49 @@ func TestReview(t *testing.T) {
 	}
 }
 
+func TestStudioQA(t *testing.T) {
+	// The canned file is for the analyze step only.
+	path := filepath.Join(t.TempDir(), "canned.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"gate":{}}`), 0o600))
+	a := newFake(t, Options{ResponseFile: path})
+	parts := []analyzer.Part{
+		{Text: "Image 1 (original):"}, {FilePath: "a.jpg", MIMEType: "image/jpeg"},
+		{Text: "Image 2 (cut-out on magenta):"}, {FilePath: "b.jpg", MIMEType: "image/jpeg"},
+		{Text: "Compare."},
+	}
+	decode := func(text string) studioQAResponse {
+		dec := json.NewDecoder(strings.NewReader(text))
+		dec.DisallowUnknownFields()
+		var out studioQAResponse
+		require.NoError(t, dec.Decode(&out), text)
+		return out
+	}
+
+	resp, err := a.Generate(context.Background(), &analyzer.Request{
+		Step: analyzer.StepStudio, Model: "gemini-3.8-flash", Parts: parts, SourceName: "walkaround.mp4",
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"missingParts":[],"backgroundKept":[],"notes":""}`, resp.Text, "lists are empty arrays, not null")
+	assert.Equal(t, analyzer.Usage{
+		Model: ModelPrefix + "gemini-3.8-flash", InputTokens: StudioQAInputTokens, OutputTokens: StudioQAOutputTokens,
+	}, resp.Usage, "prefixed model: priced at $0")
+	assert.Len(t, resp.FileHandles, len(parts))
+
+	for _, name := range []string{"car-missingpart.mp4", "Car_MissingPart.MOV"} {
+		resp, err = a.Generate(context.Background(), &analyzer.Request{Step: analyzer.StepStudio, Parts: parts, SourceName: name})
+		require.NoError(t, err)
+		out := decode(resp.Text)
+		assert.Equal(t, []string{StudioMissingPart}, out.MissingParts, name)
+		assert.NotNil(t, out.BackgroundKept)
+		assert.Contains(t, out.Notes, "missingpart")
+	}
+
+	// Deterministic.
+	again, err := a.Generate(context.Background(), &analyzer.Request{Step: analyzer.StepStudio, Parts: parts, SourceName: "car-missingpart.mp4"})
+	require.NoError(t, err)
+	assert.Equal(t, resp.Text, again.Text)
+}
+
 func TestUnknownStepAndNilRequest(t *testing.T) {
 	a := newFake(t, Options{})
 	_, err := a.Generate(context.Background(), &analyzer.Request{Step: "summarise"})

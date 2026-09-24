@@ -4,10 +4,12 @@ import { ChevronLeft, ChevronRight, Download } from "lucide-react";
 import type { KeyboardEvent } from "react";
 
 import { imageAltText, ReframeBadge } from "@/components/result-card";
+import { StudioStatusLine, StudioToggle } from "@/components/studio";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { resolveApiUrl, type ResultImage } from "@/lib/api";
+import { originalVersion, type ShownVersion } from "@/lib/studio";
 
 export interface LightboxProps {
   images: readonly ResultImage[];
@@ -15,14 +17,31 @@ export interface LightboxProps {
   index: number | null;
   onIndexChange: (index: number | null) => void;
   apiBaseUrl: string;
+  /** The version of an image on screen (the same as on its card); default: the original. */
+  versionOf?: (image: ResultImage) => ShownVersion;
+  /** Flips an image between its studio version and the original (shared with its card). */
+  onToggleOriginal?: (image: ResultImage) => void;
 }
 
-/** Full-resolution viewer with previous/next buttons and ←/→ keys. Escape closes it. */
-export function Lightbox({ images, index, onIndexChange, apiBaseUrl }: LightboxProps) {
+/**
+ * Full-resolution viewer with previous/next buttons and ←/→ keys. Escape closes it. It
+ * shows the version the card shows, with the same "Show original" toggle, and Download
+ * saves that version.
+ */
+export function Lightbox({
+  images,
+  index,
+  onIndexChange,
+  apiBaseUrl,
+  versionOf = originalVersion,
+  onToggleOriginal,
+}: LightboxProps) {
   const position = index !== null && index >= 0 && index < images.length ? index : null;
   const image = position !== null ? images[position] : null;
   const hasPrev = position !== null && position > 0;
   const hasNext = position !== null && position < images.length - 1;
+  const shown = image ? versionOf(image) : null;
+  const studio = shown?.variant != null;
 
   const go = (delta: number) => {
     if (position === null) return;
@@ -42,7 +61,7 @@ export function Lightbox({ images, index, onIndexChange, apiBaseUrl }: LightboxP
 
   return (
     <Dialog open={image !== null} onOpenChange={(o) => !o && onIndexChange(null)}>
-      {image && (
+      {image && shown && (
         <DialogContent
           className="gap-3 p-3 sm:max-w-5xl sm:p-4"
           onKeyDown={onKeyDown}
@@ -62,15 +81,24 @@ export function Lightbox({ images, index, onIndexChange, apiBaseUrl }: LightboxP
           <div className="flex items-center justify-center overflow-hidden rounded-lg bg-muted">
             <img
               key={image.id}
-              src={resolveApiUrl(apiBaseUrl, image.url)}
-              alt={imageAltText(image)}
-              width={image.width}
-              height={image.height}
+              src={resolveApiUrl(apiBaseUrl, shown.url)}
+              alt={imageAltText(image, studio)}
+              width={shown.width}
+              height={shown.height}
               className="max-h-[70vh] w-auto object-contain"
             />
           </div>
 
           <DialogDescription id={`lightbox-${image.id}-description`}>{image.reason}</DialogDescription>
+
+          {image.studio && (
+            <div className="flex flex-wrap items-center gap-2">
+              <StudioStatusLine image={image} shown={shown} />
+              {onToggleOriginal && (
+                <StudioToggle shown={shown} onToggle={() => onToggleOriginal(image)} className="ml-auto" />
+              )}
+            </div>
+          )}
 
           <div className="flex items-center justify-between gap-2">
             <div className="flex gap-2">
@@ -82,10 +110,13 @@ export function Lightbox({ images, index, onIndexChange, apiBaseUrl }: LightboxP
               </Button>
             </div>
             <Button asChild variant="outline">
-              <a href={resolveApiUrl(apiBaseUrl, image.downloadUrl)} download={image.fileName}>
+              <a href={resolveApiUrl(apiBaseUrl, shown.downloadUrl)} download={shown.fileName}>
                 <Download aria-hidden="true" />
-                Download
-                <span className="sr-only"> {image.shotLabel} ({image.fileName})</span>
+                {studio ? "Download studio photo" : "Download"}
+                <span className="sr-only">
+                  {" "}
+                  {image.shotLabel} ({shown.fileName})
+                </span>
               </a>
             </Button>
           </div>

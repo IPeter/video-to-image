@@ -113,21 +113,50 @@ type Progress struct {
 }
 
 type ResultImage struct {
-	ID             string  `json:"id"`
-	Index          int     `json:"index" doc:"1-based display order (shot-list order)."`
-	ShotID         string  `json:"shotId"`
-	ShotLabel      string  `json:"shotLabel"`
-	TimestampSec   float64 `json:"timestampSec"`
-	TimestampLabel string  `json:"timestampLabel" example:"00:06"`
-	Width          int     `json:"width"`
-	Height         int     `json:"height"`
-	Reason         string  `json:"reason"`
-	FileName       string  `json:"fileName" example:"cars_7K2M9QXA_1_front_three_quarter_00-06.jpg"`
-	URL            string  `json:"url" doc:"Full-resolution JPG, relative to the API base URL."`
-	DownloadURL    string  `json:"downloadUrl" doc:"Same as url with ?download=1 (Content-Disposition: attachment)."`
-	ThumbnailURL   string  `json:"thumbnailUrl" doc:"640 px wide JPG, relative to the API base URL."`
-	Rotation       int     `json:"rotation" doc:"Degrees clockwise the source frame was rotated to make it upright (0, 90, 180, 270)."`
-	Cropped        bool    `json:"cropped" doc:"The frame was cropped around the subject."`
+	ID             string       `json:"id"`
+	Index          int          `json:"index" doc:"1-based display order (shot-list order)."`
+	ShotID         string       `json:"shotId"`
+	ShotLabel      string       `json:"shotLabel"`
+	TimestampSec   float64      `json:"timestampSec"`
+	TimestampLabel string       `json:"timestampLabel" example:"00:06"`
+	Width          int          `json:"width"`
+	Height         int          `json:"height"`
+	Reason         string       `json:"reason"`
+	FileName       string       `json:"fileName" example:"cars_7K2M9QXA_1_front_three_quarter_00-06.jpg"`
+	URL            string       `json:"url" doc:"Full-resolution JPG, relative to the API base URL."`
+	DownloadURL    string       `json:"downloadUrl" doc:"Same as url with ?download=1 (Content-Disposition: attachment)."`
+	ThumbnailURL   string       `json:"thumbnailUrl" doc:"640 px wide JPG, relative to the API base URL."`
+	Rotation       int          `json:"rotation" doc:"Degrees clockwise the source frame was rotated to make it upright (0, 90, 180, 270)."`
+	Cropped        bool         `json:"cropped" doc:"The frame was cropped around the subject."`
+	Studio         *ImageStudio `json:"studio" doc:"Studio-background version of this image; null when the image is not eligible (interior, detail) or the feature is off."`
+}
+
+// ImageStudio is one image's studio-background outcome. The car pixels of every variant
+// are the original pixels; only the background and the floor shadow are new.
+type ImageStudio struct {
+	_        struct{}        `nullable:"true"`
+	Status   string          `json:"status" enum:"pending,ready,withheld,failed" doc:"pending: not processed yet; ready: variants exist; withheld: the cut-out was not trustworthy (reason says why) and only the original is offered; failed: an error, only the original is offered."`
+	Reason   string          `json:"reason" doc:"Why the studio version was withheld or failed, for people (empty when ready or pending)."`
+	Variants []StudioVariant `json:"variants" doc:"One per rendered style, in the domain's display order (the default style first)."`
+}
+
+// StudioVariant is one rendered studio style of an image.
+type StudioVariant struct {
+	Style        string `json:"style" enum:"grey,light,dark"`
+	URL          string `json:"url" doc:"Full-resolution JPG, relative to the API base URL: …/images/{imageId}/studio/{style}."`
+	DownloadURL  string `json:"downloadUrl" doc:"Same as url with ?download=1 (Content-Disposition: attachment)."`
+	ThumbnailURL string `json:"thumbnailUrl" doc:"640 px wide JPG: …/images/{imageId}/studio/{style}/thumb."`
+	FileName     string `json:"fileName" example:"cars_7K2M9QXA_1_front_three_quarter_00-06_studio-grey.jpg"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+}
+
+// JobStudio is the job-level studio-background progress.
+type JobStudio struct {
+	Status       string   `json:"status" enum:"none,pending,running,done,failed,skipped" doc:"none: not requested (feature off or no eligible image); pending/running: studio versions are being made after the job completed; done; failed or skipped (e.g. daily cost ceiling): only originals are offered."`
+	Styles       []string `json:"styles" enum:"grey,light,dark" doc:"Styles rendered for this job, display order, the default first."`
+	DefaultStyle string   `json:"defaultStyle" enum:"grey,light,dark,"`
+	ZipURL       *string  `json:"zipUrl" doc:"studio.zip (every studio variant + manifest.json) once status is done and at least one image is ready; else null. Route: …/jobs/{jobId}/studio.zip."`
 }
 
 type ShotRef struct {
@@ -198,6 +227,7 @@ type Job struct {
 	Video     VideoInfo  `json:"video"`
 	Progress  Progress   `json:"progress"`
 	Usage     JobUsage   `json:"usage"`
+	Studio    JobStudio  `json:"studio"`
 	Result    *JobResult `json:"result"`
 	Rejection *Rejection `json:"rejection"`
 	Error     *JobError  `json:"error"`

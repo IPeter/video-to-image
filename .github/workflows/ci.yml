@@ -76,6 +76,28 @@ jobs:
       - name: No page may be prerendered (runtime DOMAIN_KEY/API_URL, decision 13)
         run: pnpm check:dynamic
 
+  # Studio segmentation sidecar (services/studio): ruff + the pytest unit tests (mask
+  # logic, HTTP server, config on synthetic data; pytest.ini deselects the "slow" tests
+  # that run the real models). The v2i-studio image is NOT built here: its ~0.6 GB of
+  # models are not in git (deploy/k8s/deploy.sh builds it locally after
+  # services/studio/fetch-models.sh).
+  studio:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/studio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/studio/requirements*.txt
+      - run: python -m pip install -r requirements-dev.txt ruff==0.12.2
+      - name: ruff
+        run: ruff check .
+      - run: python -m pytest -q
+
   e2e:
     runs-on: ubuntu-latest
     needs: [go, web]
@@ -101,11 +123,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: ./scripts/gen-fixtures.sh
       - run: go build -o bin/v2i ./cmd/v2i && ./bin/v2i migrate
-      - name: Start API with embedded worker and fake analyzer
+      - name: Start API with embedded worker, fake analyzer and fake studio segmenter
         env:
           # The runner context is only available at step level.
           V2I_STORAGE_DIR: ${{ runner.temp }}/storage
           V2I_SCRATCH_DIR: ${{ runner.temp }}/scratch
+          # Deterministic cut-outs without the sidecar, so the studio-background spec
+          # runs instead of skipping itself.
+          V2I_STUDIO_URL: fake
         run: |
           ./bin/v2i serve --embed-worker --analyzer=fake > "$RUNNER_TEMP/api.log" 2>&1 &
           for _ in $(seq 1 60); do

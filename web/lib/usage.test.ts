@@ -144,6 +144,7 @@ describe("usageStepLabel", () => {
   it("names the model steps and keeps unknown ones", () => {
     expect(usageStepLabel("analyze")).toBe("Understanding the video");
     expect(usageStepLabel("review")).toBe("Checking the photos");
+    expect(usageStepLabel("studio")).toBe("Studio check");
     expect(usageStepLabel("rerank")).toBe("rerank");
     expect(usageStepLabel("constructor")).toBe("constructor");
   });

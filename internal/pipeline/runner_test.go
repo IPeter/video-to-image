@@ -445,3 +445,13 @@ func TestRunStopsWhenUserDeletesJob(t *testing.T) {
 	assert.Equal(t, store.StatusExpired, got.Status)
 	assert.Empty(t, e.keysUnder(storage.JobPrefix("cars", job.ID)))
 }
+
+// setDomain replaces the cars domain by a copy changed by mutate.
+func (e *env) setDomain(mutate func(*domain.Config)) {
+	e.t.Helper()
+	cars, ok := e.reg.Get("cars")
+	require.True(e.t, ok)
+	c := *cars
+	mutate(&c)
+	e.reg = domain.NewRegistry(&c)
+}

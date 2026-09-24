@@ -119,6 +119,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}/studio/{style}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Studio-background version, full resolution
+         * @description The image on a studio backdrop; the car pixels are the original photo's. Served only for a variant the job lists (result.images[].studio.variants): anything else is 404 IMAGE_NOT_FOUND (unknown style, image not eligible, studio version withheld or failed), and 409 NOT_READY while the studio version is still being made.
+         */
+        get: operations["getStudioImage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}/studio/{style}/thumb": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Studio-background version, 640 px thumbnail
+         * @description The image on a studio backdrop; the car pixels are the original photo's. Served only for a variant the job lists (result.images[].studio.variants): anything else is 404 IMAGE_NOT_FOUND (unknown style, image not eligible, studio version withheld or failed), and 409 NOT_READY while the studio version is still being made.
+         */
+        get: operations["getStudioThumbnail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/domains/{domainKey}/jobs/{jobId}/images/{imageId}/thumb": {
         parameters: {
             query?: never;
@@ -128,6 +168,26 @@ export interface paths {
         };
         /** 640 px thumbnail JPG */
         get: operations["getThumbnail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/domains/{domainKey}/jobs/{jobId}/studio.zip": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * All studio-background versions + manifest.json as a ZIP
+         * @description Offered as studio.zipUrl once the job's studio run is done. 409 NOT_READY before the job completed or while the studio versions are being made; 404 NOT_FOUND when there are none.
+         */
+        get: operations["downloadStudioZip"];
         put?: never;
         post?: never;
         delete?: never;
@@ -254,6 +314,17 @@ export interface components {
             details?: unknown;
             message: string;
         };
+        ImageStudio: {
+            /** @description Why the studio version was withheld or failed, for people (empty when ready or pending). */
+            reason: string;
+            /**
+             * @description pending: not processed yet; ready: variants exist; withheld: the cut-out was not trustworthy (reason says why) and only the original is offered; failed: an error, only the original is offered.
+             * @enum {string}
+             */
+            status: "pending" | "ready" | "withheld" | "failed";
+            /** @description One per rendered style, in the domain's display order (the default style first). */
+            variants: components["schemas"]["StudioVariant"][];
+        } | null;
         Job: {
             /** Format: date-time */
             createdAt: string;
@@ -270,6 +341,7 @@ export interface components {
              * @enum {string}
              */
             status: "queued" | "processing" | "completed" | "rejected" | "failed" | "expired";
+            studio: components["schemas"]["JobStudio"];
             usage: components["schemas"]["JobUsage"];
             video: components["schemas"]["VideoInfo"];
         };
@@ -290,6 +362,19 @@ export interface components {
             /** @description All images + manifest.json; null when there are no images. */
             zipUrl: string | null;
         } | null;
+        JobStudio: {
+            /** @enum {string} */
+            defaultStyle: "grey" | "light" | "dark" | "";
+            /**
+             * @description none: not requested (feature off or no eligible image); pending/running: studio versions are being made after the job completed; done; failed or skipped (e.g. daily cost ceiling): only originals are offered.
+             * @enum {string}
+             */
+            status: "none" | "pending" | "running" | "done" | "failed" | "skipped";
+            /** @description Styles rendered for this job, display order, the default first. */
+            styles: ("grey" | "light" | "dark")[];
+            /** @description studio.zip (every studio variant + manifest.json) once status is done and at least one image is ready; else null. Route: …/jobs/{jobId}/studio.zip. */
+            zipUrl: string | null;
+        };
         JobUsage: {
             /** Format: int64 */
             calls: number;
@@ -397,6 +482,8 @@ export interface components {
             rotation: number;
             shotId: string;
             shotLabel: string;
+            /** @description Studio-background version of this image; null when the image is not eligible (interior, detail) or the feature is off. */
+            studio: components["schemas"]["ImageStudio"];
             /** @description 640 px wide JPG, relative to the API base URL. */
             thumbnailUrl: string;
             /** @example 00:06 */
@@ -411,6 +498,22 @@ export interface components {
         ShotRef: {
             id: string;
             label: string;
+        };
+        StudioVariant: {
+            /** @description Same as url with ?download=1 (Content-Disposition: attachment). */
+            downloadUrl: string;
+            /** @example cars_7K2M9QXA_1_front_three_quarter_00-06_studio-grey.jpg */
+            fileName: string;
+            /** Format: int64 */
+            height: number;
+            /** @enum {string} */
+            style: "grey" | "light" | "dark";
+            /** @description 640 px wide JPG: …/images/{imageId}/studio/{style}/thumb. */
+            thumbnailUrl: string;
+            /** @description Full-resolution JPG, relative to the API base URL: …/images/{imageId}/studio/{style}. */
+            url: string;
+            /** Format: int64 */
+            width: number;
         };
         UploadSession: {
             /**
@@ -1042,6 +1145,202 @@ export interface operations {
             };
         };
     };
+    getStudioImage: {
+        parameters: {
+            query?: {
+                /** @description 1 → Content-Disposition: attachment with the listing file name. */
+                download?: "1";
+            };
+            header?: never;
+            path: {
+                /** @example cars */
+                domainKey: string;
+                jobId: string;
+                imageId: string;
+                /** @description Studio backdrop; one of the image's studio.variants. */
+                style: "grey" | "light" | "dark";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description JPEG image */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": string;
+                };
+            };
+            /** @description Redirect to a presigned storage URL (S3 deployments). */
+            302: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not modified (If-None-Match matched the ETag). */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description ORIGIN_NOT_ALLOWED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description DOMAIN_NOT_FOUND | JOB_NOT_FOUND | IMAGE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description NOT_READY */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description EXPIRED */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description RATE_LIMITED */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description INTERNAL_ERROR */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    getStudioThumbnail: {
+        parameters: {
+            query?: {
+                /** @description 1 → Content-Disposition: attachment with the listing file name. */
+                download?: "1";
+            };
+            header?: never;
+            path: {
+                /** @example cars */
+                domainKey: string;
+                jobId: string;
+                imageId: string;
+                /** @description Studio backdrop; one of the image's studio.variants. */
+                style: "grey" | "light" | "dark";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description JPEG image */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": string;
+                };
+            };
+            /** @description Redirect to a presigned storage URL (S3 deployments). */
+            302: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not modified (If-None-Match matched the ETag). */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description ORIGIN_NOT_ALLOWED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description DOMAIN_NOT_FOUND | JOB_NOT_FOUND | IMAGE_NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description NOT_READY */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description EXPIRED */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description RATE_LIMITED */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description INTERNAL_ERROR */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
     getThumbnail: {
         parameters: {
             query?: {
@@ -1093,6 +1392,98 @@ export interface operations {
             };
             /** @description DOMAIN_NOT_FOUND | JOB_NOT_FOUND | IMAGE_NOT_FOUND */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description EXPIRED */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description RATE_LIMITED */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description INTERNAL_ERROR */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    downloadStudioZip: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @example cars */
+                domainKey: string;
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description ZIP archive */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/zip": string;
+                };
+            };
+            /** @description Redirect to a presigned storage URL (S3 deployments). */
+            302: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not modified (If-None-Match matched the ETag). */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description ORIGIN_NOT_ALLOWED */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description DOMAIN_NOT_FOUND | JOB_NOT_FOUND | NOT_FOUND */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description NOT_READY */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

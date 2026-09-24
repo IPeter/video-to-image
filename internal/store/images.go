@@ -50,6 +50,14 @@ func imageFromRow(r sqlcdb.SelectedImage) (SelectedImage, error) {
 	if err != nil {
 		return SelectedImage{}, fmt.Errorf("image %s: crop: %w", r.ID, err)
 	}
+	box, err := decodeCrop(r.SubjectBox)
+	if err != nil {
+		return SelectedImage{}, fmt.Errorf("image %s: subject box: %w", r.ID, err)
+	}
+	studio, err := decodeImageStudio(r.Studio)
+	if err != nil {
+		return SelectedImage{}, fmt.Errorf("image %s: studio: %w", r.ID, err)
+	}
 	return SelectedImage{
 		ID:           r.ID,
 		JobID:        r.JobID,
@@ -66,10 +74,43 @@ func imageFromRow(r sqlcdb.SelectedImage) (SelectedImage, error) {
 		Bytes:        int64(r.Bytes),
 		Rotation:     int(r.Rotation),
 		Crop:         crop,
+		SubjectBox:   box,
+		Studio:       studio,
 	}, nil
 }
 
-// decodeCrop decodes selected_images.crop; NULL (and JSON null) → nil.
+// decodeImageStudio decodes selected_images.studio; NULL (and JSON null) → nil.
+func decodeImageStudio(b []byte) (*ImageStudio, error) {
+	if len(b) == 0 {
+		return nil, nil
+	}
+	var st *ImageStudio
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+// encodeImageStudio encodes an outcome for the jsonb column; nil → NULL. The status must
+// be one of the ImageStudio* values and Diagnostics, when set, valid JSON.
+func encodeImageStudio(st *ImageStudio) ([]byte, error) {
+	if st == nil {
+		return nil, nil
+	}
+	switch st.Status {
+	case ImageStudioReady, ImageStudioWithheld, ImageStudioSkipped, ImageStudioFailed:
+	default:
+		return nil, fmt.Errorf("studio status %q is not ready, withheld, skipped or failed", st.Status)
+	}
+	if len(st.Diagnostics) > 0 && !json.Valid(st.Diagnostics) {
+		return nil, errors.New("studio diagnostics are not valid JSON")
+	}
+	cp := *st
+	cp.Reason = pgText(cp.Reason)
+	return jsonb(cp)
+}
+
+// decodeCrop decodes selected_images.crop (and subject_box); NULL (and JSON null) → nil.
 func decodeCrop(b []byte) (*NRect, error) {
 	if len(b) == 0 {
 		return nil, nil
@@ -81,8 +122,8 @@ func decodeCrop(b []byte) (*NRect, error) {
 	return r, nil
 }
 
-// encodeCrop encodes a crop for the jsonb column; nil → NULL. The rectangle must be
-// normalised: finite, inside [0,1] and with X0 < X1 and Y0 < Y1.
+// encodeCrop encodes a crop (or subject box) for the jsonb column; nil → NULL. The
+// rectangle must be normalised: finite, inside [0,1] and with X0 < X1 and Y0 < Y1.
 func encodeCrop(r *NRect) ([]byte, error) {
 	if r == nil {
 		return nil, nil
@@ -141,6 +182,14 @@ func imageParams(jobID string, im SelectedImage) (sqlcdb.InsertSelectedImagesPar
 	if err != nil {
 		return p, fmt.Errorf("image %s: %w", im.ID, err)
 	}
+	box, err := encodeCrop(im.SubjectBox)
+	if err != nil {
+		return p, fmt.Errorf("image %s: subject box: %w", im.ID, err)
+	}
+	studio, err := encodeImageStudio(im.Studio)
+	if err != nil {
+		return p, fmt.Errorf("image %s: %w", im.ID, err)
+	}
 	return sqlcdb.InsertSelectedImagesParams{
 		ID:           im.ID,
 		JobID:        jobID,
@@ -157,5 +206,7 @@ func imageParams(jobID string, im SelectedImage) (sqlcdb.InsertSelectedImagesPar
 		Bytes:        size,
 		Rotation:     int32(im.Rotation),
 		Crop:         crop,
+		SubjectBox:   box,
+		Studio:       studio,
 	}, nil
 }

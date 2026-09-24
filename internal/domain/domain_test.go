@@ -184,3 +184,100 @@ func TestMaxPerShot(t *testing.T) {
 		assert.NoError(t, Validate(c))
 	})
 }
+
+func TestStudioShippedConfig(t *testing.T) {
+	reg, err := LoadDir(filepath.Join("..", "..", "configs", "domains"))
+	require.NoError(t, err)
+	cars, _ := reg.Get("cars")
+	st := cars.Studio
+	assert.True(t, st.Enabled)
+	assert.True(t, st.QA)
+	assert.Equal(t, []string{"front_three_quarter", "side_profile", "rear_three_quarter", "front", "rear"}, st.Views)
+	assert.Equal(t, []string{"grey", "light", "dark"}, st.EffectiveStyles())
+	assert.Equal(t, "grey", st.EffectiveDefaultStyle())
+	assert.Equal(t, "gemini-3.8-flash", st.EffectiveQAModel())
+	assert.True(t, st.HasView("side_profile"))
+	for _, v := range []string{"trunk", "interior_dashboard", "wheel", OtherShotID, ""} {
+		assert.False(t, st.HasView(v), v)
+	}
+}
+
+func TestStudioDefaults(t *testing.T) {
+	var st Studio
+	assert.Equal(t, []string{"grey", "light", "dark"}, st.EffectiveStyles())
+	assert.Equal(t, "grey", st.EffectiveDefaultStyle())
+	assert.Equal(t, DefaultStudioQAModel, st.EffectiveQAModel())
+	assert.False(t, st.HasView("front"), "disabled")
+
+	// The default style is shown first, the rest keep their order.
+	st = Studio{Styles: []string{"light", "dark", "grey"}, DefaultStyle: "dark", QAModel: "m"}
+	assert.Equal(t, []string{"dark", "light", "grey"}, st.EffectiveStyles())
+	st = Studio{DefaultStyle: "light"}
+	assert.Equal(t, []string{"light", "grey", "dark"}, st.EffectiveStyles())
+	st = Studio{Styles: []string{"light", "grey"}}
+	assert.Equal(t, []string{"grey", "light"}, st.EffectiveStyles())
+	assert.Equal(t, "m", Studio{QAModel: "m"}.EffectiveQAModel())
+
+	// EffectiveStyles never aliases the configured slice.
+	st = Studio{Styles: []string{"light", "grey"}}
+	got := st.EffectiveStyles()
+	got[0] = "dark"
+	assert.Equal(t, []string{"light", "grey"}, st.Styles)
+	got = Studio{}.EffectiveStyles()
+	got[0] = "dark"
+	assert.Equal(t, []string{"grey", "light", "dark"}, StudioStyles)
+}
+
+func TestStudioValidation(t *testing.T) {
+	base := loadCarsRaw(t)
+	parse := func(t *testing.T, from, to string) error {
+		t.Helper()
+		mutated := strings.Replace(base, from, to, 1)
+		require.NotEqual(t, base, mutated, "%q not found", from)
+		_, err := Parse([]byte(mutated))
+		return err
+	}
+	const views = "views: [front_three_quarter, side_profile, rear_three_quarter, front, rear]"
+	const styles = "styles: [grey, light, dark]"
+	cases := map[string]struct {
+		from, to string
+		want     string // "" = valid
+	}{
+		"needs the review":        {"review:\n  enabled: true", "review:\n  enabled: false", "studio.enabled needs review.enabled"},
+		"view not a shot":         {views, "views: [front, roof]", `studio.views: "roof" is not a shot id`},
+		"other is not a shot":     {views, "views: [front, other]", `studio.views: "other" is not a shot id`},
+		"duplicate view":          {views, "views: [front, front]", `studio.views: duplicate "front"`},
+		"views required":          {views, "views: []", "studio.views must list at least one shot id"},
+		"unknown style":           {styles, "styles: [grey, pink]", "Styles"},
+		"duplicate style":         {styles, "styles: [grey, light, grey]", `studio.styles: duplicate "grey"`},
+		"default not a style":     {styles, "styles: [light, dark]", `studio.defaultStyle "grey" is not one of studio.styles`},
+		"unknown default":         {"defaultStyle: grey", "defaultStyle: white", "DefaultStyle"},
+		"gate out of range":       {"qa: true ", "qa: true\n  gates:\n    minIoU: 1.5\n ", "MinIoU"},
+		"unknown key":             {"qa: true ", "qa: true\n  qaModle: x\n ", "qaModle"},
+		"styles may be unset":     {styles, "# styles unset", ""},
+		"default may be unset":    {"defaultStyle: grey", "# default unset", ""},
+		"disabled needs no views": {"studio:\n  enabled: true\n", "studio:\n  enabled: false\n", ""},
+		"gates override":          {"qa: true ", "qa: true\n  qaModel: gemini-3.8-flash\n  gates:\n    minIoU: 0.85\n    maxBoxFill: 0.95\n ", ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := parse(t, tc.from, tc.to)
+			if tc.want == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, tc.want)
+		})
+	}
+	t.Run("disabled studio still checks its views", func(t *testing.T) {
+		c, err := Parse([]byte(base))
+		require.NoError(t, err)
+		c.Studio.Enabled = false
+		c.Studio.Views = []string{"roof"}
+		assert.ErrorContains(t, Validate(c), `"roof" is not a shot id`)
+		c.Studio.Views = nil
+		c.Review.Enabled = false
+		c.Crop.Enabled = false
+		assert.NoError(t, Validate(c), "a disabled studio needs neither views nor the review")
+	})
+}
