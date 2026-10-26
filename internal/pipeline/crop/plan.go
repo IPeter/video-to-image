@@ -12,6 +12,7 @@ const (
 	DefaultAspect         = "4:3"
 	DefaultMarginPct      = 6.0
 	DefaultMinShortSidePx = 1080
+	DefaultMinMarginPct   = 3.0
 )
 
 // ReorientedMinShortSidePx is the lowest the short-side floor is lowered to for a crop
@@ -35,12 +36,22 @@ func ParamsFor(c domain.Crop) (Params, error) {
 	if err != nil {
 		return Params{}, fmt.Errorf("crop: aspect: %w", err)
 	}
-	p := Params{Aspect: a, MarginPct: c.MarginPct, MinShortSidePx: c.MinShortSidePx}
+	p := Params{Aspect: a, MarginPct: c.MarginPct, MinShortSidePx: c.MinShortSidePx, MinMarginPct: c.MinMarginPct}
+	if c.FallbackAspect != "" {
+		fb, err := domain.ParseAspect(c.FallbackAspect)
+		if err != nil {
+			return Params{}, fmt.Errorf("crop: fallbackAspect: %w", err)
+		}
+		p.FallbackAspect = fb
+	}
 	if p.MarginPct == 0 {
 		p.MarginPct = DefaultMarginPct
 	}
 	if p.MinShortSidePx == 0 {
 		p.MinShortSidePx = DefaultMinShortSidePx
+	}
+	if p.MinMarginPct == 0 {
+		p.MinMarginPct = DefaultMinMarginPct
 	}
 	return p, nil
 }
@@ -52,7 +63,7 @@ func ParamsFor(c domain.Crop) (Params, error) {
 // one, grown by the margin on every side (clamped to the frame), and covered by the
 // smallest Aspect-shaped rectangle centred on it. The margin is best effort: when that
 // rectangle does not fit the frame, the largest smaller margin that fits is used, down
-// to none. The rectangle is then grown around the same centre to the short-side floor
+// to MinMarginPct (no crop below it). The rectangle is then grown around the same centre to the short-side floor
 // (see Params) when it is smaller, shifted to lie inside the frame and snapped to whole
 // pixels with even sides. There is no crop (Crop nil, Width/Height the upright frame)
 // when even the bare box's rectangle does not fit the frame (the subject would be cut),
@@ -99,10 +110,24 @@ func Plan(f Frame, p Params) Result {
 	maxW, maxH := H*aspect, W/aspect
 	const eps = 1e-6
 	if bx1-bx0 > maxW+eps || by1-by0 > maxH+eps {
+		if fb := p.FallbackAspect; fb > 0 && !math.IsInf(fb, 0) && math.Abs(fb-aspect) > eps {
+			// A tall subject in a portrait frame: try the fallback shape once.
+			q := p
+			q.Aspect, q.FallbackAspect = fb, 0
+			r := Plan(f, q)
+			if r.Crop != nil {
+				r.Reason += fmt.Sprintf(" (the subject does not fit %s)", label)
+				return r
+			}
+		}
 		res.Reason = fmt.Sprintf("subject does not fit %s without cutting it", label)
 		return res
 	}
 	if fm := min(maxMargin(bx0, bx1, W, maxW), maxMargin(by0, by1, H, maxH)); fm < m {
+		if minM := p.MinMarginPct / 100 * max(bx1-bx0, by1-by0); p.MinMarginPct > 0 && fm < minM-eps {
+			res.Reason = fmt.Sprintf("subject too close to the frame edge for a %s crop with a %.0f%% margin", label, p.MinMarginPct)
+			return res
+		}
 		m = fm
 		cropped += " with a reduced margin"
 	}

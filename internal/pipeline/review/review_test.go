@@ -9,6 +9,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,11 +64,13 @@ func hashOf(id string) uint64 {
 	return z ^ (z >> 31)
 }
 
-// cand builds a scored candidate whose scoring copy lives in dir.
+// cand builds a scored candidate whose scoring copy lives in dir. Its scene is the
+// 10 s slot of its timestamp, so the fixture's shots live in separate scenes like a
+// real job's.
 func cand(dir, id, shot string, ts float64, rejected string) score.Scored {
 	return score.Scored{
 		Candidate: extract.Candidate{
-			ID: id, ShotID: shot, TimestampSec: ts,
+			ID: id, ShotID: shot, TimestampSec: ts, SceneIdx: int(ts / 10),
 			FullPath: filepath.Join(dir, "cand", id+".jpg"), SmallPath: filepath.Join(dir, "small", id+".jpg"),
 		},
 		DHash:    hashOf(id),
@@ -76,7 +79,8 @@ func cand(dir, id, shot string, ts float64, rejected string) score.Scored {
 }
 
 // fixture: f3q has 6 eligible (+1 rejected) of which only F2, F4, F7 are mutually
-// distinct; side 2 (score tie); dash 1 eligible (+1 duplicate); rear none; "other" 2 +
+// distinct (the f3q span is 4 s, so with 3 per shot the picks must be 4/3 s apart);
+// side 2 (score tie); dash 1 eligible (+1 duplicate); rear none; "other" 2 +
 // an unknown shot (folded into "other"); plus candidates that are never eligible.
 func fixture(dir string) Input {
 	f6 := cand(dir, "cf_F6", f3q, 4.0, "")
@@ -87,7 +91,7 @@ func fixture(dir string) Input {
 		cand(dir, "cf_F1", f3q, 1.0, ""),
 		cand(dir, "cf_F2", f3q, 1.5, ""),
 		cand(dir, "cf_F3", f3q, 2.0, ""),
-		cand(dir, "cf_F4", f3q, 2.5, ""),
+		cand(dir, "cf_F4", f3q, 3.0, ""),
 		cand(dir, "cf_F5", f3q, 3.0, score.RejectBlurry),
 		f6,
 		cand(dir, "cf_F7", f3q, 5.0, ""),
@@ -310,7 +314,7 @@ func frameIDs(frames []frame) []string {
 
 func TestBuildGroups(t *testing.T) {
 	in := fixture("/w")
-	groups := buildGroups(in.Domain, in.Candidates, in.Scores, DefaultCandidatesPerShot)
+	groups := buildGroups(in.Domain, in.Candidates, in.Scores, DefaultCandidatesPerShot, nil)
 	assert.Equal(t, []string{f3q, side, dash, domain.OtherShotID}, shots(groups), "priority order, other last, empty shots skipped")
 	assert.Equal(t, map[string][]string{
 		// F3 and F1 are < 1 s from F2, F6 is a near-duplicate of F2, F5 is rejected.
@@ -324,7 +328,7 @@ func TestBuildGroups(t *testing.T) {
 		assert.Equal(t, groupOf(groups, f.cand.ID), f.shot, "proposed view of %s", f.cand.ID)
 	}
 
-	one := buildGroups(in.Domain, in.Candidates, in.Scores, 1)
+	one := buildGroups(in.Domain, in.Candidates, in.Scores, 1, nil)
 	assert.Equal(t, []string{"cf_F2", "cf_S2", "cf_D1", "cf_W1"}, frameIDs(flatten(one)))
 
 	t.Run("hamming threshold", func(t *testing.T) {
@@ -334,18 +338,18 @@ func TestBuildGroups(t *testing.T) {
 		b.DHash = a.DHash ^ 0b111111 // 6 bits apart
 		scores := map[string]float64{"cf_A": 1, "cf_B": 0.5}
 		d.Selection.DedupeMaxHamming = 6
-		assert.Equal(t, []string{"cf_A"}, frameIDs(flatten(buildGroups(d, []score.Scored{a, b}, scores, 3))), "≤ threshold is a duplicate")
+		assert.Equal(t, []string{"cf_A"}, frameIDs(flatten(buildGroups(d, []score.Scored{a, b}, scores, 3, nil))), "≤ threshold is a duplicate")
 		d.Selection.DedupeMaxHamming = 5
-		assert.Equal(t, []string{"cf_A", "cf_B"}, frameIDs(flatten(buildGroups(d, []score.Scored{a, b}, scores, 3))))
+		assert.Equal(t, []string{"cf_A", "cf_B"}, frameIDs(flatten(buildGroups(d, []score.Scored{a, b}, scores, 3, nil))))
 	})
 
 	t.Run("missing scores last", func(t *testing.T) {
 		cs := []score.Scored{cand("/w", "cf_R1", rear, 1, ""), cand("/w", "cf_R2", rear, 2, ""), cand("/w", "cf_R3", rear, 3, "")}
-		g := buildGroups(testDomain(), cs, map[string]float64{"cf_R3": 0.1}, 3)
+		g := buildGroups(testDomain(), cs, map[string]float64{"cf_R3": 0.1}, 3, nil)
 		assert.Equal(t, []string{"cf_R3", "cf_R1", "cf_R2"}, frameIDs(flatten(g)))
 	})
 
-	assert.Empty(t, buildGroups(in.Domain, nil, nil, 3))
+	assert.Empty(t, buildGroups(in.Domain, nil, nil, 3, nil))
 }
 
 func groupOf(groups []group, id string) string {
@@ -362,7 +366,7 @@ func groupOf(groups []group, id string) string {
 func TestCapGroups(t *testing.T) {
 	build := func() []group {
 		in := fixture("/w")
-		return buildGroups(in.Domain, in.Candidates, in.Scores, 3) // sizes 3, 2, 1, 3
+		return buildGroups(in.Domain, in.Candidates, in.Scores, 3, nil) // sizes 3, 2, 1, 3
 	}
 
 	g, dropped := capGroups(build(), 9)
@@ -875,7 +879,7 @@ func TestRunWithFakeAnalyzer(t *testing.T) {
 	out, err := Run(context.Background(), fa, in)
 	require.NoError(t, err)
 	require.Len(t, out.Assessments, len(wantOrder))
-	for _, f := range flatten(buildGroups(in.Domain, in.Candidates, in.Scores, 3)) {
+	for _, f := range flatten(buildGroups(in.Domain, in.Candidates, in.Scores, 3, nil)) {
 		as := out.Assessments[f.cand.ID]
 		assert.Equal(t, Assessment{
 			CandidateID: f.cand.ID, RotateCW: 0, View: f.shot, FullyVisible: true, Quality: 4,
@@ -958,4 +962,114 @@ func TestResizeArea(t *testing.T) {
 			assert.InDelta(t, 1, sum, 1e-4, "taps %v[%d]", sd, i)
 		}
 	}
+}
+
+func TestShortlistGap(t *testing.T) {
+	c := func(scene int, ts float64) score.Scored {
+		return score.Scored{Candidate: extract.Candidate{SceneIdx: scene, TimestampSec: ts}}
+	}
+	assert.Equal(t, MinGapSec, shortlistGap(nil, 3))
+	assert.Equal(t, MinGapSec, shortlistGap([]score.Scored{c(0, 4), c(0, 6)}, 3), "a short scene keeps the floor")
+	assert.InDelta(t, 8.0/3, shortlistGap([]score.Scored{c(0, 3.5), c(0, 7), c(0, 11.5)}, 3), 1e-9, "an 8 s scene spreads 3 picks")
+	assert.InDelta(t, 4.0/3, shortlistGap([]score.Scored{c(0, 0), c(0, 2), c(1, 50), c(1, 52)}, 3), 1e-9,
+		"two 2 s scenes far apart: the gap between them does not count")
+	assert.Equal(t, MinGapSec, shortlistGap([]score.Scored{c(0, 0), c(0, 2), c(1, 50), c(1, 52)}, 0))
+}
+
+// The spread rule on a real walkaround shape: 4 fps over a merged 8 s side-profile
+// scene where the sharpest frames are the first (cut-off) seconds. The shortlist must
+// still reach the later part of the scene.
+func TestBuildGroupsSpreadsOverScene(t *testing.T) {
+	d := testDomain()
+	var cs []score.Scored
+	scores := map[string]float64{}
+	for i := 0; i < 32; i++ {
+		ts := 3.5 + float64(i)*0.25
+		id := fmt.Sprintf("cf_T%02d", i)
+		c := cand(t.TempDir(), id, side, ts, "")
+		c.SceneIdx = 1
+		cs = append(cs, c)
+		scores[id] = 1 - float64(i)*0.01 // earlier = sharper
+	}
+	got := frameIDs(flatten(buildGroups(d, cs, scores, 3, nil)))
+	require.Len(t, got, 3)
+	tsOf := func(id string) float64 {
+		for _, c := range cs {
+			if c.ID == id {
+				return c.TimestampSec
+			}
+		}
+		return -1
+	}
+	assert.Equal(t, 3.5, tsOf(got[0]), "the best-scoring frame first")
+	assert.GreaterOrEqual(t, tsOf(got[1]), 3.5+8.0/3-1e-9)
+	assert.GreaterOrEqual(t, tsOf(got[2]), tsOf(got[1])+8.0/3-1e-9, "the third pick reaches the last third of the scene")
+}
+
+// A "not fully visible" verdict is overruled by a box that is clear of every edge;
+// a box touching an edge, or no box, leaves the verdict alone.
+func TestParseFullyVisibleByBox(t *testing.T) {
+	in := withFiles(t)
+	frames := []frame{
+		{cand: in.Candidates[1], key: "img1", oriented: true}, // cf_F2
+		{cand: in.Candidates[3], key: "img2", oriented: true}, // cf_F4
+		{cand: in.Candidates[6], key: "img3", oriented: true}, // cf_F7
+		{cand: in.Candidates[8], key: "img4", oriented: true}, // cf_S2
+	}
+	got, ignored, err := parseAssessments(`{"images":[
+	  {"id":"img1","view":"front_three_quarter","subjectFullyVisible":false,"quality":3,"box_2d":[28,229,918,755],"issues":"Car cut off"},
+	  {"id":"img2","view":"front_three_quarter","subjectFullyVisible":false,"quality":3,"box_2d":[105,66,1000,757],"issues":"Car cut off at bottom"},
+	  {"id":"img3","view":"front_three_quarter","subjectFullyVisible":false,"quality":3,"issues":"Car cut off"},
+	  {"id":"img4","view":"side_profile","subjectFullyVisible":false,"quality":3,"box_2d":[15,100,985,900],"issues":""}
+	]}`, frames, in.Domain, 3)
+	require.NoError(t, err)
+	assert.Equal(t, 0, ignored)
+	assert.True(t, got["cf_F2"].FullyVisible, "box clear of all edges overrules the verdict")
+	assert.True(t, got["cf_F2"].VisibleByBox)
+	assert.True(t, got["cf_F2"].Usable)
+	assert.False(t, got["cf_F4"].FullyVisible, "box touches the bottom edge")
+	assert.False(t, got["cf_F4"].VisibleByBox)
+	assert.False(t, got["cf_F7"].FullyVisible, "no box: nothing to overrule with")
+	assert.False(t, got["cf_S2"].FullyVisible, "1.5 % from the top edge is inside EdgeMargin")
+}
+
+// Preferred seconds come first: the best candidate within PreferredWindowSec of each,
+// then the usual score order with the spread rule; a second with no candidate near it
+// is skipped, and a preferred pick is never repeated.
+func TestBuildGroupsPreferred(t *testing.T) {
+	d := testDomain()
+	var cs []score.Scored
+	scores := map[string]float64{}
+	for i := 0; i < 32; i++ { // 4 fps over 3.5–11.25 s, sharpest first
+		ts := 3.5 + float64(i)*0.25
+		id := fmt.Sprintf("cf_T%02d", i)
+		c := cand(t.TempDir(), id, side, ts, "")
+		c.SceneIdx = 1
+		cs = append(cs, c)
+		scores[id] = 1 - float64(i)*0.01
+	}
+	tsOf := func(id string) float64 {
+		for _, c := range cs {
+			if c.ID == id {
+				return c.TimestampSec
+			}
+		}
+		return -1
+	}
+	groups := buildGroups(d, cs, scores, 4, map[string][]float64{side: {8, 10, 40}})
+	require.Len(t, groups, 1)
+	require.Len(t, groups[0].frames, 4)
+	f := groups[0].frames
+	assert.Equal(t, 7.5, tsOf(f[0].cand.ID), "best-scoring frame within 0.5 s of 8 s (earlier = sharper here)")
+	assert.True(t, f[0].preferred)
+	assert.Equal(t, 9.5, tsOf(f[1].cand.ID), "within 0.5 s of 10 s")
+	assert.True(t, f[1].preferred)
+	assert.Equal(t, 3.5, tsOf(f[2].cand.ID), "then the sharpest frame")
+	assert.False(t, f[2].preferred)
+	assert.GreaterOrEqual(t, math.Abs(tsOf(f[3].cand.ID)-tsOf(f[2].cand.ID)), shortlistGap(cs, 4)-1e-9, "the fill keeps the spread")
+
+	// A preferred second in another shot does not touch this group; an empty map is
+	// the plain behaviour.
+	assert.Equal(t, frameIDs(flatten(buildGroups(d, cs, scores, 4, nil))),
+		frameIDs(flatten(buildGroups(d, cs, scores, 4, map[string][]float64{f3q: {8}}))))
 }

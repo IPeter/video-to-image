@@ -35,10 +35,10 @@ patches:
 images:
   - name: v2i
     newName: localhost/v2i
-    newTag: faa2635-20260923220202
+    newTag: 18f0a6d-20260924181915
   - name: v2i-web
     newName: localhost/v2i-web
-    newTag: faa2635-20260923220202
+    newTag: 18f0a6d-20260924181915
   # Studio sidecar (services/studio). Its tag only changes when the image changed, and
   # "unbuilt" until the first deploy.sh run that builds it.
   - name: v2i-studio

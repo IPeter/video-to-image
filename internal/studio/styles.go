@@ -14,15 +14,19 @@ var DefaultStyles = []Style{StyleGrey, StyleLight, StyleDark}
 // DefaultStyle is shown first when the domain names none.
 const DefaultStyle = StyleGrey
 
-// Valid reports whether s is one of the known styles.
-func (s Style) Valid() bool { return s == StyleGrey || s == StyleLight || s == StyleDark }
+// Valid reports whether s is one of the known styles (the drawn ones and the
+// generative StyleStudio).
+func (s Style) Valid() bool { return s.Drawn() || s == StyleStudio }
 
-// ParseStyle returns the style named s (grey, light, dark).
+// Drawn reports whether s is rendered by Render (grey, light, dark).
+func (s Style) Drawn() bool { return s == StyleGrey || s == StyleLight || s == StyleDark }
+
+// ParseStyle returns the style named s (grey, light, dark, studio).
 func ParseStyle(s string) (Style, error) {
 	if st := Style(s); st.Valid() {
 		return st, nil
 	}
-	return "", fmt.Errorf("studio: unknown style %q (grey, light, dark)", s)
+	return "", fmt.Errorf("studio: unknown style %q (grey, light, dark, studio)", s)
 }
 
 // StylesFor resolves a domain's studio block into the styles to render, in display

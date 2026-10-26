@@ -25,7 +25,8 @@ internal/queue           River clients, pipeline worker, periodic maintenance jo
 internal/storage         Storage interface: local disk + S3/MinIO
 internal/media           ffprobe/ffmpeg wrappers, container sniffing
 internal/analyzer        model boundary: gemini/, fake/, recording/ (record + replay), setup/
-internal/pipeline        runner.go orchestrates preview → analyze → extract → score → select → export
+internal/pipeline        runner.go orchestrates preview → analyze (+ locate) → extract → score → select → export
+internal/pipeline/locate contact-sheet pass: the preview as time-stamped frame sheets, one call names the seconds per view
 internal/pricing         model price table (reference date 2026-09-23)
 internal/metrics         Prometheus collectors
 internal/studio          studio backgrounds: gates, box mapping, compositor, QA check, sidecar client

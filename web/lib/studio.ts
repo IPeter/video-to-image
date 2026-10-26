@@ -14,13 +14,14 @@ export const STUDIO_BADGE_DESCRIPTION =
 
 /** Style names as the switch shows them. */
 export const STUDIO_STYLE_LABELS: Readonly<Record<StudioStyle, string>> = {
+  studio: "Studio",
   grey: "Grey",
   light: "Light",
   dark: "Dark",
 };
 
 /** Every style, in the API's default order (the job's own order wins; see studioStyleOptions). */
-export const STUDIO_STYLES: readonly StudioStyle[] = ["grey", "light", "dark"];
+export const STUDIO_STYLES: readonly StudioStyle[] = ["studio", "grey", "light", "dark"];
 
 function isStudioStyle(value: unknown): value is StudioStyle {
   return typeof value === "string" && (STUDIO_STYLES as readonly string[]).includes(value);

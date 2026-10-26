@@ -44,34 +44,38 @@ const (
 // the default. Unknown and repeated names are dropped; no styles → studio.DefaultStyles;
 // a default that is not rendered → the first style.
 func studioStyles(dc *domain.Config) ([]studio.Style, studio.Style) {
+	rendered := dc.Studio.Styles
+	if len(rendered) == 0 {
+		rendered = domain.StudioStyles
+	}
 	var styles []studio.Style
-	for _, s := range dc.Studio.Styles {
+	for _, s := range dc.Studio.EffectiveStyles() { // the default first
 		st := studio.Style(s)
-		if validStudioStyle(st) && !slices.Contains(styles, st) {
+		drawn := slices.Contains(rendered, s)
+		generative := st == studio.StyleStudio && dc.Studio.Generative.Enabled
+		if validStudioStyle(st) && (drawn || generative) && !slices.Contains(styles, st) {
 			styles = append(styles, st)
 		}
 	}
-	if len(styles) == 0 {
+	if len(styles) == 0 { // nothing usable configured: the package defaults, the default first
 		styles = slices.Clone(studio.DefaultStyles)
+		if def := studio.Style(dc.Studio.DefaultStyle); def.Drawn() {
+			if i := slices.Index(styles, def); i > 0 {
+				styles = append(append([]studio.Style{def}, styles[:i]...), styles[i+1:]...)
+			}
+		}
 	}
-	def := studio.Style(dc.Studio.DefaultStyle)
-	if def == "" {
-		def = studio.StyleGrey
-	}
-	i := slices.Index(styles, def)
-	if i < 0 {
-		return styles, styles[0]
-	}
-	return append(append([]studio.Style{def}, styles[:i]...), styles[i+1:]...), def
+	return styles, styles[0]
 }
 
-func validStudioStyle(s studio.Style) bool {
-	return s == studio.StyleGrey || s == studio.StyleLight || s == studio.StyleDark
-}
+func validStudioStyle(s studio.Style) bool { return s.Valid() }
 
 // studioEligible: the domain makes studio versions of the image's view and the review
 // gave the image a subject box (the segmentation prompt).
 func studioEligible(dc *domain.Config, img *store.SelectedImage) bool {
+	if dc.Studio.IsInteriorView(img.ShotID) {
+		return true // the generative studio through the glass needs no box
+	}
 	return dc.Studio.Enabled && img.SubjectBox != nil && slices.Contains(dc.Studio.Views, img.ShotID)
 }
 

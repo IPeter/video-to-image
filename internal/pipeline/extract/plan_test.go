@@ -201,3 +201,17 @@ func TestPlanInvariants(t *testing.T) {
 		}
 	}
 }
+
+func TestPlanPaddingSec(t *testing.T) {
+	in := Input{DurationSec: 60, Ranges: []Range{{StartSec: 10, EndSec: 12}}, SampleFPS: 4, MaxCandidates: 300}
+	got := Plan(in)
+	require.Len(t, got, 1)
+	assert.Equal(t, [2]float64{9.5, 12.5}, [2]float64{got[0].PadStartSec, got[0].PadEndSec}, "default padding")
+	in.PaddingSec = 1.5
+	got = Plan(in)
+	assert.Equal(t, [2]float64{8.5, 13.5}, [2]float64{got[0].PadStartSec, got[0].PadEndSec})
+	assert.Equal(t, 20, got[0].Expected)
+	in.Ranges[0] = Range{StartSec: 0.5, EndSec: 59.5}
+	got = Plan(in)
+	assert.Equal(t, [2]float64{0, 60}, [2]float64{got[0].PadStartSec, got[0].PadEndSec}, "clamped to the video")
+}

@@ -304,6 +304,7 @@
         "properties": {
           "defaultStyle": {
             "enum": [
+              "studio",
               "grey",
               "light",
               "dark",
@@ -327,6 +328,7 @@
             "description": "Styles rendered for this job, display order, the default first.",
             "items": {
               "enum": [
+                "studio",
                 "grey",
                 "light",
                 "dark"
@@ -721,7 +723,9 @@
             "type": "integer"
           },
           "style": {
+            "description": "studio: painted by an image model around the original car pixels; grey/light/dark: drawn backdrops.",
             "enum": [
+              "studio",
               "grey",
               "light",
               "dark"

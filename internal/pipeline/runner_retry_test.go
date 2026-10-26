@@ -145,9 +145,9 @@ func TestRunSaveAnalysisBlipIsRetriedWithoutPayingTwice(t *testing.T) {
 	assert.Equal(t, store.StatusCompleted, got.Status, got.InternalLog)
 	assert.Equal(t, int32(1), a.analyzeCalls.Load(), "the video is analysed once")
 	assert.Equal(t, 2, fs.count("SaveAnalysis"), "the write is retried in-process")
-	// analyze's usage (failed once, retried) + the frame review's two calls
-	// (orientation, judgement).
-	assert.Equal(t, 4, fs.count("InsertUsage"), "usage is retried too, so the cost ceiling sees it")
+	// analyze's usage (failed once, retried) + the locate call + the frame review's
+	// two calls (orientation, judgement).
+	assert.Equal(t, 5, fs.count("InsertUsage"), "usage is retried too, so the cost ceiling sees it")
 	assert.Equal(t, "Synthetic walkaround (fake analyzer).", got.VideoSummary)
 	fs.assertBounded(t, "SaveAnalysis", 15*time.Second)
 }

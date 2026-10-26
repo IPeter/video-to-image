@@ -24,6 +24,13 @@ const (
 // ViewNone is the view the model reports when a frame shows no relevant subject.
 const ViewNone = "none"
 
+// EdgeMargin is the smallest gap (fraction of the image side) a subject box must keep
+// from every image edge for the geometry to overrule a "not fully visible" verdict:
+// the model's boolean is noisy at 512 px (the same frame is called cut off in one run
+// and fine in the next), while a box that is clear of all four edges says the subject
+// was not cut by any of them (parseAssessments).
+const EdgeMargin = 0.02
+
 type Input struct {
 	Domain     *domain.Config
 	JobID      string
@@ -31,7 +38,17 @@ type Input struct {
 	WorkDir    string             // scratch dir; Run writes the downscaled images to WorkDir/review/
 	Candidates []score.Scored     // all scored candidates; rejected ones are never sent
 	Scores     map[string]float64 // weighted score by candidate ID (selectr.Score), for the shortlist
+	// Preferred lists, per shot, seconds at which the locate pass saw the whole subject
+	// (in its order). The shortlist takes the best candidate of that shot within
+	// PreferredWindowSec of each such second first, then fills up by score: the scores
+	// know sharpness, not framing, and on a real walkaround the sharpest frames of a
+	// scene were the ones at its edges where the car was still cut off.
+	Preferred map[string][]float64
 }
+
+// PreferredWindowSec is how far (seconds) a candidate may be from a preferred second
+// to count as that moment: half the locate pass's 1 s sampling on either side.
+const PreferredWindowSec = 0.5
 
 // Assessment is the model's verdict on one frame.
 type Assessment struct {
@@ -39,7 +56,10 @@ type Assessment struct {
 	RotateCW     int    // 0, 90, 180 or 270: degrees clockwise that make the frame upright
 	View         string // domain shot ID, domain.OtherShotID or ViewNone
 	FullyVisible bool   // the whole subject is inside the frame
-	Quality      int    // 1-5
+	// VisibleByBox: the model said the subject was cut off, but its own box keeps at
+	// least EdgeMargin from every image edge, so FullyVisible was set from the box.
+	VisibleByBox bool
+	Quality      int // 1-5
 	// Box is the subject's bounding box in the frame AS STORED (before RotateCW; the
 	// model measures it on the copy sent, which may be rotated, and parseAssessments maps
 	// it back), normalised to [0,1]: {X0, Y0, X1, Y1}. Zero value = no usable box.

@@ -99,7 +99,8 @@ func TestWorkerMakesStudioBackgroundsAfterTheJob(t *testing.T) {
 			continue
 		}
 		ready++
-		assert.Len(t, im.Studio.Styles, 3)
+		assert.Len(t, im.Studio.Styles, 4, "the generative style and the three drawn ones: %s", im.Studio.Diagnostics)
+		assert.Contains(t, im.Studio.Styles, store.Style("studio"))
 		for _, v := range im.Studio.Styles {
 			_, err := st.Head(ctx, v.Key)
 			assert.NoError(t, err)

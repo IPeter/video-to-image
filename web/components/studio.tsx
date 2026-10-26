@@ -21,6 +21,7 @@ import {
 
 /** Backdrop colours of the styles, for the swatches (the renderer's wall tones). */
 const STYLE_SWATCHES: Readonly<Record<StudioStyle, string>> = {
+  studio: "linear-gradient(180deg, #d9dadb 0%, #b9babc 55%, #6c6e72 100%)",
   grey: "#8f9194",
   light: "#f3f3f4",
   dark: "#2c2d30",

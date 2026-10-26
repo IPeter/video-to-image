@@ -34,7 +34,8 @@ func BuildPrompt(d *domain.Config) (system, user string) {
 	b.WriteString("\nStep 2 — Scenes. Only if the gate passed.\n")
 	writeBlock(&b, d.Selection.Instructions)
 
-	b.WriteString("\nShot list (find the best moment for each, if present):\n")
+	b.WriteString("\nShot list (list up to 2 distinct moments for each shot that is present; a walkaround " +
+		"usually shows an exterior view more than once, and the later take is often the better one):\n")
 	for _, s := range d.Shots {
 		fmt.Fprintf(&b, "- %s: %s\n", strings.TrimSpace(s.ID), cleanInline(s.Description))
 	}

@@ -217,3 +217,53 @@ func clampRelevance(v float64) float64 {
 	}
 	return clamp(v, 0, 1)
 }
+
+// MergeScenes adds extra scenes (e.g. the moments the contact-sheet pass located) to
+// base: both are treated like one model answer, so ranges of the same shot that
+// overlap or touch become one (see mergeSameShot: the higher relevance and its reason
+// win) and at most Selection.MaxScenes are kept by relevance, the rest recorded as
+// over_max_scenes. Scenes must already be post-processed (clamped, shot IDs
+// canonical). The result is ordered by start with Idx reassigned; the inputs are not
+// modified.
+func MergeScenes(base, extra []Scene, d *domain.Config) ([]Scene, []Drop) {
+	if d == nil || len(base)+len(extra) == 0 {
+		return nil, nil
+	}
+	shotPrio := make(map[string]int, len(d.Shots))
+	for i, s := range d.Shots {
+		shotPrio[s.ID] = i
+	}
+	prioOf := func(id string) int {
+		if p, ok := shotPrio[id]; ok {
+			return p
+		}
+		return len(d.Shots)
+	}
+	cs := make([]candidate, 0, len(base)+len(extra))
+	for _, list := range [][]Scene{base, extra} {
+		for _, s := range list {
+			cs = append(cs, candidate{Scene: s, order: len(cs), prio: prioOf(s.ShotID)})
+		}
+	}
+	merged, drops := mergeSameShot(cs)
+	if limit := d.Selection.MaxScenes; limit > 0 && len(merged) > limit {
+		sort.SliceStable(merged, func(i, j int) bool {
+			a, b := merged[i], merged[j]
+			if a.Relevance != b.Relevance {
+				return a.Relevance > b.Relevance
+			}
+			return byStart(a, b)
+		})
+		for _, c := range merged[limit:] {
+			drops = append(drops, Drop{RawStart: c.RawStart, RawEnd: c.RawEnd, ShotID: c.ShotID, Reason: DropOverMaxScenes})
+		}
+		merged = merged[:limit]
+	}
+	sort.SliceStable(merged, func(i, j int) bool { return byStart(merged[i], merged[j]) })
+	out := make([]Scene, len(merged))
+	for i, c := range merged {
+		c.Idx = i
+		out[i] = c.Scene
+	}
+	return out, drops
+}

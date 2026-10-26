@@ -44,7 +44,7 @@ func TestBuildPromptStructure(t *testing.T) {
 		"videoSummary",
 		"Step 2 — Scenes. Only if the gate passed.\n",
 		"Prefer moments where the whole car is in frame.\nAvoid motion blur.\n",
-		"Shot list (find the best moment for each, if present):\n",
+		"Shot list (list up to 2 distinct moments for each shot that is present; a walkaround usually shows an exterior view more than once, and the later take is often the better one):\n",
 		"- front_three_quarter: Front and one side at roughly 45°, whole car in frame\n",
 		"- side_profile: Full side of the car, perpendicular\n",
 		"- interior_dashboard: Dashboard, steering wheel and center console\n",
@@ -71,7 +71,7 @@ func TestBuildPromptShippedCars(t *testing.T) {
 
 	assert.Contains(t, user, "Decide whether this video primarily shows: a single passenger vehicle (car, SUV, van or pickup) being shown or walked around, as for a sales listing.\n")
 	assert.Contains(t, user, "recording, or if multiple different vehicles are shown with no clear single subject.\nIf it does not,")
-	assert.Contains(t, user, "Return up to 20 scenes.")
+	assert.Contains(t, user, "Return up to 30 scenes.")
 	pos := 0
 	for _, s := range d.Shots {
 		line := "- " + s.ID + ": " + s.Description + "\n"

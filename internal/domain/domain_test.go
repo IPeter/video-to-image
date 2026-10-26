@@ -192,14 +192,28 @@ func TestStudioShippedConfig(t *testing.T) {
 	st := cars.Studio
 	assert.True(t, st.Enabled)
 	assert.True(t, st.QA)
-	assert.Equal(t, []string{"front_three_quarter", "side_profile", "rear_three_quarter", "front", "rear"}, st.Views)
-	assert.Equal(t, []string{"grey", "light", "dark"}, st.EffectiveStyles())
-	assert.Equal(t, "grey", st.EffectiveDefaultStyle())
+	assert.Equal(t, []string{"front_three_quarter", "side_profile", "rear_three_quarter", "front", "rear", "trunk", "wheel", "engine_bay", "detail"}, st.Views)
+	assert.Equal(t, []string{"studio", "grey", "light", "dark"}, st.EffectiveStyles())
+	assert.Equal(t, "grey", st.EffectiveDefaultStyle(), "the drawn default")
+	assert.Equal(t, "studio", st.EffectiveDefaultStyleWithGenerative())
 	assert.Equal(t, "gemini-3.8-flash", st.EffectiveQAModel())
 	assert.True(t, st.HasView("side_profile"))
-	for _, v := range []string{"trunk", "interior_dashboard", "wheel", OtherShotID, ""} {
+	assert.True(t, st.HasView("trunk"))
+	for _, v := range []string{"interior_dashboard", "odometer", OtherShotID, ""} {
 		assert.False(t, st.HasView(v), v)
 	}
+	g := st.Generative
+	assert.True(t, g.Enabled)
+	assert.Equal(t, "gemini-3.1-flash-image", g.Model)
+	assert.Equal(t, []string{"interior_dashboard", "interior_front_seats", "interior_rear_seats"}, g.InteriorViews)
+	assert.True(t, st.IsInteriorView("interior_dashboard"))
+	assert.False(t, st.IsInteriorView("odometer"))
+
+	off := st
+	off.Generative = StudioGenerative{}
+	assert.Equal(t, []string{"grey", "light", "dark"}, off.EffectiveStyles())
+	assert.Equal(t, "grey", off.EffectiveDefaultStyleWithGenerative())
+	assert.False(t, off.IsInteriorView("interior_dashboard"))
 }
 
 func TestStudioDefaults(t *testing.T) {
@@ -237,7 +251,9 @@ func TestStudioValidation(t *testing.T) {
 		_, err := Parse([]byte(mutated))
 		return err
 	}
-	const views = "views: [front_three_quarter, side_profile, rear_three_quarter, front, rear]"
+	const views = "views: [front_three_quarter, side_profile, rear_three_quarter, front, rear, trunk, wheel, engine_bay, detail]"
+	const gen = "generative:\n    enabled: true"
+	const interiors = "interiorViews: [interior_dashboard, interior_front_seats, interior_rear_seats]"
 	const styles = "styles: [grey, light, dark]"
 	cases := map[string]struct {
 		from, to string
@@ -251,11 +267,17 @@ func TestStudioValidation(t *testing.T) {
 		"unknown style":           {styles, "styles: [grey, pink]", "Styles"},
 		"duplicate style":         {styles, "styles: [grey, light, grey]", `studio.styles: duplicate "grey"`},
 		"default not a style":     {styles, "styles: [light, dark]", `studio.defaultStyle "grey" is not one of studio.styles`},
-		"unknown default":         {"defaultStyle: grey", "defaultStyle: white", "DefaultStyle"},
+		"unknown default":         {gen, "defaultStyle: white\n  " + gen, "DefaultStyle"},
 		"gate out of range":       {"qa: true ", "qa: true\n  gates:\n    minIoU: 1.5\n ", "MinIoU"},
 		"unknown key":             {"qa: true ", "qa: true\n  qaModle: x\n ", "qaModle"},
 		"styles may be unset":     {styles, "# styles unset", ""},
-		"default may be unset":    {"defaultStyle: grey", "# default unset", ""},
+		"default may be set":      {gen, "defaultStyle: grey\n  " + gen, ""},
+		"interior not a shot":     {interiors, "interiorViews: [interior_dashboard, cabin]", `studio.generative.interiorViews: "cabin" is not a shot id`},
+		"interior duplicate":      {interiors, "interiorViews: [interior_dashboard, interior_dashboard]", `studio.generative.interiorViews: duplicate`},
+		"interior also a view":    {interiors, "interiorViews: [front]", `"front" is also in studio.views`},
+		"bad look":                {"look: grey", "look: neon", "Look"},
+		"keepPad over pad":        {"keepPad: 0.10", "keepPad: 0.5", "keepPad must not exceed pad"},
+		"generative may be off":   {gen, "generative:\n    enabled: false", ""},
 		"disabled needs no views": {"studio:\n  enabled: true\n", "studio:\n  enabled: false\n", ""},
 		"gates override":          {"qa: true ", "qa: true\n  qaModel: gemini-3.8-flash\n  gates:\n    minIoU: 0.85\n    maxBoxFill: 0.95\n ", ""},
 	}

@@ -19,6 +19,11 @@ type Price struct {
 var table = map[string]Price{
 	"gemini-3.5-flash-lite": {InputPerMTok: 0.30, OutputPerMTok: 2.50},
 	"gemini-3.8-flash":      {InputPerMTok: 0.75, OutputPerMTok: 3.75},
+	// Image model of the generative studio background (2026-09-24, Gemini API pricing
+	// page): image output is billed per token at $60/M (a 1K image ≈ 1,120 tokens ≈
+	// $0.067; ours are ~1,450 tokens); an input image is 1,120 tokens. The text
+	// tokens of its short answer are billed at the same output rate here (a handful).
+	"gemini-3.1-flash-image": {InputPerMTok: 0.30, OutputPerMTok: 60},
 }
 
 // Lookup finds the price for a model name. It accepts the "models/" prefix the API

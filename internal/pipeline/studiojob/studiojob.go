@@ -33,6 +33,7 @@ import (
 const (
 	DefaultPhotoTimeout = 45 * time.Second // V2I_STUDIO_TIMEOUT
 	DefaultQATimeout    = 90 * time.Second
+	DefaultGenTimeout   = 120 * time.Second // one image-model call (~10-20 s seen)
 )
 
 // Bounds for writes that must survive a cancelled job context (see persist).
@@ -76,6 +77,8 @@ type Runner struct {
 	PhotoTimeout time.Duration
 	// QATimeout bounds one QA model call (≤ 0 → DefaultQATimeout).
 	QATimeout time.Duration
+	// GenTimeout bounds one generative-studio image call (≤ 0 → DefaultGenTimeout).
+	GenTimeout time.Duration
 	// DailyCostCeilingUSD > 0: no QA call is made once today's model spend (since 00:00
 	// UTC) reached it; the photos not done yet are skipped and the job's studio work
 	// ends as skipped.
@@ -202,7 +205,7 @@ func (rn *run) execute(ctx context.Context) error {
 		if err := settle(nil); err != nil {
 			return err
 		}
-		if !p.needsQA || p.outcome != nil {
+		if (!p.needsQA && p.gen == nil) || p.outcome != nil {
 			if err := rn.complete(ctx, qaResult{p: p}); err != nil {
 				return err
 			}
@@ -216,7 +219,7 @@ func (rn *run) execute(ctx context.Context) error {
 			rn.log.Warn("studio: daily cost ceiling reached; remaining photos skipped", "ceiling_usd", rn.DailyCostCeilingUSD)
 			return rn.finish(ctx, store.StudioSkipped, "", &store.ImageStudio{Status: store.ImageStudioSkipped, Reason: ReasonCeiling})
 		}
-		inflight = rn.startQA(ctx, p)
+		inflight = rn.startChecks(ctx, p)
 	}
 	if err := settle(nil); err != nil {
 		return err
@@ -328,9 +331,13 @@ func (rn *run) deleteFiles(ctx context.Context) {
 	}
 }
 
-// recordUsage writes one usage_events row for a QA call (step "studio"), counted in the
-// job's cost and the daily ceiling. A failure to record is logged, not returned.
-func (rn *run) recordUsage(ctx context.Context, model string, u analyzer.Usage) {
+// recordUsage writes one usage_events row for a model call (step "studio" for the QA
+// check, "studio-gen" for the generative background), counted in the job's cost and the
+// daily ceiling. A failure to record is logged, not returned.
+func (rn *run) recordUsage(ctx context.Context, step, model string, u analyzer.Usage) {
+	if step == "" {
+		step = analyzer.StepStudio
+	}
 	if u.Model != "" {
 		model = u.Model
 	}
@@ -339,7 +346,7 @@ func (rn *run) recordUsage(ctx context.Context, model string, u analyzer.Usage) 
 		rn.log.Warn("studio: no price for model; cost recorded as 0", "model", model)
 	}
 	ev := store.UsageEvent{
-		JobID: rn.job.ID, DomainKey: rn.job.DomainKey, Step: analyzer.StepStudio, Model: model,
+		JobID: rn.job.ID, DomainKey: rn.job.DomainKey, Step: step, Model: model,
 		InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, ThinkingTokens: u.ThinkingTokens,
 		CostUSD: cost, LatencyMs: int(u.Latency.Milliseconds()),
 	}
@@ -348,7 +355,7 @@ func (rn *run) recordUsage(ctx context.Context, model string, u analyzer.Usage) 
 	}); err != nil {
 		rn.log.Error("studio: record usage", "err", err, "cost_usd", cost)
 	}
-	metrics.ModelLatency.WithLabelValues(model, analyzer.StepStudio).Observe(u.Latency.Seconds())
+	metrics.ModelLatency.WithLabelValues(model, step).Observe(u.Latency.Seconds())
 	metrics.ModelTokens.WithLabelValues(model, "input").Add(float64(u.InputTokens))
 	metrics.ModelTokens.WithLabelValues(model, "output").Add(float64(u.OutputTokens))
 	metrics.ModelTokens.WithLabelValues(model, "thinking").Add(float64(u.ThinkingTokens))
@@ -395,6 +402,13 @@ func (r *Runner) qaTimeout() time.Duration {
 		return r.QATimeout
 	}
 	return DefaultQATimeout
+}
+
+func (r *Runner) genTimeout() time.Duration {
+	if r.GenTimeout > 0 {
+		return r.GenTimeout
+	}
+	return DefaultGenTimeout
 }
 
 // Unavailable reports whether a Segmenter error means the sidecar itself could not be

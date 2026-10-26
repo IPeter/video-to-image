@@ -10,6 +10,7 @@ import (
 	"image"
 	"image/jpeg"
 	"io"
+	"maps"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -318,14 +319,16 @@ func TestRunQAWithholds(t *testing.T) {
 	ctx := context.Background()
 	job, _ := e.completedJob("car.mp4", photoSpec{shot: "side_profile", box: carBox()})
 	an := &qaAnalyzer{answer: func(_ int, r *analyzer.Request) (*analyzer.Response, error) {
-		return qaText("```json\n"+`{"missingParts":["roof antenna"],"backgroundKept":[],"notes":"antenna cut"}`+"\n```")(0, r)
+		return qaText("```json\n"+`{"missingParts":["left mirror cap","roof antenna tip"],"backgroundKept":[],"notes":"mirror cut"}`+"\n```")(0, r)
 	}}
 	require.NoError(t, e.runner(&segmenter{}, an).Run(ctx, job.ID))
 
 	st := e.images(job.ID)[0].Studio
 	assert.Equal(t, store.ImageStudioWithheld, st.Status)
-	assert.Contains(t, st.Reason, "roof antenna")
-	assert.Equal(t, []any{"roof antenna"}, diagValue(t, st, "qa", "missingParts"))
+	assert.Contains(t, st.Reason, "left mirror cap")
+	assert.NotContains(t, st.Reason, "antenna", "a lost antenna tip is minor and not a reason")
+	assert.Equal(t, []any{"left mirror cap"}, diagValue(t, st, "qa", "missingParts"))
+	assert.Equal(t, []any{"roof antenna tip"}, diagValue(t, st, "qa", "minorParts"))
 	assert.Empty(t, e.keysUnder(studiojob.Prefix("cars", job.ID)), "nothing withheld is stored")
 	assert.Equal(t, 1, e.usageRows(job.ID), "the check is paid for either way")
 	j := e.job(job.ID)
@@ -671,7 +674,9 @@ func TestEligibleAndNames(t *testing.T) {
 	box := &store.NRect{X0: 0.1, Y0: 0.1, X1: 0.9, Y1: 0.9}
 	for shot, want := range map[string]bool{
 		"front_three_quarter": true, "side_profile": true, "rear_three_quarter": true, "front": true, "rear": true,
-		"trunk": false, "interior_dashboard": false, "wheel": false, "other": false,
+		"trunk": true, "wheel": true, "detail": true, // every exterior shot since the generative style
+		"interior_dashboard": true, "interior_front_seats": true, // the studio through the glass
+		"odometer": false, "other": false,
 	} {
 		ok, reason := studiojob.Eligible(cars, store.SelectedImage{ShotID: shot, SubjectBox: box})
 		assert.Equal(t, want, ok, shot)
@@ -682,6 +687,13 @@ func TestEligibleAndNames(t *testing.T) {
 	ok, reason := studiojob.Eligible(cars, store.SelectedImage{ShotID: "front"})
 	assert.False(t, ok)
 	assert.Equal(t, studiojob.ReasonNoBox, reason)
+	ok, _ = studiojob.Eligible(cars, store.SelectedImage{ShotID: "interior_dashboard"})
+	assert.True(t, ok, "an interior needs no box")
+	noGen := *cars
+	noGen.Studio.Generative = domain.StudioGenerative{}
+	ok, reason = studiojob.Eligible(&noGen, store.SelectedImage{ShotID: "interior_dashboard", SubjectBox: box})
+	assert.False(t, ok)
+	assert.Equal(t, studiojob.ReasonNotExterior, reason)
 	off := *cars
 	off.Studio.Enabled = false
 	ok, _ = studiojob.Eligible(&off, store.SelectedImage{ShotID: "front", SubjectBox: box})
@@ -719,4 +731,89 @@ func TestUnavailable(t *testing.T) {
 		assert.Equal(t, tc.want, studiojob.Unavailable(tc.err), "%v", tc.err)
 	}
 	assert.True(t, slices.Equal(styles, []string{"grey", "light", "dark"}))
+}
+
+// The generative style on an exterior: the fake image model fills the magenta and keeps
+// the car in place, so the photo gets a "studio" variant first, then the drawn ones;
+// the call is paid for next to the QA check.
+func TestRunGenerativeExterior(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.withGenerative()
+	ctx := context.Background()
+	job, _ := e.completedJob("walkaround.mp4", photoSpec{shot: "front_three_quarter", box: carBox()})
+	an, err := fake.New(fake.Options{})
+	require.NoError(t, err)
+	seg := &segmenter{}
+	require.NoError(t, e.runner(seg, an).Run(ctx, job.ID))
+
+	im := e.images(job.ID)[0]
+	st := im.Studio
+	require.NotNil(t, st)
+	require.Equal(t, store.ImageStudioReady, st.Status, "%s", st.Diagnostics)
+	require.Contains(t, st.Styles, store.Style("studio"))
+	for _, s := range styles {
+		assert.Contains(t, st.Styles, store.Style(s))
+	}
+	v := st.Styles["studio"]
+	// The kept margin widens the frame; the result is then scaled back to the photo's
+	// long side (the generated background was upscaled anyway).
+	assert.Equal(t, [2]int{photoW, photoH}, [2]int{v.Width, v.Height})
+	assert.NotEmpty(t, e.read(v.Key))
+	assert.NotEmpty(t, e.read(v.ThumbKey))
+	assert.Equal(t, true, diagValue(t, st, "gen", "ok"))
+	assert.Less(t, diagValue(t, st, "gen", "alignment").(float64), studio.MaxAlignment)
+	assert.Equal(t, float64(1), diagValue(t, st, "gen", "calls"))
+	assert.Equal(t, 2, e.usageRows(job.ID), "the image call and the QA check")
+	assert.Equal(t, []string{"studio", "grey", "light", "dark"}, e.cars().Studio.EffectiveStyles())
+}
+
+// A model that moves the car: the answer is rejected twice (the second time with a
+// wider margin) and the photo keeps its drawn styles only.
+func TestRunGenerativeMisaligned(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.withGenerative()
+	job, _ := e.completedJob("walkaround-misaligned.mp4", photoSpec{shot: "front", box: carBox()})
+	an, err := fake.New(fake.Options{})
+	require.NoError(t, err)
+	require.NoError(t, e.runner(&segmenter{}, an).Run(context.Background(), job.ID))
+
+	st := e.images(job.ID)[0].Studio
+	require.Equal(t, store.ImageStudioReady, st.Status, "%s", st.Diagnostics)
+	assert.NotContains(t, st.Styles, store.Style("studio"))
+	assert.Contains(t, st.Styles, store.Style("grey"))
+	assert.Equal(t, false, diagValue(t, st, "gen", "ok"))
+	assert.Equal(t, float64(2), diagValue(t, st, "gen", "calls"))
+	assert.Contains(t, diagValue(t, st, "gen", "error"), "moved the car")
+	assert.InDelta(t, 0.4, diagValue(t, st, "gen", "pad").(float64), 1e-9, "the retry widened the margin")
+	assert.Equal(t, 3, e.usageRows(job.ID), "two image calls and the QA check")
+}
+
+// An interior: no segmentation, no QA; the model's window treatment becomes the only
+// variant, and a photo without a box is eligible.
+func TestRunGenerativeInterior(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.withGenerative()
+	job, _ := e.completedJob("walkaround.mp4",
+		photoSpec{shot: "interior_dashboard"}, photoSpec{shot: "odometer", box: carBox()})
+	require.Equal(t, store.StudioPending, job.StudioStatus)
+	an, err := fake.New(fake.Options{})
+	require.NoError(t, err)
+	seg := &segmenter{}
+	require.NoError(t, e.runner(seg, an).Run(context.Background(), job.ID))
+
+	imgs := e.images(job.ID)
+	st := imgs[0].Studio
+	require.Equal(t, store.ImageStudioReady, st.Status, "%s", st.Diagnostics)
+	assert.Equal(t, []store.Style{"studio"}, slices.Collect(maps.Keys(st.Styles)))
+	assert.Equal(t, photoW, st.Styles["studio"].Width, "an interior keeps its frame")
+	assert.Equal(t, true, diagValue(t, st, "gen", "interior"))
+	assert.Equal(t, float64(1), diagValue(t, st, "gen", "windows"), "the fake names one glass box")
+	assert.Greater(t, diagValue(t, st, "gen", "changed").(float64), studio.MinInteriorChange)
+	assert.Zero(t, seg.calls(), "no cut-out for an interior")
+	assert.Equal(t, store.ImageStudioSkipped, imgs[1].Studio.Status, "the odometer is neither exterior nor interior view")
+	assert.Equal(t, 2, e.usageRows(job.ID), "the window boxes and the image call")
+	assert.Equal(t, store.StudioDone, e.job(job.ID).StudioStatus)
 }

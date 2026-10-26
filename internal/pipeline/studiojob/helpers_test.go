@@ -46,7 +46,23 @@ func newEnv(t *testing.T) *env {
 	require.NoError(t, err)
 	reg, err := domain.LoadDir(filepath.Join("..", "..", "..", "configs", "domains"))
 	require.NoError(t, err)
-	return &env{t: t, pool: pool, store: store.New(pool), storage: st, reg: reg, scratch: t.TempDir()}
+	e := &env{t: t, pool: pool, store: store.New(pool), storage: st, reg: reg, scratch: t.TempDir()}
+	// The tests below describe the drawn styles on the five whole-car views; the cars
+	// domain now also has the generative style and every exterior shot. Tests of those
+	// turn them back on with withDomain.
+	e.withDomain(func(c *domain.Config) {
+		c.Studio.Views = []string{"front_three_quarter", "side_profile", "rear_three_quarter", "front", "rear"}
+		c.Studio.Generative = domain.StudioGenerative{}
+	})
+	return e
+}
+
+// withGenerative turns the generative style on (as cars.yaml ships it).
+func (e *env) withGenerative() {
+	e.withDomain(func(c *domain.Config) {
+		c.Studio.Generative = domain.StudioGenerative{Enabled: true, Pad: 0.25, KeepPad: 0.1,
+			InteriorViews: []string{"interior_dashboard", "interior_front_seats", "interior_rear_seats"}}
+	})
 }
 
 // withDomain replaces the cars domain by a copy changed by mutate.
@@ -182,7 +198,7 @@ func (e *env) usageRows(jobID string) int {
 	e.t.Helper()
 	var n int
 	require.NoError(e.t, e.pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM usage_events WHERE job_id = $1 AND step = 'studio'`, jobID).Scan(&n))
+		`SELECT count(*) FROM usage_events WHERE job_id = $1 AND step IN ('studio', 'studio-gen')`, jobID).Scan(&n))
 	return n
 }
 

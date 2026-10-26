@@ -364,14 +364,14 @@ export interface components {
         } | null;
         JobStudio: {
             /** @enum {string} */
-            defaultStyle: "grey" | "light" | "dark" | "";
+            defaultStyle: "studio" | "grey" | "light" | "dark" | "";
             /**
              * @description none: not requested (feature off or no eligible image); pending/running: studio versions are being made after the job completed; done; failed or skipped (e.g. daily cost ceiling): only originals are offered.
              * @enum {string}
              */
             status: "none" | "pending" | "running" | "done" | "failed" | "skipped";
             /** @description Styles rendered for this job, display order, the default first. */
-            styles: ("grey" | "light" | "dark")[];
+            styles: ("studio" | "grey" | "light" | "dark")[];
             /** @description studio.zip (every studio variant + manifest.json) once status is done and at least one image is ready; else null. Route: …/jobs/{jobId}/studio.zip. */
             zipUrl: string | null;
         };
@@ -506,8 +506,11 @@ export interface components {
             fileName: string;
             /** Format: int64 */
             height: number;
-            /** @enum {string} */
-            style: "grey" | "light" | "dark";
+            /**
+             * @description studio: painted by an image model around the original car pixels; grey/light/dark: drawn backdrops.
+             * @enum {string}
+             */
+            style: "studio" | "grey" | "light" | "dark";
             /** @description 640 px wide JPG: …/images/{imageId}/studio/{style}/thumb. */
             thumbnailUrl: string;
             /** @description Full-resolution JPG, relative to the API base URL: …/images/{imageId}/studio/{style}. */

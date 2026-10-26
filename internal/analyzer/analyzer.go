@@ -16,7 +16,11 @@ const (
 	StepAnalyze = "analyze"
 	StepRerank  = "rerank" // legacy, replaced by StepReview
 	StepReview  = "review"
+	StepLocate  = "locate" // the contact-sheet moment finder (internal/pipeline/locate)
 	StepStudio  = "studio" // the studio-background QA check (internal/studio)
+	// StepStudioGen is the generative studio background: an image model paints a
+	// studio around the cut-out car (internal/studio, gen.go).
+	StepStudioGen = "studio-gen"
 )
 
 // ErrUnavailable means the provider failed after its own transient-error retries
@@ -48,6 +52,12 @@ type Request struct {
 	Parts []Part
 	// ResponseSchema, when set, asks for JSON matching the schema (structured output).
 	ResponseSchema *Schema
+	// ResponseModalities asks an image model for images ("IMAGE", optionally with
+	// "TEXT"); empty means text. Images come back in Response.Images.
+	ResponseModalities []string
+	// ImageAspectRatio is the shape of a generated image ("16:9", "4:3", "3:4", ...);
+	// "" leaves it to the model (usually the input's).
+	ImageAspectRatio string
 
 	// Hints for fakes and usage accounting; providers may ignore them.
 	DurationSec float64  // duration of the video part, seconds
@@ -75,11 +85,20 @@ type Part struct {
 type Response struct {
 	Text  string // raw model text (JSON when ResponseSchema was set)
 	Usage Usage
+	// Images are the generated images of an image request (Request.ResponseModalities
+	// with "IMAGE"), in answer order; nil otherwise.
+	Images []Image
 	// FileHandles has one entry per request Part (empty for text parts and for
 	// providers without uploads). Callers reuse them within one attempt (the analyze
 	// nudge retry) and release them with ReleaseFile afterwards; they are not persisted
 	// across worker restarts (a re-delivered job uploads the preview again).
 	FileHandles []string
+}
+
+// Image is one generated image.
+type Image struct {
+	Data     []byte
+	MIMEType string // "image/png", "image/jpeg"
 }
 
 // Usage is recorded as one usage_events row per call.

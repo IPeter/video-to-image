@@ -29,6 +29,7 @@ import (
 	"video-to-image/internal/pipeline/crop"
 	"video-to-image/internal/pipeline/export"
 	"video-to-image/internal/pipeline/extract"
+	"video-to-image/internal/pipeline/locate"
 	"video-to-image/internal/pipeline/preview"
 	"video-to-image/internal/pipeline/review"
 	"video-to-image/internal/pipeline/score"
@@ -167,6 +168,9 @@ type run struct {
 	log   *slog.Logger
 	work  string
 	steps map[string]store.Step
+	// located are the locate pass's moments of this run (analyze step meta
+	// locatedMomentsKey on a resumed run), for the review shortlist.
+	located map[string][]float64
 	// previewFPS is the preview's real frame rate (keyframe-only previews are slower
 	// than requested); the model is told to sample at it.
 	previewFPS float64
@@ -289,6 +293,7 @@ func (rn *run) execute(ctx context.Context) error {
 			return fmt.Errorf("pipeline: list scenes: %w", err)
 		}
 		scenes = scenesFromStore(stored)
+		rn.located = locatedFromMeta(rn.steps[store.StepNameAnalyze].Meta)
 	} else {
 		previewPath, err := rn.stepPreview(ctx, original)
 		if err != nil {
@@ -454,19 +459,28 @@ func (rn *run) stepAnalyze(ctx context.Context, previewPath string) (*analyze.Ou
 		Reason:          out.Gate.Reason,
 		DetectedSubject: out.Gate.DetectedSubject,
 	}
+	meta := map[string]any{
+		"accepted":       out.Accepted,
+		"gateConfidence": out.Gate.Confidence,
+		"scenes":         len(out.Scenes),
+		"dropped":        out.Dropped,
+		"calls":          len(out.Calls),
+	}
+	if out.Accepted && rn.dom.Locate.Enabled {
+		// The contact-sheet pass adds the seconds it finds to the scene list before
+		// anything is saved, so the stored scenes are the ones extract will use (also
+		// after a retry). Its failure is not the job's: the analyze scenes stand alone.
+		if err := rn.locate(ctx, previewPath, out, meta); err != nil {
+			return nil, err
+		}
+	}
 	res := store.AnalysisResult{
 		Gate:      gate,
 		Summary:   out.VideoSummary,
 		ModelName: rn.dom.Model.Name,
 		Scenes:    scenesToStore(rn.job.ID, out.Scenes),
-		StepMeta: map[string]any{
-			"accepted":       out.Accepted,
-			"gateConfidence": out.Gate.Confidence,
-			"scenes":         len(out.Scenes),
-			"dropped":        out.Dropped,
-			"calls":          len(out.Calls),
-		},
-		Reject: !out.Accepted,
+		StepMeta:  meta,
+		Reject:    !out.Accepted,
 	}
 	if err := rn.persist(ctx, "save analysis", func(ctx context.Context) error {
 		return rn.Store.SaveAnalysis(ctx, rn.job.ID, res)
@@ -487,6 +501,96 @@ func (rn *run) stepAnalyze(ctx context.Context, previewPath string) (*analyze.Ou
 	return out, nil
 }
 
+// locate runs the contact-sheet pass on the preview and merges the located seconds
+// into out.Scenes (analyze.MergeScenes), recording its usage under
+// analyzer.StepLocate and its outcome in meta ("analyzeScenes", "located",
+// "locateDropped", "locateSheets", and "locateError" when it failed). It never fails
+// the step: any error, a cancellation included, leaves out.Scenes as the analyze call
+// made them, so the paid analyze answer is saved either way (the caller writes it on a
+// detached context). It always returns nil.
+func (rn *run) locate(ctx context.Context, previewPath string, out *analyze.Output, meta map[string]any) error {
+	log := rn.log.With("step", store.StepNameAnalyze)
+	start := time.Now()
+	loc, err := locate.Run(ctx, rn.Analyzer, locate.Input{
+		Domain:      rn.dom,
+		JobID:       rn.job.ID,
+		PreviewPath: previewPath,
+		DurationSec: rn.job.VideoInfo.DurationSec,
+		WorkDir:     rn.work,
+		CacheKey:    rn.job.VideoInfo.SHA256,
+		FFmpeg:      rn.FFmpeg,
+	})
+	if loc != nil && len(loc.Calls) > 0 {
+		rn.recordUsage(ctx, analyzer.StepLocate, loc.Calls, 0)
+	}
+	meta["analyzeScenes"] = len(out.Scenes)
+	if err != nil {
+		log.Warn("pipeline: locate failed; continuing with the analyze scenes", "err", err, "took", time.Since(start))
+		meta["locateError"] = truncate(err.Error(), 300)
+		return nil
+	}
+	extra := locate.Scenes(loc.Moments, rn.dom, rn.job.VideoInfo.DurationSec)
+	merged, drops := analyze.MergeScenes(out.Scenes, extra, rn.dom)
+	out.Scenes = merged
+	out.Dropped = append(out.Dropped, drops...)
+	meta["scenes"] = len(merged)
+	meta["dropped"] = out.Dropped
+	meta["located"] = len(loc.Moments)
+	meta["locateDropped"] = loc.Dropped
+	meta["locateSheets"] = loc.Sheets
+	meta[locatedMomentsKey] = momentsToMeta(loc.Moments)
+	rn.located = preferredSeconds(loc.Moments)
+	log.Info("pipeline: locate done", "moments", len(loc.Moments), "dropped", loc.Dropped,
+		"sheets", loc.Sheets, "scenes", len(merged), "took", time.Since(start))
+	return nil
+}
+
+// locatedMomentsKey is the analyze step meta key of the locate pass's moments:
+// [{"sec", "shotId", "whole", "rotateCw"}], read back by a resumed run.
+const locatedMomentsKey = "locatedMoments"
+
+func momentsToMeta(ms []locate.Moment) []map[string]any {
+	out := make([]map[string]any, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, map[string]any{"sec": m.Sec, "shotId": m.ShotID, "whole": m.Whole, "rotateCw": m.RotateCW})
+	}
+	return out
+}
+
+// preferredSeconds are the seconds per shot at which the locate pass saw the whole
+// subject, in its order (review.Input.Preferred).
+func preferredSeconds(ms []locate.Moment) map[string][]float64 {
+	out := map[string][]float64{}
+	for _, m := range ms {
+		if m.Whole {
+			out[m.ShotID] = append(out[m.ShotID], m.Sec)
+		}
+	}
+	return out
+}
+
+// locatedFromMeta reads the moments a previous attempt stored (locatedMomentsKey).
+func locatedFromMeta(meta map[string]any) map[string][]float64 {
+	raw, ok := meta[locatedMomentsKey].([]any)
+	if !ok {
+		return nil
+	}
+	var ms []locate.Moment
+	for _, e := range raw {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		sec, _ := m["sec"].(float64)
+		shot, _ := m["shotId"].(string)
+		whole, _ := m["whole"].(bool)
+		if shot != "" {
+			ms = append(ms, locate.Moment{Sec: sec, ShotID: shot, Whole: whole})
+		}
+	}
+	return preferredSeconds(ms)
+}
+
 func (rn *run) stepExtract(ctx context.Context, original string, scenes []analyze.Scene) ([]extract.Candidate, error) {
 	var cands []extract.Candidate
 	err := rn.step(ctx, store.StepNameExtract, func() (any, error) {
@@ -504,6 +608,7 @@ func (rn *run) stepExtract(ctx context.Context, original string, scenes []analyz
 			Ranges:        ranges,
 			SampleFPS:     rn.dom.Selection.SampleFPS,
 			MaxCandidates: rn.dom.Limits.MaxCandidateFrames,
+			PaddingSec:    rn.dom.Selection.ScenePaddingSec,
 			Concurrency:   rn.ExtractConcurrency,
 		})
 		if err != nil {
@@ -1208,7 +1313,7 @@ func (rn *run) reviewFrames(ctx context.Context, scored []score.Scored, meta map
 	}
 	out, err := review.Run(ctx, rn.Analyzer, review.Input{
 		Domain: rn.dom, JobID: rn.job.ID, CacheKey: rn.job.VideoInfo.SHA256,
-		WorkDir: rn.work, Candidates: scored, Scores: pre,
+		WorkDir: rn.work, Candidates: scored, Scores: pre, Preferred: rn.located,
 	})
 	if out == nil {
 		out = &review.Output{}

@@ -27,6 +27,7 @@ const (
 	StyleGrey  Style = "grey"  // neutral showroom; the default (every car colour keeps its outline)
 	StyleLight Style = "light" // white-to-light-grey cyclorama
 	StyleDark  Style = "dark"  // charcoal with a top spotlight; never automatic (black cars merge)
+	// StyleStudio (gen.go) is painted by an image model, not drawn.
 )
 
 // EdgeContact is the share (0..1) of each frame edge the mask touches.

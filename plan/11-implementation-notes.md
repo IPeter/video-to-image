@@ -273,3 +273,188 @@ so the browser always uploads in pieces (small files are one piece):
 - `v2i eval`, SSE progress, k8s manifests (probes: web `/api/healthz` + `/api/readyz`,
   API `/healthz` + `/livez`, worker `/livez` on the admin port; worker
   `terminationGracePeriodSeconds` ≥ `V2I_SHUTDOWN_TIMEOUT` + 15 s).
+
+## Round 3 (2026-09-24): finding the moments the analyze call misses
+
+Driven by the same iPhone walkaround. Round 2 delivered 3–5 photos of a video that
+holds nine or ten (front at 0–1 s, side profile at 6.5–10.5 s, rear with the trunk open
+at 18.5–20.5 s, rear 3/4 at 21.5–23 s, dashboard, cluster, seats, wheel, headlight). The
+stored verdicts of four runs showed where the photos were lost:
+
+1. Frames were only extracted inside the analyze call's scene windows (±0.5 s), about
+   14 of 59 s. The model watches a 2 fps 480p preview and answers in whole seconds; it
+   put the side profile at 4–7 s while the car was whole in frame from 6.5 s to 10.5 s,
+   so every side-profile candidate was from the mid-turn seconds and correctly judged
+   "cut off". The good seconds never became candidates.
+2. The scene list changed every run (6, 8, 8, 6 scenes; rear 3/4, wheel and odometer
+   came and went) at temperature 0.2 with "the best moment" per shot.
+3. The review relabelled the straight-on rear (tailgate open) as trunk; with one photo
+   per view, rear and trunk collapsed into one.
+4. The review called the 0.75 s front frame "cut off" while its own box had margin on
+   all four sides (another run accepted the same frame).
+
+Changes:
+
+- **Locate pass** (`internal/pipeline/locate`, `locate:` block in the domain YAML, on
+  for cars): after the analyze call accepted the video and before anything is saved,
+  the preview is sampled at 1 fps and laid out on contact sheets (4×3 tiles of ≤ 320 px,
+  the second printed in each tile's corner with a 3× bitmap font; a one-minute video is
+  5 sheets ≈ 5 images of tokens). One call (`Step "locate"`, own usage rows, label
+  "Finding the moments" in the web) returns, per view, the seconds whose tiles show the
+  whole subject. Each second becomes the range [s−0.5, s+0.5]; `analyze.MergeScenes`
+  joins touching ranges of one shot and the analyze call's own scenes (the higher
+  relevance keeps its reason), capped at `selection.maxScenes` (cars: 30). The merged
+  list is what `SaveAnalysis` stores, so a retry extracts the same ranges. A failed
+  locate call (unavailable, bad output, no frames) is logged in the analyze step meta
+  (`locateError`) and the job goes on with the analyze scenes alone; only a context
+  error propagates. The fake analyzer answers an empty list, so fixtures are unchanged.
+- **Analyze prompt**: up to 2 distinct moments per shot instead of "the best moment";
+  `cars.yaml` temperature 0; `selection.scenePaddingSec` (new, cars: 1 s; default stays
+  0.5 s = `extract.PaddingSec`).
+- **Review shortlist spread** (`review.shortlistGap`): the frames of one shot sent to
+  the review must be at least (the shot's summed scene span ÷ candidatesPerShot) apart,
+  not just 1 s, so an 8 s side-profile scene is sampled at its start, middle and end
+  instead of at its three sharpest (first, cut-off) seconds. cars: `candidatesPerShot`
+  4.
+- **Box over boolean** (`review.EdgeMargin`, `Assessment.VisibleByBox`): a "not fully
+  visible" verdict is overruled when the model's own box keeps ≥ 2 % from every image
+  edge. A box touching an edge, or no box, leaves the verdict alone. Counted in the
+  review log (`visible_by_box`).
+- **Prompt rules (cars review and locate)**: rear with the tailgate open is `rear` when
+  the whole car is visible, `trunk` only when the cargo area fills the picture; the
+  photographer's shadow or reflection is not a defect. (A code rule letting a frame
+  fill its scene's shot as well as the review's view was considered and dropped: it
+  would let a wheel close-up the review re-labelled fill a side-profile slot.)
+- **Crop fallback** (`crop.fallbackAspect`, cars: 3:4): when the subject does not fit
+  the primary aspect without being cut, the fallback shape is planned once with the same
+  margin and floor. In a 9:16 frame a 3:4 crop can hold a subject up to 75 % of the
+  height; a taller one still stays uncropped, which is the right output for it.
+
+Result on the same video (one run, 2026-09-24 16:53, local, gemini-3.5-flash-lite):
+8 of 8 photos — side profile (7 s, whole car), rear 3/4 (21.6 s), rear with the trunk
+open (20.3 s), front (1.75 s, 3:4 fallback crop), dashboard, cluster, front seats, rear
+seats through the rear door; only front 3/4 reported missing (it is not in the footage).
+The locate call named 13 seconds on 5 sheets in 4.2 s for $0.0033; the job cost $0.027
+(review $0.021 for 24 frames, up from 13) and took 97 s end to end, of which extract
+63 s (10 scenes with 1 s padding on 4K HEVC, up from ~30 s). The locate call listed
+5 s and 6 s for the side profile (car cut off; 7–10 s were the whole-car seconds) — the
+shortlist spread still reached 7 s through the merged 3–8.5 s scene; the prompt now
+says explicitly that an edge-touching subject is never "shown well" and that sideways
+tiles count like upright ones (not yet re-run against the model).
+
+Open: extract time with more scenes (the worker's 4 CPU limit will feel it; consider
+`V2I_EXTRACT_CONCURRENCY` 2 there or a lower `sampleFps` for located ranges), the
+review cost (24 frames), and the 3:4 front crop's bottom margin (tight).
+
+First job on the cluster (2026-09-24 17:23, job_01M3A07MV25YSPNJK28BHHFR9S): 8 photos,
+but all three studio versions withheld — rear 3/4 and front because the car touched the
+photo edge (both are crops around the review's box, which runs a few percent tight at
+512 px; a 6 % margin did not cover it), the side profile because the frame chosen was
+22.75 s with the tailgate open (the locate call again did not list 7–10 s, where the
+car lies sideways and nearly fills a 320 px tile). Follow-up in the same round:
+`crop.marginPct` 10 and `crop.minMarginPct` 3 for cars (a crop whose fitted margin
+would fall below the floor is not made); the locate sheets show every second as a 2×2
+quad of its rotations (as recorded, 90°, 180°, 270°; 240 px cells, 6 seconds per sheet,
+10 sheets per minute) because the model missed the sideways side-profile seconds in
+three runs when shown a single tile, while the review's orientation grids of the same
+shape scored 4 of 4; the model also names the upright copy; and the prompt asks for
+every second where the view is recognisable with `wholeSubject` telling whether it is complete — moments with
+`wholeSubject` false are kept at 0.6× relevance, since the review judges the
+full-resolution frame anyway.
+
+Third local run after the quads (17:37): the locate call named 24 seconds including the
+side profile at 8 s and 10 s (rotation 270 reported correctly), yet the job fell to 6
+photos: the review shortlist for the side profile took the sharpest frames under the
+spread rule, at 4.7, 7.0, 10.8 and 24.5 s — exactly the edges of the 7.5–10.5 s window
+— and all were cut off. The two passes were not connected. Now `review.Input.Preferred`
+(per shot, the seconds the locate pass saw the subject whole; stored in the analyze
+step meta as `locatedMoments` for a resumed run) makes the shortlist take the best
+candidate within 0.5 s of each such second first, then fill by score with the spread
+rule. `scenePaddingSec` is back to 0.5 for cars: with the located windows the 1 s
+padding only doubled the 4K decode (extract 1m57 for 293 candidates).
+
+Fourth local run (17:42), with the shortlist preferring the located seconds: 7 photos —
+side profile at 7.9 s (whole car, uncropped), rear 3/4 at 20.75 s, rear at 19.1 s,
+front at 0.25 s (3:4), dashboard, front seats, rear seats; missing only front 3/4.
+20 frames reviewed, 11 of them at located seconds; locate $0.0053 (10 quad sheets),
+job $0.027, extract 56 s. Not yet deployed.
+
+Second cluster job on the new build (job_01M3A3J7F3YFMD49MABBHTV42E, 18:22): 8 photos
+with the side profile at 7.75 s, but the studio again withheld all three: the side
+profile and the front for "roof antenna tip" (the QA policy question left open on
+2026-09-23), the rear 3/4 because the frame chosen (11.5 s) really is cut off at the
+right — the review called it fully visible, which is model noise; the gate is right.
+One QA answer was cut off at the 512-token cap with 490 thinking tokens although the
+budget is 0. Decided: a thin roof antenna or aerial (or its tip) is minor — the QA
+prompt and schema have `minorParts`, any missingParts item naming an antenna/aerial is
+moved there (`studio.minorPartWords`), and minor parts never withhold; the QA output cap
+is 2048.
+
+## Spike (2026-09-24 evening): generative studio backgrounds
+
+The user wants a real photo-studio look (turntable, cyclorama) on every photo,
+interiors included. Spike in `data/research/studio-gen-spike/` (scripts + outputs) with
+`gemini-3.1-flash-image` on the seven photos of a local run of the reference video:
+
+- Sending the photo and asking for a new background: beautiful studio, but the model
+  recomposes (shrinks and recentres the car), so pasting the original car pixels back
+  through our mask does not line up.
+- Sending the car cut out on flat magenta and asking to fill only the magenta: pixel
+  aligned when the car has room (rear, rear 3/4: mean car diff 7/255), still recomposed
+  when the car fills the frame (side profile, front: ~80/255).
+- Same, on a canvas padded 25 % with magenta on every side: aligned for all four
+  exteriors (diff 6.6–7.9). The output is the studio around the original car pixels,
+  turntable under the car, correct perspective. ~10 s and ~1,450 output tokens per image.
+- Interiors: asking to replace only what is seen through the glass keeps the cabin and
+  puts the studio in the windows (dashboard, rear seats); the front-seats shot barely
+  changed. A diff-based paste-back keeps the cabin pixels original.
+
+Plan: a generative style in the studio step — padded magenta cut-out → image model →
+alpha composite on the padded canvas → alignment check (car diff < 15/255, else retry
+once, else the procedural styles) → the existing gates and QA; interiors go through the
+window prompt with the diff paste-back. Needs the analyzer boundary to carry image
+output (response modalities, inline image bytes), a price for the image model, and a
+worker time budget (~10 s per photo, sequential per job).
+
+Try it on any photo: `make studio-try PHOTOS="a.jpg b.jpg" [ARGS="--interior --style white"]`
+(`scripts/studio-try.py`: car box from gemini-3.5-flash-lite → sidecar mask → padded
+magenta → image model → composite + alignment verdict; outputs in data/studio-try/).
+
+## Round 4 (2026-09-24 evening): generative studio, every photo
+
+Built from the spike above.
+
+- **Analyzer boundary** carries images: `Request.ResponseModalities` / `ImageAspectRatio`,
+  `Response.Images` (inline bytes + MIME); the Gemini client maps them onto
+  `responseModalities` / `imageConfig` and collects inline image parts; recordings store
+  images base64; the fake answers `studio-gen` with the request's own image, its
+  border-connected magenta turned into a grey gradient (a name containing "misaligned"
+  shifts it). Price row for gemini-3.1-flash-image ($60/M output tokens).
+- **`internal/studio/gen.go`**: `BuildCanvas` (car on magenta with a margin), `GenRequest`
+  (prompt by look: grey/white/dark; interior prompt for the window treatment),
+  `Alignment` (mean luminance difference inside the eroded mask at 384 px; > 15 = the
+  model moved the car), `ComposeGenerated` (alpha under the original car),
+  `CropCanvas` (keep 10 % margin, scale to the photo's long side), `InteriorCompose`
+  (generated pixels only where the answer differs, 2–60 % of the picture).
+- **Studio job**: the generative call runs in the photo's background goroutine before
+  the QA check; a misaligned answer is retried once with a wider margin (+0.15); a
+  failed call leaves an exterior with its drawn styles and ends an interior withheld.
+  Interior views (`studio.generative.interiorViews`) are eligible without a box, skip
+  the mask, gates and QA. `studio.views` now lists every exterior shot.
+- **Config**: `studio.generative {enabled, model, look, pad, keepPad, interiorViews}`;
+  the "studio" style is first and the default when enabled (`EffectiveStyles`,
+  `EffectiveDefaultStyleWithGenerative`). API enums, `studioStyles`, `studioEligible`,
+  web labels/swatch and the usage label "Studio backgrounds" follow.
+- The studio-job tests pin the pre-round-4 config (five views, no generative) and
+  three new tests cover the exterior, misaligned and interior paths with the fake.
+
+First local run of round 4 on the reference video (19:35): 5 of 7 studio versions ready
+(side profile, front, trunk, dashboard, front seats); rear 3/4 withheld by the QA (open
+tailgate, correct), rear seats withheld (the model changed 77 % of the picture). The
+dashboard result exposed a hole: the diff-based interior blend let a repainted dashboard
+through. Interiors now get a window-box call first (gemini-3.5-flash-lite,
+`WindowBoxesRequest`): generated pixels are taken only inside the glass boxes
+(feathered), the cabin stays original by construction, and no glass → no image call.
+Cost: the image model bills ~1,450 output tokens per photo at $60/M ≈ $0.087 (not the
+$0.04 estimated earlier); a job with 7 studio photos cost $0.65, of which $0.59 the
+image calls. Usage rows of the image calls are step `studio-gen` ("Studio backgrounds").

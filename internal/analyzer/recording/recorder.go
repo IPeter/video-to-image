@@ -73,6 +73,7 @@ func (r *Recorder) write(req *analyzer.Request, resp *analyzer.Response) error {
 		Step:         req.Step,
 		Model:        req.Model,
 		Text:         resp.Text,
+		Images:       imagesFrom(resp.Images),
 		Usage:        usageFrom(resp.Usage),
 		PromptSHA256: promptFingerprint(req),
 		RecordedAt:   r.now().UTC(),

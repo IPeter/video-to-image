@@ -406,7 +406,7 @@ func TestRunResumesWithoutPayingTwice(t *testing.T) {
 	got, _ := e.store.GetJob(ctx, job.ID)
 	require.Equal(t, store.StatusProcessing, got.Status)
 	assert.Equal(t, store.StepDone, e.steps(job.ID)["analyze"])
-	assert.Equal(t, int32(3), first.calls.Load(), "analyze + frame review (orientation, judgement)")
+	assert.Equal(t, int32(4), first.calls.Load(), "analyze + locate + frame review (orientation, judgement)")
 
 	second := &countingAnalyzer{Analyzer: newFake(t)}
 	require.NoError(t, e.runner(second).Run(ctx, job.ID))

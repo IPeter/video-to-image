@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"image/jpeg"
 	"io"
 	"math"
 	"os"
+	"strings"
 	"time"
 
 	"video-to-image/internal/analyzer"
@@ -35,6 +37,12 @@ type photo struct {
 	variants []variant // in rn.styles order
 	qa       studio.QAParams
 	diag     diagnostics
+	// gen is the generative-studio call to make (nil: none); canvas its padded cut-out
+	// (exterior) and orig the decoded photo (interior: the compose needs it).
+	gen      *studio.GenParams
+	canvas   *studio.Canvas
+	orig     image.Image
+	interior bool
 }
 
 // variant is one rendered style, encoded.
@@ -56,8 +64,22 @@ type diagnostics struct {
 	// Styles are the per-style results: composite time and JPEG size.
 	Styles    map[string]styleDiag `json:"styles,omitempty"`
 	QA        *qaDiag              `json:"qa,omitempty"`
+	Gen       *genDiag             `json:"gen,omitempty"`
 	TimingsMS map[string]int64     `json:"timingsMs,omitempty"`
 	Error     string               `json:"error,omitempty"`
+}
+
+// genDiag is the generative studio call's outcome.
+type genDiag struct {
+	Model     string  `json:"model"`
+	Interior  bool    `json:"interior,omitempty"`
+	Pad       float64 `json:"pad,omitempty"`
+	Calls     int     `json:"calls"`
+	Alignment float64 `json:"alignment,omitempty"` // mean car-pixel difference, 0-255 (exterior)
+	Windows   int     `json:"windows,omitempty"`   // glass boxes found (interior)
+	Changed   float64 `json:"changed,omitempty"`   // share of the glass area changed (interior)
+	OK        bool    `json:"ok"`
+	Error     string  `json:"error,omitempty"`
 }
 
 type gateDiag struct {
@@ -77,6 +99,7 @@ type qaDiag struct {
 	Required        bool     `json:"required,omitempty"` // a hard case: QA ran although the domain turns it off
 	OK              bool     `json:"ok"`
 	MissingParts    []string `json:"missingParts,omitempty"`
+	MinorParts      []string `json:"minorParts,omitempty"` // antennas: reported, never withheld for
 	BackgroundKept  []string `json:"backgroundKept,omitempty"`
 	LargeBackground bool     `json:"largeBackground,omitempty"`
 	Notes           string   `json:"notes,omitempty"`
@@ -117,6 +140,12 @@ func (p *photo) fail(what string, err error) *photo {
 // studio.ErrSegmenterUnavailable), storage failed or ctx ended.
 func (rn *run) prepare(ctx context.Context, im store.SelectedImage) (*photo, error) {
 	p := &photo{im: im, diag: diagnostics{TimingsMS: map[string]int64{}}}
+	if rn.dom.Studio.IsInteriorView(im.ShotID) {
+		return rn.prepareInterior(ctx, p)
+	}
+	if im.SubjectBox == nil {
+		return p.withhold(ReasonNoBox), nil
+	}
 	box := studio.Box{X0: im.SubjectBox.X0, Y0: im.SubjectBox.Y0, X1: im.SubjectBox.X1, Y1: im.SubjectBox.Y1}
 	p.diag.Box = &box
 	bg := studio.CheckBox(box, rn.gates)
@@ -188,6 +217,9 @@ func (rn *run) prepare(ctx context.Context, im store.SelectedImage) (*photo, err
 	}
 	p.diag.Styles = make(map[string]styleDiag, len(rn.styles))
 	for _, style := range rn.styles {
+		if !studio.Style(style).Drawn() {
+			continue // the generative style is made by the model below
+		}
 		v, ms, err := render(prep, style)
 		if err != nil {
 			return p.fail("render "+style, err), nil
@@ -196,6 +228,12 @@ func (rn *run) prepare(ctx context.Context, im store.SelectedImage) (*photo, err
 		p.diag.Styles[style] = styleDiag{ComposeMS: ms, Bytes: len(v.full)}
 	}
 	p.diag.TimingsMS["render"] = time.Since(start).Milliseconds()
+
+	if g := rn.dom.Studio.Generative; g.Enabled {
+		if err := rn.prepareGen(p, orig, res.Alpha, false); err != nil {
+			return nil, err
+		}
+	}
 
 	hard := bg.Hard || mg.Hard
 	p.needsQA = rn.dom.Studio.QA || hard
@@ -216,6 +254,75 @@ func (rn *run) prepare(ctx context.Context, im store.SelectedImage) (*photo, err
 	}
 	p.diag.QA = &qaDiag{Model: p.qa.Model, Required: hard && !rn.dom.Studio.QA}
 	return p, nil
+}
+
+// prepareInterior sets up the generative window treatment of an interior photo: no
+// box, no mask, no drawn styles and no QA check; the model call decides alone.
+func (rn *run) prepareInterior(ctx context.Context, p *photo) (*photo, error) {
+	p.interior = true
+	raw, err := rn.readImage(ctx, p.im)
+	if errors.Is(err, storage.ErrNotFound) {
+		if aerr := rn.ensureActive(ctx); aerr != nil {
+			return nil, aerr
+		}
+		return p.fail("read the exported photo", err), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	orig, err := jpeg.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return p.fail("decode the exported photo", err), nil
+	}
+	if err := rn.prepareGen(p, orig, nil, true); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// prepareGen builds the generative call of a photo: the padded magenta cut-out
+// (exterior) or the photo itself (interior), written to the scratch dir. Only a
+// scratch-disk problem is an error; anything else leaves p.gen nil with the reason in
+// the diagnostics (the drawn styles still stand).
+func (rn *run) prepareGen(p *photo, orig image.Image, alpha *image.Gray, interior bool) error {
+	g := rn.dom.Studio.Generative
+	pad := g.Pad
+	if pad <= 0 {
+		pad = studio.DefaultGenPad
+	}
+	params := studio.GenParams{
+		JobID: rn.job.ID, DomainKey: rn.job.DomainKey, ImageID: p.im.ID,
+		Model: g.Model, View: p.im.ShotID, Look: g.Look, Interior: interior,
+		SourceName: rn.job.VideoInfo.OriginalName,
+	}
+	p.diag.Gen = &genDiag{Model: studio.GenModel(g.Model), Interior: interior}
+	var send image.Image
+	if interior {
+		send = orig
+		p.orig = orig
+	} else {
+		c, err := studio.BuildCanvas(orig, alpha, pad)
+		if err != nil {
+			p.diag.Gen.Error = "canvas: " + err.Error()
+			return nil
+		}
+		p.canvas = c
+		p.diag.Gen.Pad = pad
+		send = c.Cutout
+	}
+	b := send.Bounds()
+	params.Width, params.Height = b.Dx(), b.Dy()
+	jpg, err := studio.SendJPEG(send)
+	if err != nil {
+		p.diag.Gen.Error = "encode: " + err.Error()
+		return nil
+	}
+	params.CanvasJPEG = jpg
+	if err := studio.WriteGenFile(rn.work, &params); err != nil {
+		return fmt.Errorf("studiojob: %w", err) // scratch disk trouble: retry later
+	}
+	p.gen = &params
+	return nil
 }
 
 // render composites one style and encodes it (q92) with its 640 px thumbnail. The
@@ -268,11 +375,225 @@ type qaResult struct {
 	err     error
 }
 
-// startQA runs the QA check of p in the background (see runQA).
-func (rn *run) startQA(ctx context.Context, p *photo) *qaCall {
+// startChecks runs the photo's model calls in the background: the generative studio
+// (runGen) and then the QA check (runQA), whichever the photo needs.
+func (rn *run) startChecks(ctx context.Context, p *photo) *qaCall {
 	c := &qaCall{done: make(chan qaResult, 1)}
-	go func() { c.done <- rn.runQA(ctx, p) }()
+	go func() {
+		if p.gen != nil {
+			if err := rn.runGen(ctx, p); err != nil {
+				c.done <- qaResult{p: p, err: err}
+				return
+			}
+		}
+		if !p.needsQA {
+			c.done <- qaResult{p: p}
+			return
+		}
+		c.done <- rn.runQA(ctx, p)
+	}()
 	return c
+}
+
+// genAttempts: an unavailable model, an empty answer or a misaligned answer is asked
+// once more (the second time with a wider margin, which is what fixes misalignment).
+const genAttempts = 2
+
+// runGen makes the generative studio variant of p: the model call (usage recorded as
+// soon as it returns), the alignment check (exterior) or the change bounds (interior),
+// the composite and its encoding. Failures are not the photo's failure: they are noted
+// in the diagnostics, an exterior keeps its drawn styles and an interior ends withheld
+// (complete). Only a context error is returned.
+func (rn *run) runGen(ctx context.Context, p *photo) error {
+	start := time.Now()
+	d := p.diag.Gen
+	defer func() {
+		p.diag.TimingsMS["gen"] = time.Since(start).Milliseconds()
+		if p.gen != nil {
+			os.Remove(p.gen.CanvasPath)
+		}
+		p.canvas, p.orig = nil, nil // free the 4K frames
+	}()
+	if p.interior {
+		if err := rn.findWindows(ctx, p); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			d.Error = truncate(err.Error(), 300)
+			rn.log.Warn("studio: interior windows not found; no studio version", "image_id", p.im.ID, "err", err)
+			return nil
+		}
+	}
+	var lastErr error
+	for attempt := 1; attempt <= genAttempts; attempt++ {
+		req := studio.GenRequest(*p.gen)
+		gctx, cancel := context.WithTimeout(ctx, rn.genTimeout())
+		d.Calls++
+		resp, err := rn.Analyzer.Generate(gctx, req)
+		cancel()
+		if resp != nil {
+			rn.recordUsage(ctx, req.Step, req.Model, resp.Usage)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			lastErr = err
+			if errors.Is(err, analyzer.ErrUnavailable) || errors.Is(err, context.DeadlineExceeded) {
+				metrics.ModelErrors.WithLabelValues(req.Model, "unavailable").Inc()
+				continue
+			}
+			metrics.ModelErrors.WithLabelValues(req.Model, "other").Inc()
+			break
+		}
+		if len(resp.Images) == 0 {
+			metrics.ModelErrors.WithLabelValues(req.Model, "bad_output").Inc()
+			lastErr = fmt.Errorf("no image in the answer (%s)", truncate(resp.Text, 120))
+			continue
+		}
+		gen, err := studio.DecodeImage(resp.Images[0])
+		if err != nil {
+			metrics.ModelErrors.WithLabelValues(req.Model, "bad_output").Inc()
+			lastErr = fmt.Errorf("decode the answer: %w", err)
+			continue
+		}
+		v, err := rn.composeGen(p, gen, attempt)
+		if err != nil {
+			lastErr = err
+			if p.interior || attempt == genAttempts {
+				break
+			}
+			// Misaligned: widen the margin and ask again.
+			if rerr := rn.widenCanvas(p); rerr != nil {
+				lastErr = errors.Join(lastErr, rerr)
+				break
+			}
+			continue
+		}
+		p.variants = append([]variant{v}, p.variants...)
+		if p.diag.Styles == nil {
+			p.diag.Styles = map[string]styleDiag{}
+		}
+		p.diag.Styles[string(studio.StyleStudio)] = styleDiag{ComposeMS: time.Since(start).Milliseconds(), Bytes: len(v.full)}
+		d.OK = true
+		return nil
+	}
+	if lastErr != nil {
+		d.Error = truncate(lastErr.Error(), 300)
+		rn.log.Warn("studio: generative background not made", "image_id", p.im.ID, "interior", p.interior, "err", lastErr)
+	}
+	return nil
+}
+
+// findWindows asks the cheap text model where the glass is in an interior photo and
+// keeps the boxes on p.gen. No glass → errNoGlass (the image call is not made).
+func (rn *run) findWindows(ctx context.Context, p *photo) error {
+	req := studio.WindowBoxesRequest(*p.gen)
+	wctx, cancel := context.WithTimeout(ctx, rn.qaTimeout())
+	p.diag.Gen.Calls++
+	resp, err := rn.Analyzer.Generate(wctx, req)
+	cancel()
+	if resp != nil {
+		rn.recordUsage(ctx, req.Step, req.Model, resp.Usage)
+	}
+	if err != nil {
+		return fmt.Errorf("window boxes: %w", err)
+	}
+	boxes, err := studio.ParseWindowBoxes(resp.Text)
+	if err != nil {
+		return fmt.Errorf("window boxes: %w", err)
+	}
+	if len(boxes) == 0 {
+		return errNoGlass
+	}
+	p.gen.Windows = boxes
+	p.diag.Gen.Windows = len(boxes)
+	return nil
+}
+
+// composeGen turns the model's answer into the studio variant: exterior answers must
+// be aligned (studio.MaxAlignment), interior answers must have changed a plausible
+// share of the picture.
+func (rn *run) composeGen(p *photo, gen image.Image, attempt int) (variant, error) {
+	d := p.diag.Gen
+	var out *image.RGBA
+	if p.interior {
+		img, changed, err := studio.InteriorCompose(p.orig, gen, p.gen.Windows)
+		if err != nil {
+			return variant{}, err
+		}
+		d.Changed = changed
+		switch {
+		case changed < studio.MinInteriorChange:
+			return variant{}, fmt.Errorf("%w: the model changed %.1f%% of the glass area", errNoGlass, changed*100)
+		}
+		out = img
+	} else {
+		align := studio.Alignment(p.canvas, gen)
+		d.Alignment = align
+		if align < 0 || align > studio.MaxAlignment {
+			return variant{}, fmt.Errorf("attempt %d: the model moved the car (alignment %.1f, limit %.0f)", attempt, align, studio.MaxAlignment)
+		}
+		composed, err := studio.ComposeGenerated(p.canvas, gen)
+		if err != nil {
+			return variant{}, err
+		}
+		keep := rn.dom.Studio.Generative.KeepPad
+		if keep <= 0 {
+			keep = studio.DefaultGenKeepPad
+		}
+		out = studio.CropCanvas(p.canvas, composed, keep)
+	}
+	full, err := studio.EncodeJPEG(out, studio.JPEGQuality)
+	if err != nil {
+		return variant{}, err
+	}
+	thumb, err := studio.EncodeJPEG(studio.ScaleToWidth(out, studio.ThumbWidth), studio.ThumbQuality)
+	if err != nil {
+		return variant{}, fmt.Errorf("thumbnail: %w", err)
+	}
+	b := out.Bounds()
+	return variant{style: string(studio.StyleStudio), full: full, thumb: thumb, width: b.Dx(), height: b.Dy()}, nil
+}
+
+// errNoGlass: an interior answer that changed nothing (no window in view).
+var errNoGlass = errors.New("no glass")
+
+// widenCanvas rebuilds an exterior photo's canvas with a wider margin for the retry.
+func (rn *run) widenCanvas(p *photo) error {
+	if p.canvas == nil {
+		return errors.New("no canvas")
+	}
+	c := p.canvas
+	orig := c.Full.SubImage(c.Inner)
+	alpha := c.Alpha.SubImage(c.Inner).(*image.Gray)
+	// SubImage keeps the parent's bounds; BuildCanvas wants matching sizes only.
+	pad := p.diag.Gen.Pad + 0.15
+	nc, err := studio.BuildCanvas(orig, alpha, pad)
+	if err != nil {
+		return err
+	}
+	jpg, err := studio.SendJPEG(nc.Cutout)
+	if err != nil {
+		return err
+	}
+	os.Remove(p.gen.CanvasPath)
+	p.gen.CanvasJPEG = jpg
+	nb := nc.Cutout.Bounds()
+	p.gen.Width, p.gen.Height = nb.Dx(), nb.Dy()
+	if err := studio.WriteGenFile(rn.work, p.gen); err != nil {
+		return err
+	}
+	p.canvas = nc
+	p.diag.Gen.Pad = pad
+	return nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // runQA asks the model whether any part of the car is missing from the cut-out, retrying
@@ -293,7 +614,7 @@ func (rn *run) runQA(ctx context.Context, p *photo) qaResult {
 		resp, err := rn.Analyzer.Generate(qctx, req)
 		cancel()
 		if resp != nil {
-			rn.recordUsage(ctx, req.Model, resp.Usage)
+			rn.recordUsage(ctx, req.Step, req.Model, resp.Usage)
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -337,10 +658,19 @@ func (rn *run) complete(ctx context.Context, res qaResult) error {
 	case res.verdict != nil:
 		v := res.verdict
 		q := p.diag.QA
-		q.OK, q.MissingParts, q.BackgroundKept, q.LargeBackground, q.Notes = v.OK, v.MissingParts, v.BackgroundKept, v.LargeBackground, v.Notes
+		q.OK, q.MissingParts, q.MinorParts, q.BackgroundKept, q.LargeBackground, q.Notes = v.OK, v.MissingParts, v.MinorParts, v.BackgroundKept, v.LargeBackground, v.Notes
 		if !v.OK {
 			p.withhold(v.Reason())
 		}
+	}
+	if p.outcome == nil && len(p.variants) == 0 {
+		// An interior whose window treatment was not made (or an exterior with nothing
+		// rendered): nothing to offer.
+		reason := ReasonGenFailed
+		if d := p.diag.Gen; d != nil && strings.Contains(d.Error, errNoGlass.Error()) {
+			reason = ReasonGenNoGlass
+		}
+		p.withhold(reason)
 	}
 	if p.outcome == nil {
 		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)

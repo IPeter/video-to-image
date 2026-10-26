@@ -58,6 +58,16 @@ studio-build: studio-models ## Build the sidecar image (v2i-studio:dev)
 studio-up: studio-models ## Sidecar on 127.0.0.1:4100, waits until the models are loaded
 	docker compose --profile studio up -d --build --wait studio
 
+STUDIO_TRY_VENV := data/studio-try-venv
+$(STUDIO_TRY_VENV)/.deps:
+	python3 -m venv $(STUDIO_TRY_VENV)
+	$(STUDIO_TRY_VENV)/bin/pip install -q pillow numpy google-genai
+	touch $@
+
+studio-try: $(STUDIO_TRY_VENV)/.deps ## Generative studio on your photos: make studio-try PHOTOS="a.jpg b.jpg" [ARGS="--interior --style white"]
+	@test -n "$(PHOTOS)" || (echo 'usage: make studio-try PHOTOS="a.jpg b.jpg" [ARGS="--interior --style white"]'; exit 1)
+	$(STUDIO_TRY_VENV)/bin/python scripts/studio-try.py $(ARGS) $(PHOTOS)
+
 studio-down: ## Stop the sidecar
 	docker compose --profile studio rm -sf studio
 

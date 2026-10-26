@@ -39,6 +39,9 @@ type Input struct {
 	Ranges        []Range
 	SampleFPS     int // domain selection.sampleFps (default 4)
 	MaxCandidates int // domain limits.maxCandidateFrames (300)
+	// PaddingSec is added on both sides of every range (domain
+	// selection.scenePaddingSec); ≤ 0 means PaddingSec.
+	PaddingSec float64
 	// Concurrency bounds the ffmpeg processes Run starts at once (one per range);
 	// ≤ 0 means DefaultConcurrency. Each process is still bounded by FFmpeg.Threads,
 	// so CPU and memory scale with Concurrency × FFmpeg.Threads.

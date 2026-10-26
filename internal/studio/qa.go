@@ -23,14 +23,25 @@ const (
 	DefaultQAModel    = "gemini-3.8-flash"
 	DefaultQALongSide = 1024 // px, both images sent to the model
 	QAJPEGQuality     = 90
-	qaMaxOutputTokens = 512 // the answer is two short lists and a sentence (~50-150 tokens)
+	// qaMaxOutputTokens bounds the answer (two short lists and a sentence, ~50-150
+	// tokens). gemini-3.8-flash spent ~490 thinking tokens on one check although the
+	// budget was 0 and the answer was cut off at the former 512, so there is headroom.
+	qaMaxOutputTokens = 2048
 	qaMaxItems        = 12
 	qaMaxItemRunes    = 120
 	qaMaxNotesRunes   = 300
 	qaLargePrefix     = "large:"
 	qaCacheKeySuffix  = ":studio-qa"
 	qaKeyBackground   = "backgroundKept"
+	qaKeyMinor        = "minorParts"
 )
+
+// minorPartWords mark a missing part the check does not withhold for: a thin roof
+// antenna or its tip is invisible in a listing photo and the segmentation loses it on
+// most cars (2 of 3 test cars and the reference walkaround), so it counts as minor
+// wherever the model lists it. Decided 2026-09-24 after every studio version of a job
+// was withheld for "roof antenna tip".
+var minorPartWords = []string{"antenna", "aerial"}
 
 // magenta is the flat background of the QA cut-out.
 var magenta = [3]float64{255, 0, 255}
@@ -143,10 +154,11 @@ func WriteQAFiles(dir string, p *QAParams) error {
 const qaPrompt = `Image 1 is an original photo of a car for a sales listing (view: %s). Image 2 is the same photo after an automatic cut-out: every pixel judged "not car" was replaced by flat magenta (#FF00FF); car pixels are unchanged.
 The car will be put on a studio backdrop, and the buyer must see the car exactly as it is, so the cut-out must not remove any part of THIS car, including dirt, damage, rust, dents and missing or broken trim.
 Compare the two images carefully, part by part: mirrors, antennas, roof rails and bars, spoiler, wipers, wheels and tyres, bumpers and bumper corners, tow hook or tow bar, exhaust, open doors or tailgate and their gas struts, trim, side skirts and sills, damaged or missing trim, glass.
-1. missingParts: parts or areas of this car that are visible in image 1 but missing, cut off or turned (partly) magenta or see-through in image 2. Magenta seen THROUGH the car's windows where image 1 shows the scene behind the glass is fine, do not list it. Do not list parts that the photo frame cuts off in both images.
-2. backgroundKept: things that are NOT part of this car (other vehicles, people, ground, walls, poles, shadows on the ground) that still remain in image 2 outside the car's outline. Start an item with "LARGE:" when it covers a big area (about a tenth of the car or more, such as part of another vehicle, a person or a patch of ground).
-3. notes: at most one short sentence, or empty.
-Be strict about missing parts: a missing thin antenna or a missing mirror counts. Name each item in at most six words. Answer with JSON only.`
+1. missingParts: parts or areas of this car that are visible in image 1 but missing, cut off or turned (partly) magenta or see-through in image 2. Magenta seen THROUGH the car's windows where image 1 shows the scene behind the glass is fine, do not list it. Do not list parts that the photo frame cuts off in both images. A thin roof antenna or aerial (or only its tip) does not go here but under minorParts.
+2. minorParts: thin roof antennas or aerials, or their tips, that are missing or shortened in image 2; nothing else.
+3. backgroundKept: things that are NOT part of this car (other vehicles, people, ground, walls, poles, shadows on the ground) that still remain in image 2 outside the car's outline. Start an item with "LARGE:" when it covers a big area (about a tenth of the car or more, such as part of another vehicle, a person or a patch of ground).
+4. notes: at most one short sentence, or empty.
+Be strict about missing parts: a missing mirror, mirror cap, wiper, roof bar, spoiler, tow hook, trim piece or wheel part counts. Name each item in at most six words. Answer with JSON only.`
 
 // qaSchema is the structured-output schema of the answer.
 func qaSchema() *analyzer.Schema {
@@ -156,12 +168,13 @@ func qaSchema() *analyzer.Schema {
 	return &analyzer.Schema{
 		Type: "object",
 		Properties: map[string]*analyzer.Schema{
-			"missingParts":  list("Car parts visible in image 1 but missing in image 2; empty if none."),
+			"missingParts":  list("Car parts visible in image 1 but missing in image 2 (not antennas); empty if none."),
+			qaKeyMinor:      list("Thin roof antennas or aerials, or their tips, missing or shortened in image 2; empty if none."),
 			qaKeyBackground: list(`Leftover background outside the car in image 2; prefix big pieces with "LARGE:".`),
 			"notes":         {Type: "string", Description: "At most one short sentence."},
 		},
-		Required:         []string{"missingParts", qaKeyBackground, "notes"},
-		PropertyOrdering: []string{"missingParts", qaKeyBackground, "notes"},
+		Required:         []string{"missingParts", qaKeyMinor, qaKeyBackground, "notes"},
+		PropertyOrdering: []string{"missingParts", qaKeyMinor, qaKeyBackground, "notes"},
 	}
 }
 
@@ -220,6 +233,8 @@ func QARequest(p QAParams) *analyzer.Request {
 }
 
 // QAVerdict is the parsed QA answer. OK is false when MissingParts is not empty.
+// MinorParts (thin antennas, aerials: the model's minorParts list plus any
+// missingParts item naming one, see minorPartWords) are reported but never withhold.
 //
 // Background kept alone is reported but not fatal: it does not misrepresent the car,
 // and the mask gates already bound leftovers that can be measured (mask outside the
@@ -229,6 +244,7 @@ func QARequest(p QAParams) *analyzer.Request {
 type QAVerdict struct {
 	OK              bool
 	MissingParts    []string
+	MinorParts      []string // antennas and aerials: reported, not fatal
 	BackgroundKept  []string // without the "LARGE:" prefix
 	LargeBackground bool     // some kept background is large
 	Notes           string
@@ -250,6 +266,7 @@ func ParseQA(text string) (QAVerdict, error) {
 	}
 	var raw struct {
 		MissingParts   *[]string `json:"missingParts"`
+		MinorParts     []string  `json:"minorParts"`
 		BackgroundKept []string  `json:"backgroundKept"`
 		Notes          string    `json:"notes"`
 	}
@@ -260,9 +277,17 @@ func ParseQA(text string) (QAVerdict, error) {
 		return QAVerdict{}, fmt.Errorf("%w: no missingParts list", ErrQABadOutput)
 	}
 	v := QAVerdict{
-		MissingParts:   cleanItems(*raw.MissingParts),
+		MissingParts:   []string{},
+		MinorParts:     cleanItems(raw.MinorParts),
 		BackgroundKept: []string{},
 		Notes:          clip(strings.TrimSpace(raw.Notes), qaMaxNotesRunes),
+	}
+	for _, it := range cleanItems(*raw.MissingParts) {
+		if isMinorPart(it) {
+			v.MinorParts = append(v.MinorParts, it)
+			continue
+		}
+		v.MissingParts = append(v.MissingParts, it)
 	}
 	for _, it := range cleanItems(raw.BackgroundKept) {
 		if rest, ok := cutPrefixFold(it, qaLargePrefix); ok {
@@ -286,6 +311,17 @@ func (v QAVerdict) Reason() string {
 		return "The cut-out kept a large piece of the old background, so it was not used."
 	}
 	return ""
+}
+
+// isMinorPart reports whether a missing-part item names an antenna or aerial.
+func isMinorPart(item string) bool {
+	l := strings.ToLower(item)
+	for _, w := range minorPartWords {
+		if strings.Contains(l, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // jsonObject returns the outermost {...} of text (after removing Markdown fences).

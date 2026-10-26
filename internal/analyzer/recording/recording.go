@@ -9,6 +9,7 @@ package recording
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -27,11 +28,45 @@ type Record struct {
 	Model    string `json:"model"` // model requested; Usage.Model is what the provider reported
 	Text     string `json:"text"`
 	Usage    Usage  `json:"usage"`
+	// Images are the generated images of an image request (base64 with their MIME type).
+	Images []RecordedImage `json:"images,omitempty"`
 	// PromptSHA256 fingerprints the system prompt, text parts, media MIME types and the
 	// response schema. The replayer warns when a request no longer matches it (the
 	// domain prompt changed since recording), but still replays.
 	PromptSHA256 string    `json:"promptSha256,omitempty"`
 	RecordedAt   time.Time `json:"recordedAt"`
+}
+
+// RecordedImage is one generated image of a recording.
+type RecordedImage struct {
+	MIMEType string `json:"mimeType"`
+	Base64   string `json:"base64"`
+}
+
+func imagesFrom(imgs []analyzer.Image) []RecordedImage {
+	if len(imgs) == 0 {
+		return nil
+	}
+	out := make([]RecordedImage, len(imgs))
+	for i, im := range imgs {
+		out[i] = RecordedImage{MIMEType: im.MIMEType, Base64: base64.StdEncoding.EncodeToString(im.Data)}
+	}
+	return out
+}
+
+func (r Record) images() []analyzer.Image {
+	if len(r.Images) == 0 {
+		return nil
+	}
+	out := make([]analyzer.Image, 0, len(r.Images))
+	for _, im := range r.Images {
+		data, err := base64.StdEncoding.DecodeString(im.Base64)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		out = append(out, analyzer.Image{Data: data, MIMEType: im.MIMEType})
+	}
+	return out
 }
 
 // Usage mirrors analyzer.Usage with JSON-friendly field names.

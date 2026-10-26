@@ -513,11 +513,11 @@ func TestCarsFloor(t *testing.T) {
 func TestParamsFor(t *testing.T) {
 	p, err := ParamsFor(domain.Crop{Enabled: true, Aspect: "4:3"})
 	require.NoError(t, err)
-	assert.Equal(t, Params{Aspect: 4.0 / 3, MarginPct: DefaultMarginPct, MinShortSidePx: DefaultMinShortSidePx}, p)
+	assert.Equal(t, Params{Aspect: 4.0 / 3, MarginPct: DefaultMarginPct, MinShortSidePx: DefaultMinShortSidePx, MinMarginPct: DefaultMinMarginPct}, p)
 
-	p, err = ParamsFor(domain.Crop{Aspect: "16:9", MarginPct: 2.5, MinShortSidePx: 720})
+	p, err = ParamsFor(domain.Crop{Aspect: "16:9", MarginPct: 2.5, MinShortSidePx: 720, MinMarginPct: 1})
 	require.NoError(t, err)
-	assert.Equal(t, Params{Aspect: 16.0 / 9, MarginPct: 2.5, MinShortSidePx: 720}, p)
+	assert.Equal(t, Params{Aspect: 16.0 / 9, MarginPct: 2.5, MinShortSidePx: 720, MinMarginPct: 1}, p)
 
 	p, err = ParamsFor(domain.Crop{})
 	require.NoError(t, err)
@@ -531,4 +531,87 @@ func TestAspectLabel(t *testing.T) {
 	for a, want := range map[float64]string{4.0 / 3: "4:3", 16.0 / 9: "16:9", 1: "1:1", 3.0 / 4: "3:4", 1.5: "3:2", math.Pi: "3.14:1"} {
 		assert.Equal(t, want, aspectLabel(a))
 	}
+}
+
+// A straight-on front view in an upright portrait frame is taller than a 4:3 crop of
+// the frame's width can be (1620 px of 3840): no 4:3 crop fits, and with a fallback
+// the frame is cropped to 3:4 around the box instead of being left uncropped.
+func TestPlanFallbackAspect(t *testing.T) {
+	f := Frame{Width: 2160, Height: 3840, RotateCW: 0, Box: [4]float64{0.1, 0.15, 0.9, 0.8}}
+	got := Plan(f, defaults)
+	assert.Nil(t, got.Crop)
+	assert.Contains(t, got.Reason, "does not fit 4:3")
+
+	p := defaults
+	p.FallbackAspect = 3.0 / 4
+	got = Plan(f, p)
+	require.NotNil(t, got.Crop, got.Reason)
+	assert.InDelta(t, 0.75, float64(got.Width)/float64(got.Height), 0.002)
+	assert.Contains(t, got.Reason, "cropped to 3:4")
+	assert.Contains(t, got.Reason, "(the subject does not fit 4:3)")
+	assert.GreaterOrEqual(t, got.Width, 1080)
+	// The box stays inside the crop.
+	c := got.Crop
+	assert.LessOrEqual(t, c[0], 0.1)
+	assert.LessOrEqual(t, c[1], 0.15)
+	assert.GreaterOrEqual(t, c[2], 0.9)
+	assert.GreaterOrEqual(t, c[3], 0.8)
+
+	// A subject taller than 3:4 allows (more than 75 % of a 9:16 frame) fits neither
+	// and stays uncropped, with the primary aspect's reason.
+	tall := Frame{Width: 2160, Height: 3840, Box: [4]float64{0.05, 0.03, 0.95, 0.97}}
+	got = Plan(tall, p)
+	assert.Nil(t, got.Crop)
+	assert.Contains(t, got.Reason, "does not fit 4:3 without cutting it")
+
+	// The fallback is not tried when it equals the aspect, and a landscape frame that
+	// fits 4:3 never reaches it.
+	p.FallbackAspect = 4.0 / 3
+	got = Plan(f, p)
+	assert.Nil(t, got.Crop)
+	assert.Contains(t, got.Reason, "does not fit 4:3 without cutting it")
+	land := Frame{Width: 3840, Height: 2160, Box: [4]float64{0.2, 0.2, 0.8, 0.8}}
+	p.FallbackAspect = 3.0 / 4
+	got = Plan(land, p)
+	require.NotNil(t, got.Crop)
+	assert.Contains(t, got.Reason, "cropped to 4:3")
+
+	// ParamsFor reads the domain's fallback.
+	params, err := ParamsFor(domain.Crop{Enabled: true, Aspect: "4:3", FallbackAspect: "3:4"})
+	require.NoError(t, err)
+	assert.InDelta(t, 0.75, params.FallbackAspect, 1e-9)
+	_, err = ParamsFor(domain.Crop{Enabled: true, Aspect: "4:3", FallbackAspect: "wide"})
+	assert.ErrorContains(t, err, "fallbackAspect")
+}
+
+// A box that fits the aspect only with a margin below MinMarginPct leaves the frame
+// uncropped; with MinMarginPct 0 the old best-effort crop is made. (A box that is
+// simply near the frame edge is not the crop's doing: the crop keeps whatever room
+// the frame has there.)
+func TestPlanMinMargin(t *testing.T) {
+	// Upright 3840x2160: a 4:3 crop is at most 2880 wide, the box is 2765 wide, so the
+	// margin can only be ~57 px = 2 % of the box.
+	f := Frame{Width: 3840, Height: 2160, Box: [4]float64{0.14, 0.3, 0.86, 0.7}}
+	p := defaults
+	p.MinMarginPct = 3
+	got := Plan(f, p)
+	assert.Nil(t, got.Crop)
+	assert.Contains(t, got.Reason, "too close to the frame edge")
+	assert.Contains(t, got.Reason, "3% margin")
+
+	p.MinMarginPct = 0
+	got = Plan(f, p)
+	require.NotNil(t, got.Crop)
+	assert.Contains(t, got.Reason, "reduced margin")
+
+	// Room for ~3.6 %: allowed with a 3 % floor.
+	f.Box = [4]float64{0.15, 0.3, 0.85, 0.7}
+	p.MinMarginPct = 3
+	got = Plan(f, p)
+	require.NotNil(t, got.Crop, got.Reason)
+	assert.Contains(t, got.Reason, "reduced margin")
+
+	params, err := ParamsFor(domain.Crop{Enabled: true, Aspect: "4:3"})
+	require.NoError(t, err)
+	assert.Equal(t, DefaultMinMarginPct, params.MinMarginPct)
 }

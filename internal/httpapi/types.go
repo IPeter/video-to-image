@@ -142,7 +142,7 @@ type ImageStudio struct {
 
 // StudioVariant is one rendered studio style of an image.
 type StudioVariant struct {
-	Style        string `json:"style" enum:"grey,light,dark"`
+	Style        string `json:"style" enum:"studio,grey,light,dark" doc:"studio: painted by an image model around the original car pixels; grey/light/dark: drawn backdrops."`
 	URL          string `json:"url" doc:"Full-resolution JPG, relative to the API base URL: …/images/{imageId}/studio/{style}."`
 	DownloadURL  string `json:"downloadUrl" doc:"Same as url with ?download=1 (Content-Disposition: attachment)."`
 	ThumbnailURL string `json:"thumbnailUrl" doc:"640 px wide JPG: …/images/{imageId}/studio/{style}/thumb."`
@@ -154,8 +154,8 @@ type StudioVariant struct {
 // JobStudio is the job-level studio-background progress.
 type JobStudio struct {
 	Status       string   `json:"status" enum:"none,pending,running,done,failed,skipped" doc:"none: not requested (feature off or no eligible image); pending/running: studio versions are being made after the job completed; done; failed or skipped (e.g. daily cost ceiling): only originals are offered."`
-	Styles       []string `json:"styles" enum:"grey,light,dark" doc:"Styles rendered for this job, display order, the default first."`
-	DefaultStyle string   `json:"defaultStyle" enum:"grey,light,dark,"`
+	Styles       []string `json:"styles" enum:"studio,grey,light,dark" doc:"Styles rendered for this job, display order, the default first."`
+	DefaultStyle string   `json:"defaultStyle" enum:"studio,grey,light,dark,"`
 	ZipURL       *string  `json:"zipUrl" doc:"studio.zip (every studio variant + manifest.json) once status is done and at least one image is ready; else null. Route: …/jobs/{jobId}/studio.zip."`
 }
 

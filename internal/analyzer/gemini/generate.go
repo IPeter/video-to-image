@@ -236,6 +236,12 @@ func buildConfig(req *analyzer.Request) (*genai.GenerateContentConfig, error) {
 		// so the pipeline's validation treats it as bad output.
 		cfg.MaxOutputTokens = req.MaxOutputTokens
 	}
+	if len(req.ResponseModalities) > 0 {
+		cfg.ResponseModalities = append([]string(nil), req.ResponseModalities...)
+	}
+	if req.ImageAspectRatio != "" {
+		cfg.ImageConfig = &genai.ImageConfig{AspectRatio: req.ImageAspectRatio}
+	}
 	return cfg, nil
 }
 
@@ -273,7 +279,10 @@ func (k *call) response(ctx context.Context, resp *genai.GenerateContentResponse
 	}
 
 	text, finish := responseText(resp)
+	images := responseImages(resp)
 	switch {
+	case len(images) > 0:
+		k.log.DebugContext(ctx, "gemini: images returned", "images", len(images), "bytes", len(images[0].Data))
 	case finish == genai.FinishReasonMaxTokens:
 		k.log.WarnContext(ctx, "gemini: answer cut off at the output token limit",
 			"finish_reason", finish, "max_output_tokens", k.cfg.MaxOutputTokens,
@@ -298,7 +307,22 @@ func (k *call) response(ctx context.Context, resp *genai.GenerateContentResponse
 	k.log.DebugContext(ctx, "gemini: call done",
 		"latency", latency, "input_tokens", usage.InputTokens, "output_tokens", usage.OutputTokens,
 		"thinking_tokens", usage.ThinkingTokens, "model_version", resp.ModelVersion)
-	return &analyzer.Response{Text: text, Usage: usage, FileHandles: handles}
+	return &analyzer.Response{Text: text, Usage: usage, FileHandles: handles, Images: images}
+}
+
+// responseImages collects the inline image parts of the first candidate (image models
+// answer with them when the request asked for the IMAGE modality).
+func responseImages(resp *genai.GenerateContentResponse) []analyzer.Image {
+	if len(resp.Candidates) == 0 || resp.Candidates[0] == nil || resp.Candidates[0].Content == nil {
+		return nil
+	}
+	var out []analyzer.Image
+	for _, p := range resp.Candidates[0].Content.Parts {
+		if p != nil && p.InlineData != nil && len(p.InlineData.Data) > 0 && strings.HasPrefix(p.InlineData.MIMEType, "image/") {
+			out = append(out, analyzer.Image{Data: p.InlineData.Data, MIMEType: p.InlineData.MIMEType})
+		}
+	}
+	return out
 }
 
 // responseText concatenates the non-thought text parts of the first candidate.

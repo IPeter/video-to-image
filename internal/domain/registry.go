@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -163,6 +164,11 @@ func Validate(c *Config) error {
 		if _, err := ParseAspect(c.Crop.Aspect); err != nil {
 			errs = append(errs, fmt.Errorf("crop.aspect: %w", err))
 		}
+		if c.Crop.FallbackAspect != "" {
+			if _, err := ParseAspect(c.Crop.FallbackAspect); err != nil {
+				errs = append(errs, fmt.Errorf("crop.fallbackAspect: %w", err))
+			}
+		}
 	}
 	errs = append(errs, validateStudio(c.Studio, c.Review.Enabled, ids)...)
 	if c.Model.ThinkingBudget != nil && c.Model.ThinkingLevel != "" {
@@ -209,6 +215,22 @@ func validateStudio(st Studio, reviewEnabled bool, shotIDs map[string]bool) []er
 	}
 	if len(st.Styles) > 0 && !seen[st.EffectiveDefaultStyle()] {
 		errs = append(errs, fmt.Errorf("studio.defaultStyle %q is not one of studio.styles", st.EffectiveDefaultStyle()))
+	}
+	g := st.Generative // inert when studio is off (HasView and IsInteriorView need Enabled)
+	seen = map[string]bool{}
+	for _, v := range g.InteriorViews {
+		switch {
+		case !shotIDs[v]:
+			errs = append(errs, fmt.Errorf("studio.generative.interiorViews: %q is not a shot id of this domain", v))
+		case seen[v]:
+			errs = append(errs, fmt.Errorf("studio.generative.interiorViews: duplicate %q", v))
+		case slices.Contains(st.Views, v):
+			errs = append(errs, fmt.Errorf("studio.generative.interiorViews: %q is also in studio.views", v))
+		}
+		seen[v] = true
+	}
+	if g.Pad > 0 && g.KeepPad > g.Pad {
+		errs = append(errs, errors.New("studio.generative.keepPad must not exceed pad"))
 	}
 	return errs
 }

@@ -127,7 +127,9 @@ func TestOrientationDrivesRotationAndBox(t *testing.T) {
 func TestOrientationPerFrame(t *testing.T) {
 	in := withFiles(t)
 	for i := range in.Candidates {
-		in.Candidates[i].SceneIdx = 2 // one scene for the whole shortlist
+		if in.Candidates[i].ShotID == f3q {
+			in.Candidates[i].SceneIdx = 2 // one scene for the whole f3q shortlist
+		}
 	}
 	fa := newScripted(reply(`{"images":[]}`))
 	fa.orient = map[string]string{"img2": "top-right", "img3": "bottom-right"} // cf_F4, cf_F7: turned after cf_F2

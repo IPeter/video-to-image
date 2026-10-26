@@ -93,6 +93,10 @@ func parseAssessments(text string, frames []frame, d *domain.Config, minQ int) (
 		if e.SubjectFullyVisible != nil {
 			as.FullyVisible = *e.SubjectFullyVisible
 		}
+		if !as.FullyVisible && clearOfEdges(boxFrom(e.Box2D), EdgeMargin) {
+			// The box is measured on the copy sent; margins survive the rotation.
+			as.FullyVisible, as.VisibleByBox = true, true
+		}
 		as.Usable = as.FullyVisible && as.Quality >= minQ && as.View != ViewNone
 		// Only a link to an EARLIER frame counts (the list is in shot-priority order, so the
 		// kept one is the higher-priority view); self-links and unknown ids are ignored.
@@ -169,6 +173,12 @@ func boxFrom(v []float64) Box {
 		return Box{}
 	}
 	return b
+}
+
+// clearOfEdges reports whether b is a valid box that keeps at least margin from every
+// edge of the unit square.
+func clearOfEdges(b Box, margin float64) bool {
+	return b.Valid() && b.X0 >= margin && b.Y0 >= margin && b.X1 <= 1-margin && b.Y1 <= 1-margin
 }
 
 // frameIndex is f's position in the shortlist (-1 if absent).

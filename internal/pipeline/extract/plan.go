@@ -21,8 +21,8 @@ const (
 //   - Ranges with non-finite bounds, EndSec < StartSec, or StartSec ≥ DurationSec are
 //     skipped, as are ranges whose padded window is empty. A zero-length range (a
 //     single instant) is kept: padding turns it into a 1 s window.
-//   - PadStartSec = max(0, StartSec − PaddingSec), PadEndSec = min(DurationSec,
-//     EndSec + PaddingSec).
+//   - PadStartSec = max(0, StartSec − pad), PadEndSec = min(DurationSec, EndSec + pad),
+//     with pad = Input.PaddingSec (PaddingSec when ≤ 0).
 //   - FPS = SampleFPS (DefaultSampleFPS when ≤ 0); ranges whose unpadded length,
 //     clamped to the video, is below ShortRangeSec use max(FPS, ShortRangeFPS).
 //   - Expected = media.ExpectedFrames(PadEnd − PadStart, FPS) = max(1, ⌊len·FPS⌋),
@@ -50,13 +50,17 @@ func Plan(in Input) []RangePlan {
 		maxCand = DefaultMaxCandidates
 	}
 
+	pad := in.PaddingSec
+	if !(pad > 0) || math.IsInf(pad, 0) {
+		pad = PaddingSec
+	}
 	plans := make([]RangePlan, 0, len(in.Ranges))
 	for _, r := range in.Ranges {
 		if !finite(r.StartSec) || !finite(r.EndSec) || r.EndSec < r.StartSec || r.StartSec >= dur {
 			continue
 		}
-		padStart := math.Max(0, r.StartSec-PaddingSec)
-		padEnd := math.Min(dur, r.EndSec+PaddingSec)
+		padStart := math.Max(0, r.StartSec-pad)
+		padEnd := math.Min(dur, r.EndSec+pad)
 		if padEnd-padStart <= 0 {
 			continue
 		}

@@ -16,7 +16,7 @@ limits:
 
 model:
   name: gemini-3.5-flash-lite
-  temperature: 0.2
+  temperature: 0                     # the scene list varied run to run at 0.2 (6-8 scenes, different views)
   # No reasoning for the cheap call. gemini-3.5-flash-lite rejects thinkingBudget: 0;
   # when switching to gemini-3.8-flash use `thinkingBudget: 0` instead (it rejects minimal).
   thinkingLevel: minimal
@@ -83,8 +83,9 @@ shots:
 
 selection:
   imageCount: 8
-  maxScenes: 20
+  maxScenes: 30                      # analyze (up to 2 per shot) plus the located seconds
   sampleFps: 4
+  scenePaddingSec: 0.5               # the locate pass covers the timestamps' slack; 1 s doubled the 4K decode time
   maxPerShot: 1                      # one photo per angle: no near-identical views
   dedupeMaxHamming: 6
   weights:
@@ -105,9 +106,26 @@ selection:
     can actually see; do not guess. The camera may have been rotated while filming (the
     picture can be sideways); judge the content, not the orientation.
 
+# Contact-sheet pass (internal/pipeline/locate): the preview at 1 fps, time-stamped, in
+# one model call; the seconds it names become scenes next to the analyze call's. On the
+# reference walkaround the analyze call put the side profile at 4-7 s while the car was
+# only whole in frame from 6.5 s to 10.5 s.
+locate:
+  enabled: true
+  fps: 1
+  maxPerShot: 4
+  instructions: |
+    Exterior views count as shown well only when the ENTIRE car — both bumpers, all
+    wheels on that side and the roof — is inside the tile with some space around it.
+    A tile where the car touches or crosses the tile edge is not shown well, however
+    sharp it is. The photographer's shadow on the ground is fine. For interior and
+    detail views the whole feature (dashboard, seats, cluster, wheel, trunk) must be
+    inside the tile. A straight-on view of the back of the car with the tailgate open
+    is rear when the whole car is visible; trunk is the cargo area filling the tile.
+
 review:
   enabled: true
-  candidatesPerShot: 3
+  candidatesPerShot: 4               # spread over the shot's scenes (review.shortlistGap)
   minQuality: 3
   maxImageSide: 512
   instructions: |
@@ -123,18 +141,25 @@ review:
     view at all. Report the view an image MAINLY shows: a picture of the whole dashboard
     and steering wheel is interior_dashboard even if the gauges are visible (odometer only
     when the instrument cluster fills most of the picture), and a wheel close-up is wheel,
-    not a side view. Mark near-duplicates with sameAs: the listing must never show the
-    same view twice.
+    not a side view. A straight-on view of the back of the car with the tailgate open
+    is still rear when the whole car is in the picture; trunk is only when the cargo
+    area fills most of the picture. The photographer's shadow on the ground or their
+    reflection in the paint is normal for a walkaround and not a defect. Mark
+    near-duplicates with sameAs: the listing must never show the same view twice.
 
 crop:
   enabled: true
   aspect: "4:3"                      # standard listing photo; upright portrait frames become landscape
-  marginPct: 6                       # best effort: shrinks when the subject would not fit 4:3
+  marginPct: 10                      # the review box runs tight; 6 % put the car on the photo edge
+  minMarginPct: 3                    # below this the frame stays uncropped (studio needs room around the car)
   # Smallest short side of a cropped photo that keeps the frame's orientation (a 4K
   # landscape frame crops to at least 1440x1080). Portrait frames turn landscape anyway:
   # crop.Plan lowers the floor for them to their widest 4:3 crop (1080p: 1080x810,
   # 720p: 720x540), but not below 480 px.
   minShortSidePx: 1080
+  # A straight-on front or rear in an upright portrait frame fills it top to bottom, so
+  # no 4:3 crop fits; a portrait crop keeps the subject framed instead of no crop.
+  fallbackAspect: "3:4"
 
 # Studio backgrounds for exterior photos (internal/studio): the car is cut out and put on
 # a studio backdrop; car pixels stay the original pixels (no retouching), and the original
@@ -142,11 +167,22 @@ crop:
 # segmentation sidecar (V2I_STUDIO_URL).
 studio:
   enabled: true
-  # trunk is left out: open tailgate and see-through glass cut out badly.
-  views: [front_three_quarter, side_profile, rear_three_quarter, front, rear]
-  styles: [grey, light, dark]        # display order; dark is never the default (black cars merge)
-  defaultStyle: grey
+  # Every exterior shot: the gates and the QA check withhold a bad cut-out (an open
+  # tailgate and see-through glass are the usual reasons), the original always stays.
+  views: [front_three_quarter, side_profile, rear_three_quarter, front, rear, trunk, wheel, engine_bay, detail]
+  styles: [grey, light, dark]        # drawn backdrops in display order; dark is never the default (black cars merge)
   qa: true                           # model check: any missing car part withholds the studio version
+  # The "studio" style: an image model paints a photo studio (turntable, cyclorama)
+  # around the cut-out car; the car pixels stay the originals. It is the default style.
+  # Interiors get the same studio through the windows (only what the model changed is
+  # taken, the cabin stays pixel for pixel). ~$0.07 per photo.
+  generative:
+    enabled: true
+    model: gemini-3.1-flash-image
+    look: grey
+    pad: 0.25
+    keepPad: 0.10
+    interiorViews: [interior_dashboard, interior_front_seats, interior_rear_seats]
 
 retentionHours: 24
 

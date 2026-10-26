@@ -23,6 +23,7 @@ type Config struct {
 	Gate      Gate      `yaml:"gate"`
 	Shots     []Shot    `yaml:"shots" validate:"required,min=1,dive"` // ordered by priority
 	Selection Selection `yaml:"selection"`
+	Locate    Locate    `yaml:"locate"`
 	Review    Review    `yaml:"review"`
 	Crop      Crop      `yaml:"crop"`
 	Studio    Studio    `yaml:"studio"`
@@ -117,6 +118,27 @@ type Selection struct {
 	// second, near-identical view of a covered shot. 0 → no cap: the fill pass adds
 	// any distinct frame by score (plan/03 step 5).
 	MaxPerShot int `yaml:"maxPerShot" validate:"gte=0"`
+	// ScenePaddingSec is added on both sides of every scene before frames are sampled,
+	// to absorb the model's whole-second timestamps. 0 → 0.5 (extract.PaddingSec).
+	ScenePaddingSec float64 `yaml:"scenePaddingSec" validate:"gte=0,lte=10"`
+}
+
+// Locate configures the contact-sheet pass (internal/pipeline/locate): after the
+// analyze call, the whole preview is shown to the model as sheets of time-stamped
+// frames and it points out the seconds at which each view is shown with the whole
+// subject in frame. Those seconds become scenes next to the analyze call's, so the
+// frames extracted for a view are no longer limited to the model's whole-second guess
+// from the video stream (which on a real walkaround missed the usable seconds of a
+// view entirely).
+type Locate struct {
+	Enabled bool `yaml:"enabled"`
+	// FPS is how many frames per second of video the sheets show. 0 → 1.
+	FPS float64 `yaml:"fps" validate:"gte=0,lte=4"`
+	// MaxPerShot bounds the moments the model may list per view. 0 → 4.
+	MaxPerShot int `yaml:"maxPerShot" validate:"gte=0,lte=20"`
+	// Instructions say what "shown well" means for this domain (what must be inside
+	// the frame for an exterior view, what to skip).
+	Instructions string `yaml:"instructions"`
 }
 
 // EffectiveMaxPerShot returns the per-shot cap selection applies; 0 means no cap.
@@ -158,6 +180,14 @@ type Crop struct {
 	// frame, or the reverse) may go lower, to the largest short side the frame allows,
 	// but never below 480 px (crop.ReorientedMinShortSidePx).
 	MinShortSidePx int `yaml:"minShortSidePx" validate:"gte=0"`
+	// MinMarginPct is the least margin a crop may keep when the full MarginPct does not
+	// fit; below it the frame stays uncropped (a crop with no room around the subject
+	// put the car on the photo edge and the studio version was withheld). 0 → 3.
+	MinMarginPct float64 `yaml:"minMarginPct" validate:"gte=0,lte=50"`
+	// FallbackAspect is tried when the subject does not fit Aspect without being cut
+	// (a straight-on front view fills a portrait frame top to bottom, so no 4:3 crop
+	// fits); "" → the frame is left uncropped as before.
+	FallbackAspect string `yaml:"fallbackAspect"`
 }
 
 // Studio configures studio backgrounds for exterior photos (internal/studio): the car
@@ -178,6 +208,27 @@ type Studio struct {
 	QAModel string `yaml:"qaModel"`
 	// Gates overrides the default thresholds (internal/studio.GatesFor).
 	Gates StudioGates `yaml:"gates"`
+	// Generative adds the "studio" style: an image model paints a photo studio around
+	// the cut-out car (internal/studio/gen.go); interiors get the studio through the
+	// glass. It is the default style when enabled.
+	Generative StudioGenerative `yaml:"generative"`
+}
+
+// StudioGenerative configures the image-model studio background.
+type StudioGenerative struct {
+	Enabled bool `yaml:"enabled"`
+	// Model is the image model; "" → gemini-3.1-flash-image.
+	Model string `yaml:"model"`
+	// Look is the studio described to the model: grey, white or dark ("" → grey).
+	Look string `yaml:"look" validate:"omitempty,oneof=grey white dark"`
+	// Pad is the magenta margin around the photo sent to the model, as a fraction of
+	// the photo's size on every side (0 → 0.25; the model recomposes the scene when
+	// the car fills the frame). KeepPad is the margin the final photo keeps (0 → 0.10).
+	Pad     float64 `yaml:"pad" validate:"gte=0,lte=1"`
+	KeepPad float64 `yaml:"keepPad" validate:"gte=0,lte=1"`
+	// InteriorViews are the shot IDs treated as interiors: the model replaces only what
+	// is seen through the glass. Empty → no interior photos get a studio version.
+	InteriorViews []string `yaml:"interiorViews" validate:"dive,required"`
 }
 
 // Studio defaults for zero values.
@@ -198,15 +249,31 @@ func (s Studio) EffectiveDefaultStyle() string {
 	return DefaultStudioStyle
 }
 
+// StudioStyleGenerative is the style the image model paints (Studio.Generative).
+const StudioStyleGenerative = "studio"
+
+// EffectiveDefaultStyleWithGenerative is the style shown first: StudioStyleGenerative
+// when the generative style is on and DefaultStyle does not name a drawn style
+// explicitly, else EffectiveDefaultStyle.
+func (s Studio) EffectiveDefaultStyleWithGenerative() string {
+	if s.Generative.Enabled && s.DefaultStyle == "" {
+		return StudioStyleGenerative
+	}
+	return s.EffectiveDefaultStyle()
+}
+
 // EffectiveStyles returns the styles to render in display order, the default style
-// first: Styles (StudioStyles when empty) with EffectiveDefaultStyle moved to the front.
-// The result is a new slice.
+// first: the generative "studio" style when enabled, then Styles (StudioStyles when
+// empty), with the default moved to the front. The result is a new slice.
 func (s Studio) EffectiveStyles() []string {
 	styles := s.Styles
 	if len(styles) == 0 {
 		styles = StudioStyles
 	}
-	def := s.EffectiveDefaultStyle()
+	if s.Generative.Enabled {
+		styles = append([]string{StudioStyleGenerative}, styles...)
+	}
+	def := s.EffectiveDefaultStyleWithGenerative()
 	out := make([]string, 0, len(styles)+1)
 	out = append(out, def)
 	for _, st := range styles {
@@ -215,6 +282,12 @@ func (s Studio) EffectiveStyles() []string {
 		}
 	}
 	return out
+}
+
+// IsInteriorView reports whether photos of shotID get the generative studio through
+// the glass (Generative on and shotID in Generative.InteriorViews).
+func (s Studio) IsInteriorView(shotID string) bool {
+	return s.Enabled && s.Generative.Enabled && slices.Contains(s.Generative.InteriorViews, shotID)
 }
 
 // EffectiveQAModel returns QAModel or DefaultStudioQAModel.

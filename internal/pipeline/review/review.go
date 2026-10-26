@@ -39,6 +39,8 @@ type frame struct {
 	path string // downscaled copy sent to the model, rotated by rot (set by writeImages)
 	key  string // the id the model sees, "img<n>" (set by assignKeys)
 	rot  int    // clockwise rotation that makes the frame upright (from orientFrames)
+	// preferred: shortlisted for a second the locate pass named (Input.Preferred).
+	preferred bool
 	// oriented: rot comes from the orientation call. Otherwise the frame is sent as
 	// stored and the judgement call reports its rotation.
 	oriented bool
@@ -79,7 +81,7 @@ func Run(ctx context.Context, a analyzer.Analyzer, in Input) (*Output, error) {
 	}
 	d := in.Domain
 
-	groups := buildGroups(d, in.Candidates, in.Scores, candidatesPerShot(d.Review))
+	groups := buildGroups(d, in.Candidates, in.Scores, candidatesPerShot(d.Review), in.Preferred)
 	groups, dropped := capGroups(groups, MaxImages)
 	if len(dropped) > 0 {
 		slog.InfoContext(ctx, "review: shortlist capped", "job", in.JobID, "domain", d.Key,
@@ -88,6 +90,9 @@ func Run(ctx context.Context, a analyzer.Analyzer, in Input) (*Output, error) {
 	frames := flatten(groups)
 	if len(frames) == 0 {
 		return out, nil
+	}
+	if n := countPreferred(frames); n > 0 {
+		slog.InfoContext(ctx, "review: shortlist", "job", in.JobID, "domain", d.Key, "frames", len(frames), "at_located_seconds", n)
 	}
 	if in.WorkDir == "" {
 		return out, errors.New("review: no work dir")
@@ -138,14 +143,17 @@ func Run(ctx context.Context, a analyzer.Analyzer, in Input) (*Output, error) {
 	}
 	out.Assessments = assessments
 
-	usable := 0
+	usable, byBox := 0, 0
 	for _, as := range assessments {
 		if as.Usable {
 			usable++
 		}
+		if as.VisibleByBox {
+			byBox++
+		}
 	}
 	attrs := []any{"job", in.JobID, "domain", d.Key, "sent", len(frames), "answered", len(assessments),
-		"usable", usable, "ignored", ignored, "as_stored", len(frames) - countOriented(frames)}
+		"usable", usable, "visible_by_box", byBox, "ignored", ignored, "as_stored", len(frames) - countOriented(frames)}
 	if ignored > 0 || len(assessments) < len(frames) {
 		slog.WarnContext(ctx, "review: incomplete answer", attrs...)
 	} else {
@@ -179,8 +187,11 @@ func maxImageSide(r domain.Review) int {
 // order and domain.OtherShotID last. Eligible candidates are not rejected, have a
 // scoring copy and a usable ID; a shot ID outside the domain counts as "other". Each
 // group is ordered by scores (highest first, missing/NaN last; ties by timestamp, then
-// ID) and greedily cut to perShot candidates that are mutually distinct (see distinct).
-func buildGroups(d *domain.Config, cands []score.Scored, scores map[string]float64, perShot int) []group {
+// ID); first the best candidate within PreferredWindowSec of each of the shot's
+// preferred seconds is taken (mutually distinct by hash and MinGapSec), then the group
+// is greedily filled to perShot candidates that are distinct from every pick (see
+// distinct and shortlistGap).
+func buildGroups(d *domain.Config, cands []score.Scored, scores map[string]float64, perShot int, preferred map[string][]float64) []group {
 	byShot := make(map[string][]score.Scored)
 	seen := make(map[string]bool, len(cands))
 	for _, c := range cands {
@@ -224,19 +235,32 @@ func buildGroups(d *domain.Config, cands []score.Scored, scores map[string]float
 				return cs[i].ID < cs[j].ID
 			}
 		})
+		gap := shortlistGap(cs, perShot)
 		g := group{shot: shot}
+		fits := func(c score.Scored, gap float64) bool {
+			for _, f := range g.frames {
+				if f.cand.ID == c.ID || !distinct(f.cand, c, d.Selection.DedupeMaxHamming, gap) {
+					return false
+				}
+			}
+			return true
+		}
+		for _, sec := range preferred[shot] {
+			if len(g.frames) >= perShot {
+				break
+			}
+			for _, c := range cs { // best score first
+				if math.Abs(c.TimestampSec-sec) <= PreferredWindowSec && fits(c, MinGapSec) {
+					g.frames = append(g.frames, frame{cand: c, shot: shot, preferred: true})
+					break
+				}
+			}
+		}
 		for _, c := range cs {
 			if len(g.frames) >= perShot {
 				break
 			}
-			ok := true
-			for _, f := range g.frames {
-				if !distinct(f.cand, c, d.Selection.DedupeMaxHamming) {
-					ok = false
-					break
-				}
-			}
-			if ok {
+			if fits(c, gap) {
 				g.frames = append(g.frames, frame{cand: c, shot: shot})
 			}
 		}
@@ -246,9 +270,37 @@ func buildGroups(d *domain.Config, cands []score.Scored, scores map[string]float
 }
 
 // distinct reports whether two frames differ enough to both be worth a look: their
-// dHashes are further apart than maxHamming and they are at least MinGapSec apart.
-func distinct(a, b score.Scored, maxHamming int) bool {
-	return score.Hamming(a.DHash, b.DHash) > maxHamming && math.Abs(a.TimestampSec-b.TimestampSec) >= MinGapSec
+// dHashes are further apart than maxHamming and they are at least gap seconds apart.
+func distinct(a, b score.Scored, maxHamming int, gap float64) bool {
+	return score.Hamming(a.DHash, b.DHash) > maxHamming && math.Abs(a.TimestampSec-b.TimestampSec) >= gap
+}
+
+// shortlistGap is the time two shortlisted frames of one shot must keep apart: at
+// least MinGapSec, and at least the shot's time span divided by the shortlist size, so
+// the picks spread over everything the shot covers instead of clustering where the
+// frames happen to be sharpest. On a real walkaround the camera is still settling at
+// the start of a scene (the car half in frame) and the usable moment comes later; the
+// sharpest frames were all from the first seconds and every one was cut off.
+func shortlistGap(cs []score.Scored, perShot int) float64 {
+	if len(cs) == 0 || perShot <= 0 {
+		return MinGapSec
+	}
+	// The span is summed per scene, so two short scenes far apart do not count the
+	// silence between them.
+	type span struct{ lo, hi float64 }
+	spans := map[int]span{}
+	for _, c := range cs {
+		s, ok := spans[c.SceneIdx]
+		if !ok {
+			s = span{c.TimestampSec, c.TimestampSec}
+		}
+		spans[c.SceneIdx] = span{math.Min(s.lo, c.TimestampSec), math.Max(s.hi, c.TimestampSec)}
+	}
+	total := 0.0
+	for _, s := range spans {
+		total += s.hi - s.lo
+	}
+	return math.Max(MinGapSec, total/float64(perShot))
 }
 
 // capGroups bounds the shortlist to maxImages frames. It first trims the
@@ -352,6 +404,17 @@ func limitHint(err error, req *analyzer.Request, resp *analyzer.Response) error 
 		return fmt.Errorf("answer probably cut off at the %d-token output limit: %w", req.MaxOutputTokens, err)
 	}
 	return err
+}
+
+// countPreferred is the number of shortlisted frames taken for a preferred second.
+func countPreferred(frames []frame) int {
+	n := 0
+	for _, f := range frames {
+		if f.preferred {
+			n++
+		}
+	}
+	return n
 }
 
 // countOriented is the number of frames whose rotation came from the orientation call.

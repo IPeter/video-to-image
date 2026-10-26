@@ -88,7 +88,7 @@ func TestQARequest(t *testing.T) {
 	require.NotNil(t, req.ThinkingBudget)
 	assert.Zero(t, *req.ThinkingBudget, "3.8-flash: thinkingBudget 0 (it rejects thinkingLevel minimal)")
 	assert.Empty(t, req.ThinkingLevel)
-	assert.Equal(t, int32(512), req.MaxOutputTokens)
+	assert.Equal(t, int32(2048), req.MaxOutputTokens)
 	assert.Equal(t, "walk.mp4", req.SourceName)
 
 	require.Len(t, req.Parts, 5)
@@ -105,8 +105,8 @@ func TestQARequest(t *testing.T) {
 	s := req.ResponseSchema
 	require.NotNil(t, s)
 	assert.Equal(t, "object", s.Type)
-	assert.Equal(t, []string{"missingParts", "backgroundKept", "notes"}, s.PropertyOrdering)
-	assert.ElementsMatch(t, []string{"missingParts", "backgroundKept", "notes"}, s.Required)
+	assert.Equal(t, []string{"missingParts", "minorParts", "backgroundKept", "notes"}, s.PropertyOrdering)
+	assert.ElementsMatch(t, []string{"missingParts", "minorParts", "backgroundKept", "notes"}, s.Required)
 	assert.Equal(t, "array", s.Properties["missingParts"].Type)
 	assert.Equal(t, "string", s.Properties["missingParts"].Items.Type)
 	assert.Equal(t, "array", s.Properties["backgroundKept"].Type)
@@ -152,27 +152,31 @@ func TestParseQA(t *testing.T) {
 		want QAVerdict
 	}{
 		{"nothing missing", `{"missingParts":[],"backgroundKept":[],"notes":""}`,
-			QAVerdict{OK: true, MissingParts: []string{}, BackgroundKept: []string{}}},
-		{"antenna missing (spike pub01)", `{"missingParts":["thin roof antenna"],"backgroundKept":[],"notes":""}`,
-			QAVerdict{MissingParts: []string{"thin roof antenna"}, BackgroundKept: []string{}}},
+			QAVerdict{OK: true, MissingParts: []string{}, MinorParts: []string{}, BackgroundKept: []string{}}},
+		{"antenna missing is minor (spike pub01)", `{"missingParts":["thin roof antenna"],"backgroundKept":[],"notes":""}`,
+			QAVerdict{OK: true, MissingParts: []string{}, MinorParts: []string{"thin roof antenna"}, BackgroundKept: []string{}}},
+		{"antenna tip listed as minor", `{"missingParts":[],"minorParts":["roof antenna tip"],"backgroundKept":[],"notes":""}`,
+			QAVerdict{OK: true, MissingParts: []string{}, MinorParts: []string{"roof antenna tip"}, BackgroundKept: []string{}}},
+		{"aerial with a mirror still withholds", `{"missingParts":["Aerial","left mirror cap"],"backgroundKept":[]}`,
+			QAVerdict{MissingParts: []string{"left mirror cap"}, MinorParts: []string{"Aerial"}, BackgroundKept: []string{}}},
 		{"two parts (spike user02)", `{"missingParts":["portion of the left side mirror"," left tailgate gas strut "],"backgroundKept":[],"notes":"Mirror cap lost."}`,
-			QAVerdict{MissingParts: []string{"portion of the left side mirror", "left tailgate gas strut"}, BackgroundKept: []string{}, Notes: "Mirror cap lost."}},
+			QAVerdict{MissingParts: []string{"portion of the left side mirror", "left tailgate gas strut"}, MinorParts: []string{}, BackgroundKept: []string{}, Notes: "Mirror cap lost."}},
 		{"small leftovers are fine", `{"missingParts":[],"backgroundKept":["ground shadow under the bumper"],"notes":""}`,
-			QAVerdict{OK: true, MissingParts: []string{}, BackgroundKept: []string{"ground shadow under the bumper"}}},
+			QAVerdict{OK: true, MissingParts: []string{}, MinorParts: []string{}, BackgroundKept: []string{"ground shadow under the bumper"}}},
 		{"large leftover withholds", `{"missingParts":[],"backgroundKept":["LARGE: part of a silver car","gravel"],"notes":""}`,
-			QAVerdict{MissingParts: []string{}, BackgroundKept: []string{"part of a silver car", "gravel"}, LargeBackground: true}},
+			QAVerdict{MissingParts: []string{}, MinorParts: []string{}, BackgroundKept: []string{"part of a silver car", "gravel"}, LargeBackground: true}},
 		{"large, lower case, no text", `{"missingParts":[],"backgroundKept":["large:"]}`,
-			QAVerdict{MissingParts: []string{}, BackgroundKept: []string{"large leftover background"}, LargeBackground: true}},
+			QAVerdict{MissingParts: []string{}, MinorParts: []string{}, BackgroundKept: []string{"large leftover background"}, LargeBackground: true}},
 		{"fenced", "```json\n{\"missingParts\": [], \"backgroundKept\": [], \"notes\": \"ok\"}\n```",
-			QAVerdict{OK: true, MissingParts: []string{}, BackgroundKept: []string{}, Notes: "ok"}},
+			QAVerdict{OK: true, MissingParts: []string{}, MinorParts: []string{}, BackgroundKept: []string{}, Notes: "ok"}},
 		{"fence without language", "```\n{\"missingParts\": [\"wheel\"]}\n```",
-			QAVerdict{MissingParts: []string{"wheel"}, BackgroundKept: []string{}}},
+			QAVerdict{MissingParts: []string{"wheel"}, MinorParts: []string{}, BackgroundKept: []string{}}},
 		{"prose around it", "Here is the result:\n{\"missingParts\":[\"mirror\"],\"backgroundKept\":[]}\nDone.",
-			QAVerdict{MissingParts: []string{"mirror"}, BackgroundKept: []string{}}},
+			QAVerdict{MissingParts: []string{"mirror"}, MinorParts: []string{}, BackgroundKept: []string{}}},
 		{"placeholders dropped", `{"missingParts":["None", " ", "n/a."],"backgroundKept":["nothing"]}`,
-			QAVerdict{OK: true, MissingParts: []string{}, BackgroundKept: []string{}}},
+			QAVerdict{OK: true, MissingParts: []string{}, MinorParts: []string{}, BackgroundKept: []string{}}},
 		{"no background key", `{"missingParts":[]}`,
-			QAVerdict{OK: true, MissingParts: []string{}, BackgroundKept: []string{}}},
+			QAVerdict{OK: true, MissingParts: []string{}, MinorParts: []string{}, BackgroundKept: []string{}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

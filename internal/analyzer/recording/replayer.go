@@ -81,6 +81,7 @@ func (p *Replayer) Generate(ctx context.Context, req *analyzer.Request) (*analyz
 	}
 	return &analyzer.Response{
 		Text:        rec.Text,
+		Images:      rec.images(),
 		Usage:       rec.Usage.analyzer(),
 		FileHandles: make([]string, len(req.Parts)),
 	}, nil

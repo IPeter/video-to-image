@@ -21,6 +21,15 @@ type Params struct {
 	Aspect         float64 // target width / height, e.g. 4.0/3
 	MarginPct      float64 // space around the subject, % of the box's larger side
 	MinShortSidePx int     // smallest acceptable short side of the result, in pixels
+	// FallbackAspect is tried, with the same margin and floor, when the subject does
+	// not fit Aspect without being cut; 0 → none (the frame stays uncropped).
+	FallbackAspect float64
+	// MinMarginPct is the smallest margin (same unit as MarginPct) a crop may end up
+	// with when the full margin does not fit: below it the frame is left uncropped.
+	// The review's box is measured on a 512 px copy and runs tight by a few percent;
+	// a crop with no room around it put the car on the photo edge, and the studio
+	// step then withheld the studio version for that. 0 → DefaultMinMarginPct.
+	MinMarginPct float64
 }
 
 // Frame describes a stored source frame and the rotation that makes it upright.

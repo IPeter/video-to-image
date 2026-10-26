@@ -55,6 +55,8 @@ const (
 	ReasonQAFailed    = "The studio version could not be checked, so only the original is offered."
 	ReasonCeiling     = "The daily budget for automatic checks was reached, so no studio version was made."
 	ReasonCoverage    = "The car fills too little or too much of the photo for a studio background."
+	ReasonGenFailed   = "The studio version of this photo could not be made."
+	ReasonGenNoGlass  = "No window view to put the studio behind in this photo."
 )
 
 // Eligible reports whether an exported image gets a studio version: its view is one of
@@ -62,7 +64,11 @@ const (
 // (store.SelectedImage.SubjectBox). reason says why not.
 func Eligible(dom *domain.Config, im store.SelectedImage) (ok bool, reason string) {
 	switch {
-	case dom == nil || !dom.Studio.HasView(im.ShotID):
+	case dom == nil:
+		return false, ReasonNotExterior
+	case dom.Studio.IsInteriorView(im.ShotID):
+		return true, "" // the generative studio through the glass: no box needed
+	case !dom.Studio.HasView(im.ShotID):
 		return false, ReasonNotExterior
 	case im.SubjectBox == nil:
 		return false, ReasonNoBox
